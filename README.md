@@ -105,3 +105,9 @@ games of that version are recognized exactly.
 | `signatures/` | signature libraries |
 | (sibling folder `IL2CPP Decompiler tools n stuff`) | not source: the corpus game and its ground truth, reference game, outputs, helper scripts (`tools/pdbsyms.py`, `tools/measure.sh`) |
 | (sibling folder `IL2CPP Neural Model`) | the learned function-identification model: training code, exported data, runs |
+
+## License
+
+Rewind is licensed under the [Apache License 2.0](LICENSE). You are free to use, fork and modify it; if you
+redistribute it or a modified version, keep the [NOTICE](NOTICE) file, which credits the original project,
+and mark the files you changed.
