@@ -4,6 +4,7 @@
     <AssemblyName>rewind</AssemblyName>
     <RootNamespace>Rewind.Cli</RootNamespace>
     <TieredPGO>true</TieredPGO>
+    <ApplicationIcon>..\..\assets\rewind.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Rewind.Core\Rewind.Core.csproj" />

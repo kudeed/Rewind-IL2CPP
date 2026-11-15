@@ -1,4 +1,9 @@
-# Rewind
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/rewind-banner-dark.svg">
+    <img alt="Rewind: Unity IL2CPP decompiler" src="assets/rewind-banner.svg" width="100%">
+  </picture>
+</p>
 
 A decompiler for Unity games built with IL2CPP.
 
@@ -168,6 +173,7 @@ more games built with that version Rewind recognizes exactly.
 | `src/Rewind.Cli` | the `rewind` command |
 | `src/Rewind.Lab` | `rewind-lab`, commands for measuring things during development (`hir-stats`, `diff-exec`, `sig-apply` and more) |
 | `signatures/` | signature libraries |
+| `assets/` | the logo and banner, in light and dark versions (SVG and PNG), and the app icon |
 
 The test games and their ground truth are kept separately and aren't included.
 
