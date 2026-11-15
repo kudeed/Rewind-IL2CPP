@@ -145,6 +145,9 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
 
     private static bool Tracing(MethodDef m) => Traced != null && m.FullName.Contains(Traced, StringComparison.Ordinal);
 
+    /// <summary>REWIND_INLINE_SITE=text: says which members of other classes the methods whose name contains the text name, and how many models there are for each.</summary>
+    private static readonly string? TracedSite = Environment.GetEnvironmentVariable("REWIND_INLINE_SITE");
+
     private sealed class Template
     {
         public required MethodDef Method;
@@ -167,9 +170,57 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         public int Size;
         /// <summary>Whether it reads all its parameters before it does anything else (see ReadsFirst); null: not looked at yet.</summary>
         public bool? Early;
+        /// <summary>Whether it names its object once, as the first thing it works out, and does not change it (see ThisFirst); null: not looked at yet.</summary>
+        public bool? OwnFirst;
     }
 
     private HExpr[]? Reexpress(HNewObject made, MethodDef wanted) => StructFolding.Reexpress(made, wanted, pipeline);
+
+    private static readonly bool NoZeroMade = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_ZERO_MADE") != null;
+
+    /// <summary>
+    /// Whether a struct constructor puts a parameter or a zero into every field of its struct: it makes the
+    /// struct "default" exactly when it is given zeros.
+    /// </summary>
+    private bool ZeroMade(MethodDef constructor, TypeSig? made)
+    {
+        TypeSig[] classArguments = made is GenericInstSig g ? g.Arguments : [];
+        if (pipeline.ConstructorBody(constructor, classArguments) is not { } body) return false;
+        List<HStmt> statements = body.Blocks[0].Statements;
+        var stored = new HashSet<FieldDef>();
+        for (int k = 0; k < statements.Count - 1; k++)
+        {
+            if (statements[k] is not HAssign { Target: HField { Object: HArg { Index: < 0 } } target, Value: var value }) return false;
+            bool fits = value switch
+            {
+                HArg { Index: >= 0 } => true,
+                HConst { Value: null } => true,
+                HConst { Value: float f } => BitConverter.SingleToInt32Bits(f) == 0,
+                HConst { Value: double d } => BitConverter.DoubleToInt64Bits(d) == 0,
+                HConst { Value: bool b } => !b,
+                HConst { Value: int i } => i == 0,
+                HConst { Value: long l } => l == 0,
+                _ => false,
+            };
+            if (!fits) return false;
+            stored.Add(target.Field);
+        }
+        return constructor.DeclaringType.Fields.Where(f => !f.IsStatic).All(stored.Contains);
+    }
+
+    /// <summary>The zero of a number type, or "null" of a reference: what a field of a "default" struct holds.</summary>
+    private static HExpr? Zero(TypeSig? type) => type switch
+    {
+        PrimitiveSig { Element: Il2CppTypeEnum.R4 } => new HConst(0f, type),
+        PrimitiveSig { Element: Il2CppTypeEnum.R8 } => new HConst(0.0, type),
+        PrimitiveSig { Element: Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8 } => new HConst(0L, type),
+        PrimitiveSig { Element: Il2CppTypeEnum.Boolean } => new HConst(false, type),
+        PrimitiveSig { Element: Il2CppTypeEnum.I1 or Il2CppTypeEnum.U1 or Il2CppTypeEnum.I2 or Il2CppTypeEnum.U2 or Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4 or Il2CppTypeEnum.Char } =>
+            new HConst(0, type),
+        PrimitiveSig or PointerSig or ByRefSig or GenericParamSig or OpaqueSig => null,
+        { IsValueType: false } => new HConst(null, type),
+        _ => null,
+    };
 
     private readonly Dictionary<TypeDef, List<Template>> _templates = [];
     private readonly HashSet<TypeDef> _building = [];
@@ -275,7 +326,10 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                     if (code.Instructions <= 96 && Make(m, body) is { } template) list.Add(template);
                     else if (!NoFlows && MakeFlow(m, body) is { } flow) list.Add(flow);
                     if (Tracing(m))
+                    {
                         Console.Error.WriteLine($"[inline] {m.FullName}: {code.Instructions} instructions, {(body == null ? "not recovered" : body.Blocks.Count + " blocks")}, {(list.Count == had ? "no model" : list[^1].Flow != null ? "a model with branches" : "a model")}");
+                        if (body != null) Console.Error.WriteLine(HirPrinter.Print(body));
+                    }
                 }
                 // A method may itself have had a private method of its class pasted in, which the place at hand
                 // calls instead ("Euler" is "Internal_FromEulerRad" of a vector, and that is the native call).
@@ -292,7 +346,11 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                         if (!Pass(own, Hidden, (_, _) => raw, t => !ReferenceEquals(t.Method, template.Method) && (t.Method.Flags & MethodDef.AccessMask) != 6, false)) break;
                         changed = true;
                     }
-                    if (changed && Make(template.Method, own) is { } folded) list.Add(folded);
+                    if (changed && Make(template.Method, own) is { } folded)
+                    {
+                        list.Add(folded);
+                        if (Tracing(template.Method)) Console.Error.WriteLine($"[inline] {template.Method.FullName}: with its class's own methods put back\n{HirPrinter.Print(own)}");
+                    }
                 }
                 // The same for what a method has pasted in of other classes. Its own code was compiled with
                 // its assembly, where the compiler pasted in what it liked; pasted into the code of another
@@ -750,7 +808,9 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                     // A struct's method is handed the address of the struct: the receiver is the place itself.
                     if (_method.DeclaringType.IsValueType && site is HAddressOf { Target: var self }) site = self;
                     if (This != null) return HirCleanup.Same(This, site);
-                    if (!HirBuilder.IsPure(site)) return false;
+                    // Something that does work (a call that hands over the object) only for a method that reads
+                    // its object once, before it does anything else: then it is worked out first either way.
+                    if (!HirBuilder.IsPure(site) && !ThisFirst(_template)) return false;
                     This = site;
                     ThisAt = Position;
                     return true;
@@ -840,6 +900,16 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                              (call.Alternatives.Contains(sc4.Method) || sc4.Alternatives.Contains(call.Method)))) &&
                            call.Virtual == sc4.Virtual && Types(call.DeclaringType, sc4.DeclaringType) && Types(call.Constrained, sc4.Constrained) &&
                            SameTypes(call.MethodArguments, sc4.MethodArguments) && Expression(call.This, sc4.This) && All(call.Arguments, sc4.Arguments);
+                case HNewObject n when !NoZeroMade && site is HTypeExpr { Op: HTypeOp.Default, Target: var cleared } && n.Constructor.DeclaringType.IsValueType &&
+                                       Types(n.Type, cleared) && _owner.ZeroMade(n.Constructor, n.Type):
+                {
+                    // A struct with every field zero, which the place has as "default": made by a constructor that
+                    // puts its parameters into the fields, it was given zeros ("Euler(0, 0, 0)").
+                    foreach (HExpr argument in n.Arguments)
+                        if (Zero(argument.Type) is not { } zero || !Expression(argument, zero))
+                            return false;
+                    return true;
+                }
                 case HNewObject n:
                     // The same struct value, made with another of its constructors (the place has the shortest
                     // that fits what was stored): as this method's constructor would have been given it.
@@ -1079,9 +1149,12 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                         foreach (TypeDef other in others) candidates = candidates.Concat(templates(other, null));
                         candidates = candidates.OrderByDescending(c => c.Size).ToList();
                     }
+                    if (TracedSite != null && method.Method.FullName.Contains(TracedSite, StringComparison.Ordinal))
+                        Console.Error.WriteLine($"[inline-site] {method.Method.Name} L{block.Id}:{i}: {anchor} of {declaring?.ShortName ?? "?"}: {candidates.Count(t => t.Members.Contains(anchor))} of {candidates.Count()} models name it, {candidates.Count(t => t.Members.Contains(anchor) && usable(t))} usable");
                     foreach (Template template in candidates)
                     {
                         if (!template.Members.Contains(anchor) || !usable(template)) continue;
+                        if (Tracing(template.Method)) Console.Error.WriteLine($"[inline] {method.Method.Name}: trying {template.Method.Name}{(template.Flow != null ? " (with branches)" : "")} for {anchor} at L{block.Id}:{i}");
                         counts ??= Counts.Of(method);
                         _partly = false;
                         if (template.Flow != null ? TryFoldFlow(method, block, i, template, counts) : TryFold(method, block, i, template, anchor, counts)) return true;
@@ -1160,7 +1233,8 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
     {
         MethodDef m = template.Method;
         if (!m.IsStatic && unifier.This == null) return null;
-        if (!m.IsStatic && m.DeclaringType.IsValueType && unifier.This is not (HLocal or HArg or HField or HElement or HDeref)) return null;
+        // (A struct worked out on the spot is a copy the method runs on: right for one that only reads it.)
+        if (!m.IsStatic && m.DeclaringType.IsValueType && unifier.This is not (HLocal or HArg or HField or HElement or HDeref) && !ThisFirst(template)) return null;
         TypeSig? declaring = template.Declaring;
         TypeSig[] classArguments = template.SiteArguments;
         if (declaring != null && !m.IsStatic)
@@ -1280,7 +1354,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                 }
             }
             foreach (HExpr? operand in Operands(e)) Walk(operand);
-            worked |= !(e is HConst or HLocal or HArg or HUnary or HCompare or HAddressOf { Target: HLocal } ||
+            worked |= !(e is HConst or HLocal or HArg or HUnary or HCompare or HAddressOf { Target: HLocal } || (!NoCallFirst && e is HAddressOf { Target: HArg }) ||
                         e is HBinary or HConv && HirBuilder.IsPure(e) || e is HTypeExpr { Op: HTypeOp.Default or HTypeOp.SizeOf });
         }
         foreach (HStmt s in template.Statements)
@@ -1307,6 +1381,85 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         if (fine) Walk(template.Result);
         fine &= seen.Count != 0;
         template.Early = fine;
+        return fine;
+    }
+
+    private static readonly bool NoThisFirst = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_THIS_FIRST") != null;
+    private static readonly bool NoTurned = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_TURNED") != null;
+
+    /// <summary>
+    /// Whether a method names its object once, as the first thing it works out (in its first statement), and
+    /// only reads it there: the object may then be handed over as something that does work - a call,
+    /// "this.Runner" in "this.Runner.Tick" - which is worked out where the method's first statement was, just
+    /// as the call of the method works out its object first. (A struct is only read through, a field of it or
+    /// all of it: a copy made on the spot, which the call then runs on, is the same to such a method.)
+    /// </summary>
+    private static bool ThisFirst(Template template)
+    {
+        if (template.OwnFirst is { } known) return known;
+        bool fine = !NoThisFirst && !template.Method.IsStatic;
+        HStmt? first = null;
+        List<HStmt> all = [];
+        if (fine)
+        {
+            if (template.Flow != null)
+            {
+                all.AddRange(template.Flow.Blocks.SelectMany(b => b.Statements));
+                first = template.Flow.Blocks[0].Statements.FirstOrDefault();
+            }
+            else
+            {
+                all.AddRange(template.Statements);
+                if (template.Result != null) all.Add(new HEval(template.Result));
+                first = all.FirstOrDefault();
+            }
+            fine = first != null;
+        }
+        if (fine)
+        {
+            int named = 0, here = 0;
+            foreach (HStmt s in all) FinallyFolding.Visit(s, e => named += e is HArg { Index: < 0 } ? 1 : 0);
+            FinallyFolding.Visit(first!, e => here += e is HArg { Index: < 0 } ? 1 : 0);
+            fine = named == 1 && here == 1;
+        }
+        if (fine)
+        {
+            // What stands around the mention: a field read through it, all of it, or (for a class) a call on it.
+            HExpr? self = null, around = null;
+            void Find(HExpr? e, HExpr? parent)
+            {
+                if (e == null || self != null) return;
+                if (e is HArg { Index: < 0 })
+                {
+                    self = e;
+                    around = parent;
+                    return;
+                }
+                foreach (HExpr? operand in Operands(e)) Find(operand, e);
+            }
+            switch (first)
+            {
+                case HAssign a:
+                    Find(a.Target, null);
+                    if (self != null) fine = false; // (the object, or a part of it, is what is set)
+                    Find(a.Value, null);
+                    break;
+                case HEval v: Find(v.Expression, null); break;
+                case HBranch b: Find(b.Condition, null); break;
+                case HReturn r: Find(r.Value, null); break;
+                default: fine = false; break;
+            }
+            bool value = template.Method.DeclaringType.IsValueType;
+            fine &= self != null && around switch
+            {
+                HField { Field.IsStatic: false } => true,
+                HDeref => value,
+                HCall c when !value => ReferenceEquals(c.This, self),
+                _ => false,
+            };
+            fine &= self != null && WorkedOutFirst(first!, around ?? self);
+        }
+        template.OwnFirst = fine;
         return fine;
     }
 
@@ -1391,14 +1544,23 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
     /// Whether, from a position in a block on, a variable is given a new value - whole - before anything else
     /// is done with it, on every way the method can go on from there.
     /// </summary>
-    private static bool Renewed(HMethod method, HBlock block, int from, HVar variable)
+    internal static bool Renewed(HMethod method, HBlock block, int from, HVar variable)
     {
-        var seen = new HashSet<HBlock>();
-        var work = new Stack<(HBlock Block, int From)>();
-        work.Push((block, from));
+        // A struct may be given its next value field by field ("v.x = a; v.y = b"): a field given anew no longer
+        // holds what the method left in it, and reading it then reads the place's own value. What is followed
+        // along each way is which fields still hold the method's (null: the whole variable, as it is for
+        // anything but a struct).
+        FieldDef[]? fields = !NoPartsRenewed && variable.Type is { IsValueType: true } and not (PrimitiveSig or PointerSig or ByRefSig or OpaqueSig or GenericParamSig) &&
+                             variable.Type.Definition is { IsEnum: false } definition
+            ? definition.Fields.Where(f => !f.IsStatic).ToArray()
+            : null;
+        if (fields is { Length: 0 }) fields = null;
+        var seen = new Dictionary<HBlock, HashSet<FieldDef>?>();
+        var work = new Stack<(HBlock Block, int From, HashSet<FieldDef>? Held)>();
+        work.Push((block, from, fields == null ? null : [.. fields]));
         while (work.Count != 0)
         {
-            (HBlock b, int first) = work.Pop();
+            (HBlock b, int first, HashSet<FieldDef>? held) = work.Pop();
             bool renewed = false;
             for (int k = first; k < b.Statements.Count && !renewed; k++)
             {
@@ -1408,14 +1570,125 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                     if (ConstructorFolding.Mentions(value, variable)) return false;
                     renewed = true;
                 }
-                else if (ConstructorFolding.Mentions(s, variable)) return false;
+                else if (held != null && s is HAssign { Target: HField { Object: HLocal { Variable: var whose }, Field: var part }, Value: var partValue } &&
+                         ReferenceEquals(whose, variable) && !part.IsStatic)
+                {
+                    if (Observes(partValue, variable, held)) return false;
+                    held = [.. held];
+                    held.Remove(part);
+                    renewed = held.Count == 0;
+                }
+                else if (held != null ? Observes(s, variable, held) : ConstructorFolding.Mentions(s, variable)) return false;
             }
             if (renewed) continue;
             // Where an exception can take the method elsewhere from any statement, the ways on are not these.
             if (method.TryRegions.Count != 0) return false;
             foreach (HBlock next in Successors(b))
-                if (seen.Add(next))
-                    work.Push((next, 0));
+            {
+                // Each block is looked at again only with fields that were not looked for in it before.
+                if (seen.TryGetValue(next, out HashSet<FieldDef>? before))
+                {
+                    if (before == null || (held != null && held.IsSubsetOf(before))) continue;
+                    if (held == null) seen[next] = null;
+                    else before.UnionWith(held);
+                    work.Push((next, 0, held == null ? null : [.. seen[next]!]));
+                    continue;
+                }
+                seen[next] = held == null ? null : [.. held];
+                work.Push((next, 0, held == null ? null : [.. held]));
+            }
+        }
+        return true;
+    }
+
+    private static readonly bool NoPartsRenewed = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_PARTS_RENEWED") != null;
+    private static readonly bool NoSlotsOn = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_SLOTS_ON") != null;
+    private static readonly bool NoAlikeCalls = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_ALIKE_CALLS") != null;
+    private static readonly bool NoKeptParts = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_KEPT_PARTS") != null;
+    private static readonly bool NoZeroStructs = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_ZERO_STRUCTS") != null;
+
+    /// <summary>"default(T)" of a struct: a value every field of which is zero.</summary>
+    private static bool ZeroStruct(HExpr? e) => !NoZeroStructs && e is HTypeExpr { Op: HTypeOp.Default, Target: { IsValueType: true } and not (PrimitiveSig or PointerSig or ByRefSig or GenericParamSig) };
+
+    /// <summary>
+    /// Whether something reads what one of <paramref name="held"/> holds in a struct variable: a field of it, or
+    /// the variable whole (its address included).
+    /// </summary>
+    private static bool Observes(HStmt s, HVar variable, HashSet<FieldDef> held)
+    {
+        bool observed = false;
+        int named = 0, apart = 0;
+        FinallyFolding.Visit(s, e =>
+        {
+            if (e is HLocal l && ReferenceEquals(l.Variable, variable)) named++;
+            else if (e is HField { Object: HLocal { Variable: var whose } } f && ReferenceEquals(whose, variable))
+            {
+                if (held.Contains(f.Field) || f.Field.IsStatic) observed = true;
+                else apart++;
+            }
+        });
+        return observed || named > apart;
+    }
+
+    private static bool Observes(HExpr? e, HVar variable, HashSet<FieldDef> held) => e != null && Observes(new HEval(e), variable, held);
+
+    private static readonly bool NoApart = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_APART") != null;
+    private static readonly bool NoCallFirst = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_CALL_FIRST") != null;
+    private const int ApartMost = 6;
+
+    /// <summary>
+    /// A method's statements at a place with a few of the place's own between them and before the use of what
+    /// the method returns: "v = new Vector3(..); this.a = new Quaternion(..); q = Internal_FromEulerRad(&v)" for
+    /// two lines of source, the second one "Quaternion.Euler(..)". Where each is (null: not found so).
+    /// </summary>
+    private (Unifier Unifier, int[] Positions)? Apart(Template template, List<HStmt> site, int at, Counts counts)
+    {
+        int n = template.Statements.Count;
+        for (int start = at - n - 1; start >= 0 && start >= at - n - ApartMost; start--)
+        {
+            var unifier = new Unifier(this, template, site, counts);
+            var pos = new int[n];
+            int p = start, skipped = 0;
+            bool found = true;
+            for (int k = 0; k < n && found; k++)
+            {
+                found = false;
+                for (; p < at && skipped <= ApartMost; p++)
+                {
+                    Unifier trial = unifier.Clone();
+                    trial.At = p;
+                    trial.Position = k;
+                    if (trial.Statement(template.Statements[k], site[p]))
+                    {
+                        unifier = trial;
+                        pos[k] = p++;
+                        found = true;
+                        break;
+                    }
+                    if (k == 0) break; // the first of them is where this try starts
+                    skipped++;
+                }
+            }
+            if (!found || skipped + (at - p) > ApartMost) continue;
+            return (unifier, pos);
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Whether what stands between a method's statements found apart (see Apart) does the same once those are
+    /// all done at the use: plain stores that do no work and have nothing to do with the method's statements
+    /// before them.
+    /// </summary>
+    private static bool Aside(List<HStmt> site, int[] pos, int user, HashSet<int> removed)
+    {
+        for (int p = pos[0] + 1; p < user; p++)
+        {
+            if (removed.Contains(p)) continue;
+            if (site[p] is not HAssign a || HasCall(a.Value) || HasCall(a.Target)) return false;
+            foreach (int q in pos)
+                if (q < p && !Commute(site[q], site[p]))
+                    return false;
         }
         return true;
     }
@@ -1435,30 +1708,45 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             if (start < 0 || start + n > site.Count || (a == n && start + n >= site.Count)) continue;
 
             var unifier = new Unifier(this, template, site, counts) { Loose = early };
+            // Where each of the method's statements is at the place.
+            var pos = new int[n];
             bool matched = true;
             for (int k = 0; k < n && matched; k++)
             {
                 unifier.At = start + k;
                 unifier.Position = k;
+                pos[k] = start + k;
                 matched = unifier.Statement(template.Statements[k], site[start + k]);
             }
             bool tracing = Tracing(m);
             if (tracing) Console.Error.WriteLine($"[inline] {m.FullName} in {method.Method.FullName} at L{block.Id}:{at}: statements {(matched ? "match" : "differ")}");
+            // The place may have other things of its own done between the method's statements and the use of what
+            // it returns (the compiler worked the argument out early, then went on with something else): see Apart.
+            bool apart = false;
+            if (!matched && a == n && n != 0 && template.Result is not (null or HLocal) && !NoApart && Apart(template, site, at, counts) is { } found)
+            {
+                (unifier, pos) = found;
+                start = pos[0];
+                matched = apart = true;
+                if (tracing) Console.Error.WriteLine($"[inline]   its statements are found apart, from {start} on");
+            }
             if (!matched) continue;
 
             // What the method returns: nothing; a variable it filled (the site has its own in that role); or a
             // value, which the statement after must then contain.
             HVar? into = null;
             HExpr? replaced = null;
+            bool negated = false;
             int user = -1;
             if (template.Result is HLocal { Variable: var returned } && unifier.Locals.TryGetValue(returned, out HVar? siteResult)) into = siteResult;
             else if (template.Result != null)
             {
-                user = start + n;
+                user = apart ? at : start + n;
                 if (user >= site.Count) continue;
                 var candidates = new List<HExpr>();
                 FinallyFolding.Visit(site[user], candidates.Add);
-                bool loose = n == 0 ? OneExpression(template) : early;
+                // (A method that is one call of what it is handed, in order, reads its parameters first too.)
+                bool loose = n == 0 ? OneExpression(template) || (!NoCallFirst && ReadsFirst(template)) : early && !apart;
                 foreach (HExpr candidate in candidates)
                 {
                     // An assignment's target is a place, not a value.
@@ -1467,17 +1755,32 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                     trial.At = user;
                     trial.Position = n;
                     trial.Loose = loose;
-                    if (!trial.Expression(template.Result, candidate)) continue;
+                    bool turned = false;
+                    if (!trial.Expression(template.Result, candidate))
+                    {
+                        // A test the place asks the other way round (the compiler turned it to suit its jump):
+                        // the method's answer, negated.
+                        if (NoTurned || template.Result is not HCompare { Op: var asked } question || candidate is not HCompare { Op: var other } ||
+                            other != Opposite(asked) || (asked is not (HCompareOp.Eq or HCompareOp.Ne) && !(Whole(question.Left.Type) && Whole(question.Right.Type))))
+                            continue;
+                        trial = unifier.Clone();
+                        trial.At = user;
+                        trial.Position = n;
+                        trial.Loose = loose;
+                        if (!trial.Expression(new HCompare(other, question.Left, question.Right) { Type = question.Type }, candidate)) continue;
+                        turned = true;
+                    }
                     // Arguments that do work are worked out in the order of the parameters, after the object
                     // the method is called on: that must be the order they stand in here.
                     if (trial.Working)
                     {
-                        bool ordered = Stable(trial.This);
+                        bool ordered = Stable(trial.This) || ThisFirst(template);
                         for (int k = 1; k < trial.Order.Count && ordered; k++) ordered = trial.Order[k - 1] < trial.Order[k];
                         if (!ordered) continue;
                     }
                     unifier = trial;
                     replaced = candidate;
+                    negated = turned;
                     break;
                 }
                 if (replaced == null)
@@ -1493,7 +1796,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             // must be the first thing done there.
             if (n != 0 && unifier.Working)
             {
-                bool ordered = Stable(unifier.This);
+                bool ordered = Stable(unifier.This) || ThisFirst(template);
                 for (int k = 1; k < unifier.Order.Count && ordered; k++) ordered = unifier.Order[k - 1] < unifier.Order[k];
                 if (ordered && replaced != null) ordered = WorkedOutFirst(site[user], replaced);
                 if (!ordered)
@@ -1505,7 +1808,12 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
 
             // Temporaries of the method have temporaries of their own here; nothing else may use those.
             var removed = new HashSet<int>(unifier.Consumed);
-            for (int k = 0; k < n; k++) removed.Add(start + k);
+            for (int k = 0; k < n; k++) removed.Add(pos[k]);
+            if (apart && !Aside(site, pos, user, removed))
+            {
+                if (tracing) Console.Error.WriteLine("[inline]   what stands between its statements does not stay what it is");
+                continue;
+            }
             bool leaks = false;
             int last = replaced != null ? user : start + n - 1;
             foreach (HVar local in unifier.SiteLocals)
@@ -1514,7 +1822,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                 // A stack slot the place uses for one thing after another: the method's temporary lives in it
                 // from where it is given a value here - whole - to where the slot is given the next, on every
                 // way on from here. What else the place keeps in the slot before and after is not the method's.
-                bool passing = Passing(method, block, start, n, last + 1, local);
+                bool passing = Passing(method, block, start, (replaced != null ? user : start + n) - start, last + 1, local);
                 for (int b = 0; b < method.Blocks.Count && !leaks; b++)
                 {
                     List<HStmt> statements = method.Blocks[b].Statements;
@@ -1547,7 +1855,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             int firstEffect = n + 1;
             for (int k = 0; k < n; k++)
             {
-                bool inert = site[start + k] is HAssign { Target: HLocal target, Value: var value } && unifier.SiteLocals.Contains(target.Variable) && !HasCall(value);
+                bool inert = site[pos[k]] is HAssign { Target: HLocal target, Value: var value } && unifier.SiteLocals.Contains(target.Variable) && !HasCall(value);
                 if (!inert)
                 {
                     firstEffect = k;
@@ -1578,7 +1886,8 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             }
             if (tracing) Console.Error.WriteLine("[inline]   folded");
             ulong address = site[at].Address;
-            if (replaced != null) EnumeratorLoops.Rewrite(site[user], e => ReferenceEquals(e, replaced) ? call : null);
+            HExpr answer = negated ? new HUnary(HUnaryOp.LogicalNot, call) { Type = call.Type } : call;
+            if (replaced != null) EnumeratorLoops.Rewrite(site[user], e => ReferenceEquals(e, replaced) ? answer : null);
             var rebuilt = new List<HStmt>(site.Count);
             for (int k = 0; k < site.Count; k++)
             {
@@ -1936,8 +2245,9 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                 if (!entry || NoKept) return false;
                 (HBlock b, int i) = site[c];
                 if (!ReferenceEquals(b, site[0].Block)) return false;
-                if (b.Statements[i] is not HAssign { Target: HLocal { Variable: var mine }, Value: var value } own || HasCall(value) ||
-                    U.SiteLocals.Contains(mine))
+                // (A field of a struct variable of the place too: the struct it hands over, filled in early.)
+                if (b.Statements[i] is not HAssign { Target: var into, Value: var value } own || HasCall(value) || HasCall(into) ||
+                    VariableOf(into) is not { } mine || U.SiteLocals.Contains(mine))
                     return false;
                 for (int u = 0; u < site.Count - 1; u++)
                     if (used[u] && !Commute(site[u].Block.Statements[site[u].Index], own))
@@ -1946,6 +2256,16 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             }
             if (kept != null) Kept.AddRange(kept);
             return true;
+        }
+
+        /// <summary>The variable a place is (a local), or is a part of (a field of a struct local, and so on); null for anything else.</summary>
+        private static HVar? VariableOf(HExpr place)
+        {
+            if (place is HLocal { Variable: var whole }) return whole;
+            if (NoKeptParts) return null;
+            HExpr e = place;
+            while (e is HField { Object: { } inside } f && !f.Field.IsStatic && inside.Type is { IsValueType: true } and not (PointerSig or ByRefSig)) e = inside;
+            return !ReferenceEquals(e, place) && e is HLocal { Variable: var root, Type: not (PointerSig or ByRefSig) } ? root : null;
         }
 
         private void Take(List<(HBlock Block, int Index)> run, bool[] used, HBlock block, Unifier trial)
@@ -2246,6 +2566,21 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         Dictionary<HVar, int>? readHere = null, readThere = null;
         bool Alike(HExpr? x, HExpr? y)
         {
+            // Two copies of the same call are the same code (not the same value: each copy is run on one way).
+            if (!NoAlikeCalls && x is HCall c && y is HCall d)
+            {
+                if (!ReferenceEquals(c.Method, d.Method) || c.Virtual != d.Virtual || !ReferenceEquals(c.DeclaringType, d.DeclaringType) ||
+                    !ReferenceEquals(c.Constrained, d.Constrained) || c.MethodArguments.Length != d.MethodArguments.Length ||
+                    c.Arguments.Length != d.Arguments.Length || !Alike(c.This, d.This))
+                    return false;
+                for (int k = 0; k < c.MethodArguments.Length; k++)
+                    if (!ReferenceEquals(c.MethodArguments[k], d.MethodArguments[k]))
+                        return false;
+                for (int k = 0; k < c.Arguments.Length; k++)
+                    if (!Alike(c.Arguments[k], d.Arguments[k]))
+                        return false;
+                return true;
+            }
             if (counterpart == null) return HirCleanup.Same(x, y);
             if (ReferenceEquals(x, y)) return true;
             if (x == null || y == null || x.GetType() != y.GetType()) return false;
@@ -2354,17 +2689,34 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         Leads(e => e is HLocal l && ReferenceEquals(l.Variable, variable), at, value);
 
     /// <summary>The same, for a test of a value that stands in the test itself.</summary>
-    private static (HBlock Block, int Index)? Leads(Func<HExpr, bool> result, (HBlock Block, int Index) at, long value)
+    private static (HBlock Block, int Index)? Leads(Func<HExpr, bool> result, (HBlock Block, int Index) at, long value, bool zero = false)
     {
         if (at.Block.Statements[at.Index] is not HBranch branch) return null;
+        // zero: the value is a struct with nothing in it, of which the test reads a field (whole numbers only).
+        bool InValue(HExpr e) => result(e) || (e is HField { Object: { } inside, Field.IsStatic: false } && InValue(inside));
         long? Worth(HExpr e) => e switch
         {
+            HField { Object: { } inside, Type: var type } when zero && !NoZeroStructs && InValue(inside) && Whole(type) => 0,
+            _ when zero && result(e) => null,
             _ when result(e) => value,
             HConst c => Integral(c.Value),
             HConv { Kind: HConvKind.I1 or HConvKind.U1 or HConvKind.I2 or HConvKind.U2 or HConvKind.I4 or HConvKind.U4 or HConvKind.I8 or HConvKind.U8 } c when value is 0 or 1 => Worth(c.Operand),
             HUnary { Op: HUnaryOp.LogicalNot } u => Worth(u.Operand) is { } v ? (v == 0 ? 1 : 0) : null,
             HCompare { Op: HCompareOp.Eq } c => Worth(c.Left) is { } a && Worth(c.Right) is { } b ? (a == b ? 1 : 0) : null,
             HCompare { Op: HCompareOp.Ne } c => Worth(c.Left) is { } a && Worth(c.Right) is { } b ? (a != b ? 1 : 0) : null,
+            // Order, of whole numbers.
+            HCompare { Op: var op } c when !NoZeroStructs && Whole(c.Left.Type) && Whole(c.Right.Type) && Worth(c.Left) is { } a && Worth(c.Right) is { } b => op switch
+            {
+                HCompareOp.Lt => a < b ? 1 : 0,
+                HCompareOp.Le => a <= b ? 1 : 0,
+                HCompareOp.Gt => a > b ? 1 : 0,
+                HCompareOp.Ge => a >= b ? 1 : 0,
+                HCompareOp.LtUn => (ulong)a < (ulong)b ? 1 : 0,
+                HCompareOp.LeUn => (ulong)a <= (ulong)b ? 1 : 0,
+                HCompareOp.GtUn => (ulong)a > (ulong)b ? 1 : 0,
+                HCompareOp.GeUn => (ulong)a >= (ulong)b ? 1 : 0,
+                _ => null,
+            },
             _ => null,
         };
         if (Worth(branch.Condition) is not { } decided) return null;
@@ -2484,6 +2836,11 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
     private bool Finish(HMethod method, Template template, FlowMatch match, HBlock first, int start)
     {
         MethodDef m = template.Method;
+        bool Why(string reason)
+        {
+            if (Tracing(m)) Console.Error.WriteLine($"[inline]   {reason}");
+            return false;
+        }
         if (match.Exits.Count == 0) return false;
         (HBlock Block, int Index) next = Past(match.Exits[0].Block, match.Exits[0].Index);
         HVar? into = null;
@@ -2502,7 +2859,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
 
         if (m.ReturnType.IsVoid)
         {
-            if (!OneWayOn()) return false;
+            if (!OneWayOn()) return Why("its returns do not go on at one place");
         }
         else
         {
@@ -2604,9 +2961,10 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             }
             // One return computes its value and the place tests it on the spot; the others return constants and
             // go on where that test leads with them.
-            if (!settled && match.Exits.Count >= 2 && match.Exits.Count(e => e.Value is not HConst) == 1)
+            // (A struct with nothing in it is a constant too: every field of it is zero.)
+            if (!settled && match.Exits.Count >= 2 && match.Exits.Count(e => e.Value is not HConst && !ZeroStruct(e.Value)) == 1)
             {
-                var computed = match.Exits.First(e => e.Value is not HConst);
+                var computed = match.Exits.First(e => e.Value is not HConst && !ZeroStruct(e.Value));
                 (HBlock Block, int Index) at = Past(computed.Block, computed.Index);
                 if (at.Block.Statements[at.Index] is HBranch test)
                 {
@@ -2622,6 +2980,11 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                         bool all = true;
                         foreach (var other in match.Exits)
                         {
+                            if (ZeroStruct(other.Value))
+                            {
+                                all &= Leads(e => ReferenceEquals(e, candidate), at, 0, zero: true) is { } cleared && SameExit(cleared, Past(other.Block, other.Index));
+                                continue;
+                            }
                             if (other.Value is not HConst { Value: var constant }) continue;
                             all &= Integral(constant) is { } known && Leads(e => ReferenceEquals(e, candidate), at, known) is { } led && SameExit(led, Past(other.Block, other.Index));
                         }
@@ -2672,7 +3035,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                     settled = true;
                 }
             }
-            if (!settled) return false;
+            if (!settled) return Why("what it returns is not taken up here");
         }
         Unifier unifier = match.U;
 
@@ -2708,17 +3071,17 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                 }
             return true;
         }
-        if (!Valid(unifier.This, -1)) return false;
+        if (!Valid(unifier.This, -1)) return Why("what it is called on is not worth the same before");
         for (int p = 0; p < unifier.Arguments.Length; p++)
             if (!Valid(unifier.Arguments[p], p))
-                return false;
-        if (MakeCall(template, unifier) is not { } call) return false;
+                return Why($"argument {p} is not worth the same before");
+        if (MakeCall(template, unifier) is not { } call) return Why("no call could be written");
 
         // The first block: what was before, the call, and how it goes on.
         HBlock target = next.Block;
         bool inside = ways == null && !handedOn && next.Index != 0;
-        if (inside && ReferenceEquals(target, first) && next.Index <= start) return false;
-        if (match.Kept.Count != 0 && ReferenceEquals(target, first)) return false;
+        if (inside && ReferenceEquals(target, first) && next.Index <= start) return Why("the place goes on before the call");
+        if (match.Kept.Count != 0 && ReferenceEquals(target, first)) return Why("statements of the place kept among its first ones");
         List<HStmt> old = [.. first.Statements];
         ulong address = old[start].Address;
         var rebuilt = new List<HStmt>();
@@ -2729,6 +3092,8 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         foreach ((HBlock keptIn, int keptAt) in match.Kept)
             if (ReferenceEquals(keptIn, first) && keptAt >= start && keptAt < old.Count && !match.Used.Contains((first, keptAt)))
                 rebuilt.Add(old[keptAt]);
+        // Where the place goes on from the call.
+        int continuation = rebuilt.Count;
         HStmt? user2 = null;
         if (replaced != null)
         {
@@ -2776,19 +3141,28 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                 if (!ReferenceEquals(local, into))
                     own.Add(local);
             own.AddRange(temporaries);
-            foreach (HBlock b in reached)
+            // Nothing that can still be reached may use them - or, for a stack slot the place uses for one thing
+            // after another (the same temporary for the item of each "list.Add(..)" pasted in, one after the
+            // other), nothing from the call on may look at what the method left in it; what the place puts in it
+            // anew afterwards is its own.
+            foreach (HVar local in own)
             {
-                foreach (HStmt s in b.Statements)
+                bool named = false;
+                foreach (HBlock b in reached)
                 {
-                    foreach (HVar local in own)
+                    foreach (HStmt s in b.Statements)
                         if (ConstructorFolding.Mentions(s, local))
                         {
-                            holds = false;
+                            named = true;
                             break;
                         }
-                    if (!holds) break;
+                    if (named) break;
                 }
-                if (!holds) break;
+                if (named && (NoSlotsOn || !Renewed(method, first, continuation, local)))
+                {
+                    holds = false;
+                    break;
+                }
             }
         }
         if (!holds)
@@ -2796,7 +3170,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             if (user2 != null) EnumeratorLoops.Rewrite(user2, e => ReferenceEquals(e, call) ? replaced : null);
             first.Statements.Clear();
             first.Statements.AddRange(old);
-            return false;
+            return Why("what was its own is used further on, or a part of it can still be reached");
         }
         HirCleanup.Run(method);
         return true;

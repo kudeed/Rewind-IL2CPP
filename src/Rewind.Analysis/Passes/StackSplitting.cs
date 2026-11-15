@@ -12,9 +12,21 @@ namespace Rewind.Analysis.Passes;
 /// per piece of the object, with every access that spans several pieces tying them together); each group after
 /// the first moves to fresh stack memory. No group can observe another's data, so the program means the same.
 /// Applied only to the objects the high-level form found contradictory.
+///
+/// The same goes for the memory above the return address, the space the caller set aside for the function (the
+/// home slots of the register arguments, the stack arguments): the compiler keeps locals there as well, a spilled
+/// "this" in one place, an enum to box and then a caught exception in the next. What that memory held on entry
+/// is a stack argument, though: a group that reads it stays where the caller put it.
 /// </summary>
 public static class StackSplitting
 {
+    /// <summary>The return address: no part of any object.</summary>
+    private const int ReturnSlot = 8;
+
+    private static readonly bool BelowOnly = Environment.GetEnvironmentVariable("REWIND_NO_CALLER_SLOTS") != null;
+
+    private static bool Owned(int offset) => offset < 0 || (offset >= ReturnSlot && !BelowOnly);
+
     /// <summary>When set, told what was decided for each object (for debugging).</summary>
     public static Action<string>? Trace;
     public static bool Detail = Environment.GetEnvironmentVariable("REWIND_SPLIT_DETAIL") != null;
@@ -33,6 +45,7 @@ public static class StackSplitting
     public static int Run(Function fn, IEnumerable<int> offsets, Func<Node, int, int>? escapeExtent = null, Func<Node, int, bool>? writesOnly = null,
         Func<Node, int, bool>? readsOnly = null, Func<Node, int, bool>? removable = null, Func<int, int>? reach = null)
     {
+        Trace?.Invoke($"function 0x{fn.Address:X}");
         // An address kept in a value (stored, merged) can be used from anywhere, but only to get at the object it
         // points to: as far as that object is known to extend (reach), else everything above it.
         int Reach(int at) => reach?.Invoke(at) is int known and > 0 ? at + known : int.MaxValue;
@@ -51,7 +64,7 @@ public static class StackSplitting
             return true;
         }
 
-        // Every use of a stack address below the entry stack pointer.
+        // Every use of a stack address of the function's own memory.
         var all = new List<Access>();
         var escaped = new List<(int Start, int End, Node By)>();
         foreach (Block b in fn.Blocks)
@@ -60,7 +73,7 @@ public static class StackSplitting
                 if (n.Dead) continue;
                 for (int i = 0; i < n.In.Length; i++)
                 {
-                    if (!IsStackAddress(n.In[i], out int at) || at >= 0) continue;
+                    if (!IsStackAddress(n.In[i], out int at) || !Owned(at)) continue;
                     if (n.Op == Op.Load && i == 0) all.Add(new Access(n, i, at, at + n.Type.Bytes(), true, false));
                     else if (n.Op == Op.Store && i == 0) all.Add(new Access(n, i, at, at + n.In[1].Type.Bytes(), false, true));
                     else if (n.Op is Op.Call)
@@ -76,13 +89,24 @@ public static class StackSplitting
         foreach (Block b in fn.Blocks)
             foreach (Node phi in b.Phis)
                 foreach (Node input in phi.In)
-                    if (IsStackAddress(input, out int at) && at < 0) escaped.Add((at, Reach(at), phi));
+                    if (IsStackAddress(input, out int at) && Owned(at)) escaped.Add((at, Reach(at), phi));
 
-        int moved = 0, nextBase = -0x40000;
+        // How far a call given a stack address may reach when its extent is not known: the function's locals end
+        // at the return address; above it, as far as anything here touches that memory.
+        int above = ReturnSlot;
+        foreach (Access a in all)
+            if (a.Start >= ReturnSlot) above = Math.Max(above, a.End != int.MaxValue ? a.End : a.Start + 8);
+        int Top(int at) => at < 0 ? 0 : above;
+
+        // Moved lifetimes go below everything the function uses (earlier rounds' moves included).
+        int lowest = 0;
+        foreach (Access a in all) lowest = Math.Min(lowest, a.Start);
+        foreach (var e in escaped) lowest = Math.Min(lowest, e.Start);
+        int moved = 0, nextBase = Math.Min(-0x40000, (lowest & ~0xFF) - 0x100);
         var done = new HashSet<int>();
         foreach (int offset in offsets.OrderBy(o => o))
         {
-            if (offset >= 0 || done.Contains(offset)) continue;
+            if (!Owned(offset) || done.Contains(offset)) continue;
             // The object: everything that overlaps the offset, transitively.
             int start = offset, end = offset + 1;
             bool grew = true;
@@ -91,7 +115,7 @@ public static class StackSplitting
                 grew = false;
                 foreach (Access a in all)
                 {
-                    int aEnd = Math.Min(a.End, 0);
+                    int aEnd = Math.Min(a.End, Top(a.Start));
                     if (a.Start < end && start < aEnd && (a.Start < start || aEnd > end))
                     {
                         start = Math.Min(start, a.Start);
@@ -106,7 +130,7 @@ public static class StackSplitting
                 Trace?.Invoke($"object [{start}, {end}) at {offset}: its address is kept in a value ({Function.Describe(escaped.First(e => e.Start < end && start < e.End).By)})");
                 continue;
             }
-            var accesses = all.Where(a => a.Start < end && start < Math.Min(a.End, 0)).ToList();
+            var accesses = all.Where(a => a.Start < end && start < Math.Min(a.End, Top(a.Start))).ToList();
             if (accesses.Count < 2 || accesses.Count > 400)
             {
                 Trace?.Invoke($"object [{start}, {end}) at {offset}: {accesses.Count} accesses");
@@ -206,7 +230,7 @@ public static class StackSplitting
                 foreach (Access a in list) Step(a, sets, record: true);
             }
 
-            // Groups; the largest stays where it is.
+            // Groups; the largest stays where it is (or the ones that read what the caller left there).
             // A lifetime made of writes alone is never read: its stores and fills do nothing.
             foreach (var unread in accesses.GroupBy(a => Find(a.Id)).ToList())
             {
@@ -232,8 +256,16 @@ public static class StackSplitting
                 }
             Trace?.Invoke($"object [{start}, {end}) at {offset}: {accesses.Count} accesses, {pieces} pieces, {groups.Count} lifetimes");
             if (groups.Count < 2) continue;
+            // What the caller left above the return address is read where it is; the other lifetimes move.
+            var entered = new HashSet<int>();
+            for (int p = 0; p < pieces; p++)
+                if (edges[p] >= 0)
+                    entered.Add(Find(entryBase + p));
+            List<IGrouping<int, Access>> moving = groups.Any(g => entered.Contains(g.Key))
+                ? groups.Where(g => !entered.Contains(g.Key)).ToList()
+                : groups.Skip(1).ToList();
             int size = end - start;
-            foreach (var group in groups.Skip(1))
+            foreach (var group in moving)
             {
                 int newStart = nextBase;
                 nextBase -= Math.Max(0x100, (size + 0xFF) & ~0xFF);

@@ -34,14 +34,13 @@ internal static class Program
           --state-machines       decompile: write iterators and async methods as the classes the compiler made of
                                  them (no "yield return" or "await")
           --signatures <path>    decompile: signature file or folder for recognizing runtime functions
-          --identifications <f>  decompile: answers of the identification model (python -m rewind_nn.identify run)
           -v, --verbose          print progress details
         """;
 
     private sealed class Options
     {
         public string Command = "";
-        public string? Input, OutDir, Metadata, Binary, Abi, Unity, Signatures, Identifications, CSharp;
+        public string? Input, OutDir, Metadata, Binary, Abi, Unity, Signatures, CSharp;
         public bool StateMachines;
         public List<string> Assemblies = [];
         public bool Verbose, NoSource;
@@ -116,7 +115,6 @@ internal static class Program
                 case "--abi": o.Abi = Next(); break;
                 case "--unity": o.Unity = Next(); break;
                 case "--signatures": o.Signatures = Next(); break;
-                case "--identifications": o.Identifications = Next(); break;
                 case "--csharp": o.CSharp = Next(); break;
                 case "--state-machines": o.StateMachines = true; break;
                 case "--assembly": if (Next() is { } name) o.Assemblies.Add(name); break;
@@ -204,10 +202,7 @@ internal static class Program
                                   "Unity version and build configuration); method bodies will be largely incomplete.");
             else if (!found.ExactVersion)
                 Console.WriteLine("note:     no signature library for exactly this Unity version; the closest one was used.");
-            Rewind.Analysis.Runtime.ModelIdentifications? identified = o.Identifications != null ? Rewind.Analysis.Runtime.ModelIdentifications.Load(o.Identifications) : null;
-            program = new Rewind.Analysis.ProgramAnalysis(model, found.Helpers, found.Context, identified);
-            if (identified != null)
-                Console.WriteLine($"model:    {identified.ByAddress.Count} functions identified by the model; {program.ModelHelpers.Count} of them are runtime helpers the decompiler translates");
+            program = new Rewind.Analysis.ProgramAnalysis(model, found.Helpers, found.Context);
         }
         else
         {

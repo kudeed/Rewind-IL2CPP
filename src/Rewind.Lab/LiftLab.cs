@@ -40,10 +40,7 @@ internal static class LiftLab
             var matched = library.Match(index, model.Image, context.FunctionStarts.Where(a => !context.IsManaged(a)), out var report);
             Console.WriteLine($"helpers from {Path.GetFileName(symbolsPath)}: {report}");
             var watch = Stopwatch.StartNew();
-            var identified = Rewind.Analysis.Runtime.ModelIdentifications.FromEnvironment();
-            var analysis = new ProgramAnalysis(model, matched, context, identified);
-            if (identified != null)
-                Console.WriteLine($"model identifications: {identified.ByAddress.Count} loaded ({identified.Source}); {analysis.ModelHelpers.Count} became runtime helpers");
+            var analysis = new ProgramAnalysis(model, matched, context);
             Console.WriteLine($"exact copies: {analysis.ExactCopies.Copies.Count} of {analysis.ExactCopies.Examined} unlisted functions equal a listed method ({analysis.ExactCopies.Rounds} rounds); witnessed copies: {analysis.InlineCopies.Count}; program analysis {watch.ElapsedMilliseconds} ms");
             return analysis;
         }
@@ -123,11 +120,6 @@ internal static class LiftLab
         return 0;
     }
 
-    /// <summary>
-    /// check-proposal &lt;input&gt; &lt;symbols|sig&gt; &lt;hex address&gt;: for each candidate the model proposed for an unnamed
-    /// function (REWIND_IDENTIFICATIONS), the candidate recovered from its own code and from the function's code,
-    /// and where the two differ.
-    /// </summary>
     /// <summary>copy-check &lt;input&gt; &lt;symbols|sig&gt; &lt;hex address&gt; &lt;hex original&gt;: the function at an address read as the listed method at another, next to that method's own code.</summary>
     public static int CopyCheck(Il2CppModel model, string symbolsPath, ulong address, ulong original)
     {
@@ -147,32 +139,6 @@ internal static class LiftLab
         return 0;
     }
 
-    public static int CheckProposal(Il2CppModel model, string symbolsPath, ulong address)
-    {
-        ProgramAnalysis program = MakeProgram(model, symbolsPath);
-        var pipeline = new Rewind.Analysis.Recover.MethodPipeline(program);
-        if (program.Identified == null || !program.Identified.Proposals.TryGetValue(address, out var candidates))
-        {
-            Console.WriteLine("no proposals for that address");
-            return 1;
-        }
-        foreach (var (score, group) in candidates)
-        {
-            var (method, own, copy, error) = pipeline.RecoverBoth(address, group[0]);
-            Console.WriteLine($"=== {score:F4} 0x{group[0]:X} {method?.FullName}");
-            if (error != null || own == null || copy == null) { Console.WriteLine("    " + error); continue; }
-            Console.WriteLine($"    own: {own.Problems.Count} problem(s) {string.Join(" | ", own.Problems.Distinct().Take(3))}");
-            Console.WriteLine($"    as copy: {copy.Problems.Count} problem(s) {string.Join(" | ", copy.Problems.Distinct().Take(3))}");
-            string[] a = Rewind.Analysis.Hir.HirPrinter.Canonical(own).Split('\n'), b = Rewind.Analysis.Hir.HirPrinter.Canonical(copy).Split('\n');
-            int same = 0;
-            while (same < a.Length && same < b.Length && a[same] == b[same]) same++;
-            Console.WriteLine(same == a.Length && same == b.Length ? "    SAME CODE" : $"    first difference at line {same} of {a.Length}/{b.Length}:");
-            for (int i = Math.Max(0, same - 2); i < Math.Min(Math.Max(a.Length, b.Length), same + 6); i++)
-                Console.WriteLine($"      {(i < a.Length ? a[i].TrimEnd() : "-"),-70} | {(i < b.Length ? b[i].TrimEnd() : "-")}");
-        }
-        return 0;
-    }
-
     /// <summary>inline-why &lt;input&gt; &lt;symbols|sig&gt; &lt;hex address&gt;: each condition for lifting calls to a function in place.</summary>
     public static int InlineWhy(Il2CppModel model, string symbolsPath, ulong target)
     {
@@ -180,7 +146,7 @@ internal static class LiftLab
         Console.WriteLine($"section {model.Image.SectionAt(target)?.Name}; noreturn {program.Context.NoReturn.Contains(target)}; helper {program.Helpers.At(target)?.Kind}");
         Console.WriteLine($"range {program.RangeOf(target)}; exception info {program.ExceptionInfo(target) != null}");
         var t = program.Resolve(target);
-        Console.WriteLine($"resolve: managed {t.IsManaged} ({string.Join(", ", t.Methods.Select(m => m.FullName).Concat(t.Insts.Select(i => i.ToString())).Take(3))}) helper {t.Helper?.Kind} model {t.Model != null}");
+        Console.WriteLine($"resolve: managed {t.IsManaged} ({string.Join(", ", t.Methods.Select(m => m.FullName).Concat(t.Insts.Select(i => i.ToString())).Take(3))}) helper {t.Helper?.Kind}");
         Console.WriteLine($"should inline: {program.ShouldInline(target)}");
         return 0;
     }
@@ -209,9 +175,11 @@ internal static class LiftLab
             Rewind.Analysis.Passes.StackSplitting.Trace = text => Console.WriteLine("  [split] " + text);
             Rewind.Analysis.Passes.ExceptionStacks.Trace = text => Console.WriteLine("  [stack] " + text);
         }
+        // Several methods at once: filters separated by '|'.
+        string[] filters = filter.Split('|', StringSplitOptions.RemoveEmptyEntries);
         foreach (MethodDef method in model.Methods)
         {
-            if (!method.FullName.Contains(filter, StringComparison.Ordinal)) continue;
+            if (!filters.Any(f => method.FullName.Contains(f, StringComparison.Ordinal))) continue;
             if (method.Address == 0)
             {
                 // A method of a generic class (or a generic method): only its instantiations have code.
@@ -320,7 +288,6 @@ internal static class LiftLab
             perAssembly[asm] = tally;
         }
         Console.WriteLine($"recovered {total} methods in {sw.ElapsedMilliseconds} ms: {clean} clean ({100.0 * clean / Math.Max(1, total):F1}%), {crashed} crashed");
-        if (program.ProposalsChecked != 0) Console.WriteLine($"model proposals: {program.ProposalsChecked} checked, {program.ProposalsConfirmed} confirmed by equal recovered code");
         foreach (var (asm, t) in perAssembly.OrderByDescending(kv => kv.Value.Total).Take(12))
             Console.WriteLine($"  {asm,-40} {t.Clean,6}/{t.Total,-6} {100.0 * t.Clean / Math.Max(1, t.Total):F1}%");
         Console.WriteLine("most common gaps:");

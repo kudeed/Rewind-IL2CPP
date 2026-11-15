@@ -289,11 +289,6 @@ public sealed class HMethod
     public List<string> Notes = [];
     /// <summary>Try regions by index (see HBlock.Scope).</summary>
     public Dictionary<int, HTryRegion> TryRegions = [];
-    /// <summary>
-    /// Call targets known only as "the same code as these methods" (a checked model proposal) where none of the
-    /// methods fits the call. Recovering again with their code lifted in place expresses the call exactly.
-    /// </summary>
-    public HashSet<ulong> UnfitTargets = [];
     /// <summary>For inspection: the types the recovery gave stack memory, by offset from the entry stack pointer.</summary>
     public Dictionary<int, TypeSig> FrameTypes = [];
 

@@ -2,6 +2,7 @@ using Rewind.Analysis.Abi;
 using Rewind.Analysis.Hir;
 using Rewind.Analysis.Ir;
 using Rewind.Analysis.Passes;
+using Rewind.Analysis.Runtime;
 using Rewind.Analysis.X64;
 using Rewind.Model;
 
@@ -31,7 +32,6 @@ public sealed class MethodPipeline
         _program = program;
         _lifter = program.NewLifter();
         _normalizer = new Normalizer(program);
-        program.CopyVerifier ??= VerifyCopy;
     }
 
     /// <summary>
@@ -113,13 +113,6 @@ public sealed class MethodPipeline
         return false;
     }
 
-    /// <summary>
-    /// Checks a proposal of the identification model: is the unnamed function at <paramref name="address"/> a
-    /// private copy of the listed method(s) at <paramref name="originals"/>? It is when reading its machine code
-    /// as that method gives, statement for statement, the code the method's own machine code gives - both
-    /// recovered completely. The compiler may lay the two out differently and use other registers; what they do
-    /// is then the same as far as recovery can tell, which is as far as its output goes anyway.
-    /// </summary>
     /// <summary>For inspection: the listed method at <paramref name="original"/> recovered from its own code and from the code at <paramref name="address"/>.</summary>
     public (MethodDef? Method, HMethod? Own, HMethod? Copy, string? Error) RecoverBoth(ulong address, ulong original)
     {
@@ -142,43 +135,7 @@ public sealed class MethodPipeline
         }
     }
 
-    private bool VerifyCopy(ulong address, ulong[] originals)
-    {
-        foreach (ulong original in originals)
-        {
-            MethodDef? method = null;
-            TypeSig[] classArgs = [], methodArgs = [];
-            if (_program.Model.MethodsByAddress.TryGetValue(original, out List<MethodDef>? defs))
-                method = defs.FirstOrDefault(m => m.DeclaringType.GenericParameters.Length == 0 && m.GenericParameters.Length == 0);
-            if (method == null && _program.Model.InstsByAddress.TryGetValue(original, out List<MethodInst>? insts) && insts.Count != 0)
-                (method, classArgs, methodArgs) = (insts[0].Method, insts[0].ClassArguments, insts[0].MethodArguments);
-            if (method == null) continue;
-            try
-            {
-                // A check can start while this pipeline is in the middle of lifting (the lifter asks about a call
-                // target): the work is done by a pipeline of its own.
-                var inner = new MethodPipeline(_program);
-                if (!_program.OwnCanonical.TryGetValue(original, out string? own))
-                {
-                    HMethod recovered = inner.Build(inner.Lift(method, classArgs, methodArgs, original));
-                    _program.OwnCanonical[original] = own = recovered.Problems.Count == 0 ? HirPrinter.Canonical(recovered) : null;
-                }
-                if (own == null) return false;
-                HMethod copy = inner.Build(inner.Lift(method, classArgs, methodArgs, address));
-                return copy.Problems.Count == 0 && HirPrinter.Canonical(copy) == own;
-            }
-            catch (Exception e) when (e is not OutOfMemoryException and not StackOverflowException)
-            {
-                return false;
-            }
-        }
-        return false;
-    }
-
-    /// <summary>
-    /// Lifts and builds; when a call could only be named by methods that do not fit it (HMethod.UnfitTargets),
-    /// once more with those targets' code lifted in place.
-    /// </summary>
+    /// <summary>Lifts and builds the method from the code at <paramref name="address"/>.</summary>
     private HMethod RecoverAt(MethodDef method, TypeSig[]? classArgs, TypeSig[]? methodArgs, ulong address)
     {
         // A definition's own type parameters as the arguments: the body its reference-type instantiations share
@@ -192,26 +149,11 @@ public sealed class MethodPipeline
         (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters) = (own, own);
         try
         {
-            return RecoverBody(method, classArgs, methodArgs, address);
-        }
-        finally
-        {
-            (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters) = (builder, layouts);
-        }
-    }
-
-    private HMethod RecoverBody(MethodDef method, TypeSig[]? classArgs, TypeSig[]? methodArgs, ulong address)
-    {
-        HMethod result = Build(Lift(method, classArgs, methodArgs, address));
-        if (result.UnfitTargets.Count == 0) return result;
-        var forced = result.UnfitTargets.Where(_program.Unresolved.Add).ToList();
-        try
-        {
             return Build(Lift(method, classArgs, methodArgs, address));
         }
         finally
         {
-            foreach (ulong target in forced) _program.Unresolved.Remove(target);
+            (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters) = (builder, layouts);
         }
     }
 
@@ -318,6 +260,7 @@ public sealed class MethodPipeline
 
     private GuardedAccessorFolding? _guardedAccessors;
     private InlineFolding? _inlineFolding;
+    private static readonly bool NoStructsAgain = Environment.GetEnvironmentVariable("REWIND_NO_STRUCTS_AFTER_GUARDS") != null;
 
     private HMethod Build(LiftedMethod lifted)
     {
@@ -349,7 +292,9 @@ public sealed class MethodPipeline
             _program.OwnTranslation = before;
             _program.NamedVerifier = verifier;
         }
-        (_guardedAccessors ??= new GuardedAccessorFolding(this)).Run(result);
+        // A networked property read in the middle of a struct being filled kept the stores apart (its check is a
+        // branch): with the read put back they are one run, which may be one struct made in one go.
+        if ((_guardedAccessors ??= new GuardedAccessorFolding(this)).Run(result) && !NoStructsAgain) StructFolding.Run(result, _program, this);
         (_inlineFolding ??= new InlineFolding(this, _program)).Run(result);
         if (WrapperFolding.Lift(result, this))
         {
@@ -416,6 +361,21 @@ public sealed class MethodPipeline
         foreach (string text in found) method.Problems.Add($"native operation left in the code ({text})");
     }
 
+    private static readonly bool NoSharedConstructors = Environment.GetEnvironmentVariable("REWIND_NO_SHARED_CONSTRUCTORS") != null;
+
+    /// <summary>The type argument whose code a type argument's code is shared with: "object" for a reference type (in a struct's arguments too).</summary>
+    private TypeSig Shared(TypeSig type)
+    {
+        if (type is PointerSig or ByRefSig or GenericParamSig or OpaqueSig) return type;
+        if (!type.IsValueType) return _program.Model.Sigs.Primitive(Rewind.Runtime.Il2CppTypeEnum.Object);
+        if (type is GenericInstSig g)
+        {
+            TypeSig[] arguments = g.Arguments.Select(Shared).ToArray();
+            return arguments.SequenceEqual(g.Arguments) ? type : _program.Model.Sigs.GenericInst(g.Definition, arguments);
+        }
+        return type;
+    }
+
     private readonly Dictionary<(MethodDef, string), HMethod?> _constructorBodies = [];
     private readonly HashSet<MethodDef> _recovering = [];
 
@@ -438,14 +398,21 @@ public sealed class MethodPipeline
             }
             else
             {
-                foreach (MethodInst inst in _program.InstsOf(constructor))
+                // The instantiation's own code - or, for reference types among the type arguments, the code
+                // they share (every class runs what was made for "object").
+                for (int form = 0; form < (NoSharedConstructors ? 1 : 2) && lifted == null; form++)
                 {
-                    if (inst.MethodArguments.Length != 0 || inst.ClassArguments.Length != classArguments.Length) continue;
-                    bool same = true;
-                    for (int i = 0; i < classArguments.Length && same; i++) same = ReferenceEquals(inst.ClassArguments[i], classArguments[i]);
-                    if (!same) continue;
-                    lifted = Lift(inst.Method, inst.ClassArguments, inst.MethodArguments, inst.Address);
-                    break;
+                    TypeSig[] wanted = form == 0 ? classArguments : classArguments.Select(Shared).ToArray();
+                    if (form == 1 && wanted.SequenceEqual(classArguments)) break;
+                    foreach (MethodInst inst in _program.InstsOf(constructor))
+                    {
+                        if (inst.Address == 0 || inst.MethodArguments.Length != 0 || inst.ClassArguments.Length != wanted.Length) continue;
+                        bool same = true;
+                        for (int i = 0; i < wanted.Length && same; i++) same = ReferenceEquals(inst.ClassArguments[i], wanted[i]);
+                        if (!same) continue;
+                        lifted = Lift(inst.Method, inst.ClassArguments, inst.MethodArguments, inst.Address);
+                        break;
+                    }
                 }
             }
             if (lifted != null)
@@ -736,9 +703,46 @@ public sealed class MethodPipeline
     private bool WritesAndNothingElse(Node call, int inputIndex) =>
         BlockCopies.Access(call, inputIndex, _program.Helpers, out _, out bool blockReads, out bool blockWrites) && blockWrites && !blockReads;
 
-    /// <summary>True when the callee only reads the memory a pointer argument points to (the source of a copy).</summary>
-    private bool ReadsOnly(Node call, int inputIndex) =>
-        BlockCopies.Access(call, inputIndex, _program.Helpers, out _, out _, out bool blockWrites) && !blockWrites;
+    /// <summary>True when the callee only reads the memory a pointer argument points to (the source of a copy, a value being boxed).</summary>
+    private bool ReadsOnly(Node call, int inputIndex)
+    {
+        if (BlockCopies.Access(call, inputIndex, _program.Helpers, out _, out _, out bool blockWrites)) return !blockWrites;
+        if (call.Aux is not CallInfo { Indirect: false, Intrinsic: null } info || inputIndex >= info.Slots.Count ||
+            info.Slots[inputIndex] is not { Kind: ArgSlotKind.IntReg } slot || _program.Resolve(info.Target).Helper is not { } helper)
+            return false;
+        return HelperReads(call, info, helper.Kind, slot.Index) > 0;
+    }
+
+    /// <summary>
+    /// How many bytes a runtime helper reads through the stack address in argument <paramref name="position"/>, and
+    /// does nothing else with: Box(klass, &amp;value) one value of the class, a C++ throw the wrapper of the exception
+    /// (one pointer). -1 when that is not known (the unbox helpers write a value whose size is not the class's).
+    /// </summary>
+    private int HelperReads(Node call, CallInfo info, HelperKind kind, int position)
+    {
+        if (NoHelperExtents) return -1;
+        if (kind == HelperKind.CxxThrow && position == 0) return _program.Model.Image.PointerSize;
+        if (kind != HelperKind.Box || position != 1) return -1;
+        for (int i = 0; i < info.Slots.Count && i < call.In.Length; i++)
+        {
+            if (info.Slots[i] is not { Kind: ArgSlotKind.IntReg, Index: 0 }) continue;
+            if (SlotClass(call.In[i]) is not { IsValueType: true } type || type.ContainsGenericParameter) return -1;
+            var (size, _, known) = _program.Layouts.SizeOf(type);
+            return known && size > 0 ? size : -1;
+        }
+        return -1;
+    }
+
+    private static readonly bool NoHelperExtents = Environment.GetEnvironmentVariable("REWIND_NO_HELPER_EXTENTS") != null;
+
+    /// <summary>The class a metadata slot value names, when it names one.</summary>
+    private TypeSig? SlotClass(Node value)
+    {
+        if (value.Op != Op.SlotValue) return null;
+        ulong slot = (ulong)value.Imm;
+        return _program.Defaults.Slots.TryGetValue(slot, out TypeDef? def) ? def.Sig
+            : _program.Model.ResolveUsageSlot(slot) is { Kind: UsageKind.TypeInfo, Type: { } usage } ? usage : null;
+    }
 
     /// <summary>
     /// Values boxed in place: generated code writes an object header (the class, then a mark) on the stack in
@@ -754,9 +758,7 @@ public sealed class MethodPipeline
             foreach (Node n in b.Nodes)
             {
                 if (n.Dead || n.Op != Op.Store || n.In[1].Op != Op.SlotValue || StackOffset(sp0, n.In[0]) is not int at) continue;
-                ulong slot = (ulong)n.In[1].Imm;
-                TypeSig? type = _program.Defaults.Slots.TryGetValue(slot, out TypeDef? def) ? def.Sig
-                    : _program.Model.ResolveUsageSlot(slot) is { Kind: UsageKind.TypeInfo, Type: { } usage } ? usage : null;
+                TypeSig? type = SlotClass(n.In[1]);
                 if (type is not { IsValueType: true } || type.ContainsGenericParameter) continue;
                 var (size, _, known) = _program.Layouts.SizeOf(type);
                 if (!known) continue;
@@ -780,7 +782,7 @@ public sealed class MethodPipeline
                 if (call.Dead || call.Op is not (Op.Call or Op.TailCall) || call.Aux is not CallInfo { Indirect: false, Intrinsic: null } info) continue;
                 if (info.Slots.Count != call.In.Length || call.In.Length == 0) continue;
                 CallTarget target = _program.Resolve(info.Target);
-                if (!target.IsManaged || target.Helper != null || target.Model != null || target.Forwarded) continue;
+                if (!target.IsManaged || target.Helper != null || target.Forwarded) continue;
                 var integer = new HashSet<int>();
                 var floating = new HashSet<int>();
                 bool unknown = false;
@@ -929,12 +931,7 @@ public sealed class MethodPipeline
         if (position < 0) return -1;
 
         CallTarget target = _program.Resolve(info.Target);
-        if (target.Helper != null)
-        {
-            // Box(klass, &value) and the unbox helpers read or write one value of the class's size; the caller
-            // sizes these by the type it resolves later, so stay conservative but bounded.
-            return -1;
-        }
+        if (target.Helper != null) return HelperReads(call, info, target.Helper.Kind, position);
 
         int extent = -1, objects = 0, others = 0;
         void Consider(MethodAbi abi)
