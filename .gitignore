@@ -1,0 +1,42 @@
+# Build output
+bin/
+obj/
+artifacts/
+TestResults/
+*.nupkg
+
+# IDE and editor state
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.swp
+*~
+
+# OS files
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Local backups, scratch and decompiler output
+/src - old backup/
+out/
+*.bak
+*.log
+
+# Game files never belong in this repository. Test games, the corpus, ground
+# truth and outputs live in the sibling "IL2CPP Decompiler tools n stuff" folder.
+*.exe
+*.dll
+*.pdb
+*.so
+*.dylib
+*.apk
+*.xapk
+*.apks
+*.aab
+*.ipa
+global-metadata.dat
+*_Data/
+*_BackUpThisFolder_ButDontShipItWithYourGame/

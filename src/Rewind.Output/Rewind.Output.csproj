@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Rewind.Output</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Rewind.Core\Rewind.Core.csproj" />
+    <ProjectReference Include="..\Rewind.Analysis\Rewind.Analysis.csproj" />
+    <PackageReference Include="Mono.Cecil" Version="0.11.6" />
+    <PackageReference Include="ICSharpCode.Decompiler" Version="11.2.0.10050" />
+  </ItemGroup>
+</Project>

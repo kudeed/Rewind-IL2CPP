@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Rewind.Analysis</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Gee.External.Capstone" Version="2.3.0" />
+    <ProjectReference Include="..\Rewind.Core\Rewind.Core.csproj" />
+    <PackageReference Include="Iced" Version="1.22.0" />
+  </ItemGroup>
+</Project>
