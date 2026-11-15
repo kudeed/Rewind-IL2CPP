@@ -192,7 +192,8 @@ public sealed class Normalizer(ProgramAnalysis program)
     {
         // Merges of one value (left behind when a lookup collapsed into the value it looked up) are that value.
         foreach (Block b in _fn.Blocks.ToList()) SimplifyPhis(b);
-        bool changed = RefoldTruncations();
+        bool changed = CollapsePhiCycles();
+        changed |= RefoldTruncations();
         changed |= RejoinSplitMerges();
         changed |= UseKnownZeros();
         changed |= FoldKnownBranches();
@@ -1264,6 +1265,56 @@ public sealed class Normalizer(ProgramAnalysis program)
         if (!any) return;
         block.Phis.RemoveAll(n => n.Dead);
         ApplyReplacements();
+    }
+
+    private static readonly bool NoPhiCycles = Environment.GetEnvironmentVariable("REWIND_NO_PHI_CYCLES") != null;
+
+    /// <summary>
+    /// Merges that only pass one value around: each is given that value or another merge of the group, as a frame
+    /// pointer kept in a register through a loop is. They are all that value. (SimplifyPhis looks at one merge at a
+    /// time and does not see through the cycle; a stack address hidden that way escapes the stack analyses.)
+    /// </summary>
+    private bool CollapsePhiCycles()
+    {
+        if (NoPhiCycles) return false;
+        bool any = false;
+        foreach (Block b in _fn.Blocks)
+            foreach (Node phi in b.Phis)
+            {
+                if (phi.Dead) continue;
+                Node? value = null;
+                var group = new HashSet<Node> { phi };
+                var work = new Stack<Node>();
+                work.Push(phi);
+                bool single = true;
+                while (single && work.Count > 0)
+                    foreach (Node raw in work.Pop().In)
+                    {
+                        Node input = Resolve(raw);
+                        if (input.Op == Op.Phi)
+                        {
+                            if (group.Add(input)) work.Push(input);
+                            continue;
+                        }
+                        if (value == null) value = input;
+                        else if (!SameValue(input, value))
+                        {
+                            single = false;
+                            break;
+                        }
+                    }
+                if (!single || value == null || group.Count < 2) continue;
+                foreach (Node merged in group)
+                {
+                    _replace[merged] = value;
+                    merged.Dead = true;
+                }
+                any = true;
+            }
+        if (!any) return false;
+        foreach (Block b in _fn.Blocks) b.Phis.RemoveAll(n => n.Dead);
+        ApplyReplacements();
+        return true;
     }
 
     private bool RemoveUnreachable()

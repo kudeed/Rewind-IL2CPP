@@ -176,11 +176,12 @@ public sealed partial class HirBuilder
         if (NoScalarConflicts) return;
         // The same with a reference kept where a small number is, or a number where a reference is: the
         // compiler used one slot for two variables, one after the other. (Nothing is reported: where the two
-        // lifetimes can be told apart they are, and the next build has a variable for each.)
+        // lifetimes can be told apart they are, and the next build has a variable for each.) A double counts too:
+        // unlike a long, it is never what an untyped slot is taken for.
         static bool IsSmallNumber(TypeSig? t) => t switch
         {
             PrimitiveSig p => p.Element is Il2CppTypeEnum.Boolean or Il2CppTypeEnum.Char or Il2CppTypeEnum.I1 or Il2CppTypeEnum.U1 or Il2CppTypeEnum.I2 or
-                Il2CppTypeEnum.U2 or Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4 or Il2CppTypeEnum.R4,
+                Il2CppTypeEnum.U2 or Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4 or Il2CppTypeEnum.R4 or Il2CppTypeEnum.R8,
             { Definition: { IsEnum: true } } => true,
             _ => false,
         };
@@ -459,6 +460,7 @@ public sealed partial class HirBuilder
         SettlePhis();
         RefineFloatPhis();
         RefinePhiJoins();
+        RefinePhiStructs();
         RefineFrameTypes();
         foreach (PendingCopy copy in _pendingCopies) Problem($"only part of a {copy.Type.ShortName} was copied");
         CheckFrameVariables();
@@ -889,6 +891,8 @@ public sealed partial class HirBuilder
             // A merged reference holds whatever any way in gives it, so its type must be one that every such
             // value fits: the nearest common base, not the type of whichever value came first. (A value the
             // code has checked to be of a class counts as that class.)
+            if (value is not HConst && IsStructType(value.Type) && IsStructType(variable.Type) && !Open(value.Type))
+                _phiStructs[phi] = _phiStructs.TryGetValue(phi, out TypeSig? seen) && (seen == null || seen.Key != value.Type!.Key) ? null : value.Type;
             TypeSig? incoming = _castTypes.TryGetValue(input, out List<TypeSig>? checkedAs) && checkedAs.Count == 1 ? checkedAs[0] : value.Type;
             if (value is not HConst && incoming != null && IsReference(incoming) && !Open(incoming))
                 _phiJoins[phi] = _phiJoins.TryGetValue(phi, out TypeSig? soFar) ? JoinTypes(soFar, incoming) : incoming;
@@ -939,6 +943,25 @@ public sealed partial class HirBuilder
             PhiTypesRefined = true;
         }
     }
+    /// <summary>The struct type all values a merged struct was given in this build have (null where they differ).</summary>
+    private readonly Dictionary<Node, TypeSig?> _phiStructs = [];
+
+    /// <summary>
+    /// A merged struct typed as something none of its values is: the type was taken over from an earlier build,
+    /// before the stack object its values come from was found to be another struct of that size (two methods
+    /// folded into one body, each of its own struct). It takes the type its values have now.
+    /// </summary>
+    private void RefinePhiStructs()
+    {
+        foreach (var (phi, type) in _phiStructs)
+        {
+            if (type == null || !_phiVar.TryGetValue(phi, out HVar? variable) || type.Key == variable.Type.Key) continue;
+            if (_p.Layouts.SizeOf(type).Size != _p.Layouts.SizeOf(variable.Type).Size) continue;
+            PhiTypes[phi] = type;
+            PhiTypesRefined = true;
+        }
+    }
+
     /// <summary>How often a merged value of integer type was used where a float is expected, and as which float type.</summary>
     private readonly Dictionary<Node, (int Count, TypeSig Type)> _floatUses = [];
 

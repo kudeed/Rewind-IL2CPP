@@ -34,6 +34,9 @@ internal static class GapCover
         var pipeline = new MethodPipeline(program);
         var perMethod = new List<HashSet<string>>();
         int total = 0, clean = 0, crashed = 0;
+        // REWIND_GAP_LIST=<file>: every method with what blocks it, to compare two rounds method by method.
+        string? listPath = Environment.GetEnvironmentVariable("REWIND_GAP_LIST");
+        List<string>? listed = listPath != null ? [] : null;
         foreach (MethodDef method in model.Methods)
         {
             if (method.Address == 0) continue;
@@ -44,15 +47,18 @@ internal static class GapCover
             try
             {
                 HMethod h = pipeline.Recover(method);
+                listed?.Add($"0x{method.Address:X}\t{method.FullName}\t{(h.Problems.Count == 0 ? "complete" : string.Join(" | ", h.Problems.Distinct().Take(4)))}");
                 if (h.Problems.Count == 0) { clean++; continue; }
                 perMethod.Add(h.Problems.Select(Kind).ToHashSet());
             }
-            catch (Exception)
+            catch (Exception e)
             {
+                listed?.Add($"0x{method.Address:X}\t{method.FullName}\tcrash {e.GetType().Name}");
                 crashed++;
                 perMethod.Add(["crash"]);
             }
         }
+        if (listPath != null) File.WriteAllLines(listPath, listed!);
         Console.WriteLine($"{total} methods: {clean} complete ({100.0 * clean / Math.Max(1, total):F1}%), {perMethod.Count} blocked, {crashed} crashed");
 
         var fixedKinds = new HashSet<string>();

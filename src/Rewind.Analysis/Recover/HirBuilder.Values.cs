@@ -1829,12 +1829,14 @@ public sealed partial class HirBuilder
 
     // ---- stack locals ------------------------------------------------------------------------------------------
 
+    private static readonly bool FrameDebug = Environment.GetEnvironmentVariable("REWIND_FRAME_DEBUG") != null;
+
     private HVar FrameVar(int offset, TypeSig type)
     {
         var key = (offset, type.Key);
         if (!_frameVars.TryGetValue(key, out HVar? variable))
         {
-            variable = _h.NewLocal(type, "local");
+            variable = _h.NewLocal(type, FrameDebug ? $"local_{-offset:X}_" : "local");
             variable.AddressTaken = true;
             _frameVars[key] = variable;
         }

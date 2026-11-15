@@ -2,6 +2,7 @@ using Rewind.Analysis.Abi;
 using Rewind.Analysis.Hir;
 using Rewind.Analysis.Ir;
 using Rewind.Analysis.Passes;
+using Rewind.Analysis.Runtime;
 using Rewind.Analysis.X64;
 using Rewind.Model;
 
@@ -702,9 +703,46 @@ public sealed class MethodPipeline
     private bool WritesAndNothingElse(Node call, int inputIndex) =>
         BlockCopies.Access(call, inputIndex, _program.Helpers, out _, out bool blockReads, out bool blockWrites) && blockWrites && !blockReads;
 
-    /// <summary>True when the callee only reads the memory a pointer argument points to (the source of a copy).</summary>
-    private bool ReadsOnly(Node call, int inputIndex) =>
-        BlockCopies.Access(call, inputIndex, _program.Helpers, out _, out _, out bool blockWrites) && !blockWrites;
+    /// <summary>True when the callee only reads the memory a pointer argument points to (the source of a copy, a value being boxed).</summary>
+    private bool ReadsOnly(Node call, int inputIndex)
+    {
+        if (BlockCopies.Access(call, inputIndex, _program.Helpers, out _, out _, out bool blockWrites)) return !blockWrites;
+        if (call.Aux is not CallInfo { Indirect: false, Intrinsic: null } info || inputIndex >= info.Slots.Count ||
+            info.Slots[inputIndex] is not { Kind: ArgSlotKind.IntReg } slot || _program.Resolve(info.Target).Helper is not { } helper)
+            return false;
+        return HelperReads(call, info, helper.Kind, slot.Index) > 0;
+    }
+
+    /// <summary>
+    /// How many bytes a runtime helper reads through the stack address in argument <paramref name="position"/>, and
+    /// does nothing else with: Box(klass, &amp;value) one value of the class, a C++ throw the wrapper of the exception
+    /// (one pointer). -1 when that is not known (the unbox helpers write a value whose size is not the class's).
+    /// </summary>
+    private int HelperReads(Node call, CallInfo info, HelperKind kind, int position)
+    {
+        if (NoHelperExtents) return -1;
+        if (kind == HelperKind.CxxThrow && position == 0) return _program.Model.Image.PointerSize;
+        if (kind != HelperKind.Box || position != 1) return -1;
+        for (int i = 0; i < info.Slots.Count && i < call.In.Length; i++)
+        {
+            if (info.Slots[i] is not { Kind: ArgSlotKind.IntReg, Index: 0 }) continue;
+            if (SlotClass(call.In[i]) is not { IsValueType: true } type || type.ContainsGenericParameter) return -1;
+            var (size, _, known) = _program.Layouts.SizeOf(type);
+            return known && size > 0 ? size : -1;
+        }
+        return -1;
+    }
+
+    private static readonly bool NoHelperExtents = Environment.GetEnvironmentVariable("REWIND_NO_HELPER_EXTENTS") != null;
+
+    /// <summary>The class a metadata slot value names, when it names one.</summary>
+    private TypeSig? SlotClass(Node value)
+    {
+        if (value.Op != Op.SlotValue) return null;
+        ulong slot = (ulong)value.Imm;
+        return _program.Defaults.Slots.TryGetValue(slot, out TypeDef? def) ? def.Sig
+            : _program.Model.ResolveUsageSlot(slot) is { Kind: UsageKind.TypeInfo, Type: { } usage } ? usage : null;
+    }
 
     /// <summary>
     /// Values boxed in place: generated code writes an object header (the class, then a mark) on the stack in
@@ -720,9 +758,7 @@ public sealed class MethodPipeline
             foreach (Node n in b.Nodes)
             {
                 if (n.Dead || n.Op != Op.Store || n.In[1].Op != Op.SlotValue || StackOffset(sp0, n.In[0]) is not int at) continue;
-                ulong slot = (ulong)n.In[1].Imm;
-                TypeSig? type = _program.Defaults.Slots.TryGetValue(slot, out TypeDef? def) ? def.Sig
-                    : _program.Model.ResolveUsageSlot(slot) is { Kind: UsageKind.TypeInfo, Type: { } usage } ? usage : null;
+                TypeSig? type = SlotClass(n.In[1]);
                 if (type is not { IsValueType: true } || type.ContainsGenericParameter) continue;
                 var (size, _, known) = _program.Layouts.SizeOf(type);
                 if (!known) continue;
@@ -895,12 +931,7 @@ public sealed class MethodPipeline
         if (position < 0) return -1;
 
         CallTarget target = _program.Resolve(info.Target);
-        if (target.Helper != null)
-        {
-            // Box(klass, &value) and the unbox helpers read or write one value of the class's size; the caller
-            // sizes these by the type it resolves later, so stay conservative but bounded.
-            return -1;
-        }
+        if (target.Helper != null) return HelperReads(call, info, target.Helper.Kind, position);
 
         int extent = -1, objects = 0, others = 0;
         void Consider(MethodAbi abi)
