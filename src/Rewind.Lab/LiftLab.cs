@@ -175,9 +175,11 @@ internal static class LiftLab
             Rewind.Analysis.Passes.StackSplitting.Trace = text => Console.WriteLine("  [split] " + text);
             Rewind.Analysis.Passes.ExceptionStacks.Trace = text => Console.WriteLine("  [stack] " + text);
         }
+        // Several methods at once: filters separated by '|'.
+        string[] filters = filter.Split('|', StringSplitOptions.RemoveEmptyEntries);
         foreach (MethodDef method in model.Methods)
         {
-            if (!method.FullName.Contains(filter, StringComparison.Ordinal)) continue;
+            if (!filters.Any(f => method.FullName.Contains(f, StringComparison.Ordinal))) continue;
             if (method.Address == 0)
             {
                 // A method of a generic class (or a generic method): only its instantiations have code.

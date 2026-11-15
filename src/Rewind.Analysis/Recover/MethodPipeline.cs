@@ -259,6 +259,7 @@ public sealed class MethodPipeline
 
     private GuardedAccessorFolding? _guardedAccessors;
     private InlineFolding? _inlineFolding;
+    private static readonly bool NoStructsAgain = Environment.GetEnvironmentVariable("REWIND_NO_STRUCTS_AFTER_GUARDS") != null;
 
     private HMethod Build(LiftedMethod lifted)
     {
@@ -290,7 +291,9 @@ public sealed class MethodPipeline
             _program.OwnTranslation = before;
             _program.NamedVerifier = verifier;
         }
-        (_guardedAccessors ??= new GuardedAccessorFolding(this)).Run(result);
+        // A networked property read in the middle of a struct being filled kept the stores apart (its check is a
+        // branch): with the read put back they are one run, which may be one struct made in one go.
+        if ((_guardedAccessors ??= new GuardedAccessorFolding(this)).Run(result) && !NoStructsAgain) StructFolding.Run(result, _program, this);
         (_inlineFolding ??= new InlineFolding(this, _program)).Run(result);
         if (WrapperFolding.Lift(result, this))
         {
@@ -357,6 +360,21 @@ public sealed class MethodPipeline
         foreach (string text in found) method.Problems.Add($"native operation left in the code ({text})");
     }
 
+    private static readonly bool NoSharedConstructors = Environment.GetEnvironmentVariable("REWIND_NO_SHARED_CONSTRUCTORS") != null;
+
+    /// <summary>The type argument whose code a type argument's code is shared with: "object" for a reference type (in a struct's arguments too).</summary>
+    private TypeSig Shared(TypeSig type)
+    {
+        if (type is PointerSig or ByRefSig or GenericParamSig or OpaqueSig) return type;
+        if (!type.IsValueType) return _program.Model.Sigs.Primitive(Rewind.Runtime.Il2CppTypeEnum.Object);
+        if (type is GenericInstSig g)
+        {
+            TypeSig[] arguments = g.Arguments.Select(Shared).ToArray();
+            return arguments.SequenceEqual(g.Arguments) ? type : _program.Model.Sigs.GenericInst(g.Definition, arguments);
+        }
+        return type;
+    }
+
     private readonly Dictionary<(MethodDef, string), HMethod?> _constructorBodies = [];
     private readonly HashSet<MethodDef> _recovering = [];
 
@@ -379,14 +397,21 @@ public sealed class MethodPipeline
             }
             else
             {
-                foreach (MethodInst inst in _program.InstsOf(constructor))
+                // The instantiation's own code - or, for reference types among the type arguments, the code
+                // they share (every class runs what was made for "object").
+                for (int form = 0; form < (NoSharedConstructors ? 1 : 2) && lifted == null; form++)
                 {
-                    if (inst.MethodArguments.Length != 0 || inst.ClassArguments.Length != classArguments.Length) continue;
-                    bool same = true;
-                    for (int i = 0; i < classArguments.Length && same; i++) same = ReferenceEquals(inst.ClassArguments[i], classArguments[i]);
-                    if (!same) continue;
-                    lifted = Lift(inst.Method, inst.ClassArguments, inst.MethodArguments, inst.Address);
-                    break;
+                    TypeSig[] wanted = form == 0 ? classArguments : classArguments.Select(Shared).ToArray();
+                    if (form == 1 && wanted.SequenceEqual(classArguments)) break;
+                    foreach (MethodInst inst in _program.InstsOf(constructor))
+                    {
+                        if (inst.Address == 0 || inst.MethodArguments.Length != 0 || inst.ClassArguments.Length != wanted.Length) continue;
+                        bool same = true;
+                        for (int i = 0; i < wanted.Length && same; i++) same = ReferenceEquals(inst.ClassArguments[i], wanted[i]);
+                        if (!same) continue;
+                        lifted = Lift(inst.Method, inst.ClassArguments, inst.MethodArguments, inst.Address);
+                        break;
+                    }
                 }
             }
             if (lifted != null)

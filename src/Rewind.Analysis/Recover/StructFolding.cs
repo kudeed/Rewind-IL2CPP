@@ -32,7 +32,10 @@ internal static class StructFolding
             for (int round = 0; round < 6 && FoldBlock(method, block, program, pipeline); round++) any = true;
             if (DropRepeatedClears(block)) any = true;
         }
-        if (ForwardWholeValues(method)) any = true;
+        // (After the folding: a store that repeats one before may still be part of a whole made anew.)
+        if (!NoRepeatedStores && DropRepeatedStores(method, program)) any = true;
+        if (!NoUnionCopies && UnionCopies(method, program, pipeline)) any = true;
+        if (ForwardWholeValues(method, pipeline)) any = true;
         if (any) HirCleanup.Run(method);
     }
 
@@ -104,6 +107,16 @@ internal static class StructFolding
         Walk(e, x => { if (x is HLocal l && ReferenceEquals(l.Variable, variable)) found = true; });
         return found;
     }
+
+    private static bool MentionsStatement(HStmt s, HVar variable)
+    {
+        bool found = false;
+        FinallyFolding.Visit(s, x => found |= x is HLocal l && ReferenceEquals(l.Variable, variable));
+        return found;
+    }
+
+    /// <summary>REWIND_NO_STRUCT_PARTS_ACROSS: a struct filled field by field is put together only where nothing else is done in between.</summary>
+    private static readonly bool NoPartsAcross = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_PARTS_ACROSS") != null;
 
     // ---- which memory two places can share -------------------------------------------------------------------------
 
@@ -277,6 +290,12 @@ internal static class StructFolding
         {
             HStmt s = statements[k];
             if (ReferenceEquals(s, except)) continue;
+            // A call made for what it does: only what no call can change is still what it was.
+            if (s is HEval && !NoPartsAcross)
+            {
+                if (!(proof ??= CallProof(value))) return false;
+                continue;
+            }
             if (s is not HAssign a) return false;
             // Something that does work, put somewhere: only what no call can change is still what it was.
             if (!HirBuilder.IsPure(a.Value) && !(proof ??= CallProof(value))) return false;
@@ -339,6 +358,8 @@ internal static class StructFolding
         public required HExpr Value;
         /// <summary>Where the temporary was given its value (-1: the value is written in the store itself).</summary>
         public int TempAt = -1;
+        /// <summary>The value is a variable that holds this field of a struct (see HeldPart): what it is a copy of.</summary>
+        public HField? Held;
     }
 
     /// <summary>
@@ -474,11 +495,161 @@ internal static class StructFolding
         return value;
     }
 
+    private static readonly bool NoHeldParts = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_HELD_PARTS") != null;
+    private static readonly bool NoRepeatedStores = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_REPEATED_STORES") != null;
+
+    /// <summary>
+    /// A store into a field of a struct variable that puts in what the field holds already: the same value,
+    /// stored there before - on the one way here - with neither the struct nor what the value is made of set
+    /// since. Code pasted in on two ways copies the struct field by field on each ("v.name = t" before a
+    /// test, and again on one way after it); the second store does nothing.
+    /// </summary>
+    private static bool DropRepeatedStores(HMethod method, ProgramAnalysis program)
+    {
+        bool any = false;
+        Dictionary<HBlock, List<HBlock>>? predecessors = null;
+        foreach (HBlock block in method.Blocks)
+        {
+            List<HStmt> s = block.Statements;
+            for (int i = s.Count - 1; i >= 0; i--)
+            {
+                if (s[i] is not HAssign { Target: HField { Object: HLocal { Variable: var v, Type: var vt } } target, Value: var value } || target.Field.IsStatic ||
+                    !IsStruct(vt) || !CallProof(value) || (v.AddressTaken && AddressNamed(method, v)))
+                    continue;
+                bool union = Overlaid(program, vt!);
+                // Walk back to the last statement that sets the variable or anything the value is made of.
+                HStmt? last = null;
+                HBlock current = block;
+                int k = i - 1;
+                var visited = new HashSet<HBlock> { block };
+                bool done = false;
+                for (int hops = 0; hops < 16 && !done; hops++)
+                {
+                    for (; k >= 0 && !done; k--)
+                    {
+                        if (current.Statements[k] is not HAssign { Target: var set } other) continue;
+                        HExpr root = set;
+                        HField? outer = null;
+                        while (root is HField { Object: { } inside } f && !f.Field.IsStatic && IsStruct(inside.Type))
+                        {
+                            outer = f;
+                            root = inside;
+                        }
+                        if (root is not HLocal { Variable: var written }) continue;
+                        // (Another field of the struct leaves this one as it is - unless fields share memory.)
+                        if (ReferenceEquals(written, v) && !Mentions(value, written) && outer != null && !ReferenceEquals(outer.Field, target.Field) && !union) continue;
+                        if (ReferenceEquals(written, v) || Mentions(value, written))
+                        {
+                            last = other;
+                            done = true;
+                        }
+                    }
+                    if (done) break;
+                    if (current == method.Blocks[0]) break;
+                    predecessors ??= Predecessors(method);
+                    if (!predecessors.TryGetValue(current, out List<HBlock>? into) || into.Count != 1 || into[0].Scope != current.Scope || !visited.Add(into[0])) break;
+                    current = into[0];
+                    k = current.Statements.Count - 2;
+                }
+                if (last is not HAssign { Target: HField { Object: HLocal { Variable: var again } } before } earlier || !ReferenceEquals(again, v) ||
+                    !ReferenceEquals(before.Field, target.Field) || !HirCleanup.Same(earlier.Value, value))
+                    continue;
+                s.RemoveAt(i);
+                any = true;
+            }
+        }
+        return any;
+    }
+
+    private static Dictionary<HBlock, List<HBlock>> Predecessors(HMethod method)
+    {
+        var predecessors = new Dictionary<HBlock, List<HBlock>>();
+        foreach (HBlock b in method.Blocks)
+        {
+            if (b.Statements.Count == 0) continue;
+            IEnumerable<HBlock> next = b.Statements[^1] switch
+            {
+                HJump j => [j.Target],
+                HBranch br => [br.WhenTrue, br.WhenFalse],
+                HSwitch sw => [.. sw.Targets, sw.Default],
+                _ => [],
+            };
+            foreach (HBlock to in next.Distinct())
+            {
+                if (!predecessors.TryGetValue(to, out List<HBlock>? list)) predecessors[to] = list = [];
+                list.Add(b);
+            }
+        }
+        return predecessors;
+    }
+
+    /// <summary>
+    /// The field of a struct variable that a variable holds at a statement: its last value, found by going
+    /// back through the block and the blocks that are the only way into it, is "t = x.f" - with x not set
+    /// again since. Null when that is not so.
+    /// </summary>
+    private static HField? HeldPart(HMethod method, HBlock block, int at, HVar kept, Dictionary<HBlock, List<HBlock>> predecessors)
+    {
+        var passed = new List<HStmt>();
+        HBlock current = block;
+        int i = at - 1;
+        var visited = new HashSet<HBlock> { block };
+        for (int hops = 0; hops < 16; hops++)
+        {
+            for (; i >= 0; i--)
+            {
+                HStmt s = current.Statements[i];
+                if (s is HAssign { Target: HLocal { Variable: var set }, Value: var value } && ReferenceEquals(set, kept))
+                {
+                    if (value is not HField { Object: HLocal { Variable: var whole, Type: var wholeType } } part || part.Field.IsStatic || !IsStruct(wholeType) ||
+                        (whole.AddressTaken && AddressNamed(method, whole)) || ReferenceEquals(whole, kept))
+                        return null;
+                    // The struct must not have been changed on the way: no store into it, whole or in part.
+                    foreach (HStmt later in passed)
+                        if (later is HAssign { Target: var target } && Root(target) is HLocal { Variable: var changed } && ReferenceEquals(changed, whole))
+                            return null;
+                    return new HField { Object = new HLocal(whole) { Type = wholeType }, Field = part.Field, DeclaringType = part.DeclaringType, Type = part.Type };
+                }
+                if (s is HAssign { Target: var other } && Root(other) is HLocal { Variable: var partly } && ReferenceEquals(partly, kept)) return null;
+                passed.Add(s);
+            }
+            // The one way into the block (in the same region): where the value came from is there.
+            if (current == method.Blocks[0] || !predecessors.TryGetValue(current, out List<HBlock>? into) || into.Count != 1) return null;
+            HBlock before = into[0];
+            if (before.Scope != current.Scope || !visited.Add(before)) return null;
+            current = before;
+            i = current.Statements.Count - 2; // (the last statement is the jump or test that leads here)
+        }
+        return null;
+
+        static HExpr Root(HExpr e)
+        {
+            while (e is HField { Object: { } inside } f && !f.Field.IsStatic && IsStruct(inside.Type)) e = inside;
+            return e;
+        }
+    }
+
+    /// <summary>
+    /// Whether the method's statements take the address of a variable (or of a part of it) anywhere, or do
+    /// something with memory that is not written out (then it may be anywhere). A variable whose address the
+    /// machine code took (for a call that fills it, say) but whose statements never name its address any more
+    /// is changed only where it is set.
+    /// </summary>
+    private static bool AddressNamed(HMethod method, HVar variable)
+    {
+        bool named = false;
+        foreach (HBlock b in method.Blocks)
+            foreach (HStmt s in b.Statements)
+                FinallyFolding.Visit(s, e => named |= e is HOpaque || e is HAddressOf { Target: var t } && Mentions(t, variable));
+        return named;
+    }
+
     private static bool FoldBlock(HMethod method, HBlock block, ProgramAnalysis program, MethodPipeline pipeline)
     {
         List<HStmt> s = block.Statements;
         bool any = false;
         Usage usage = Usage.Of(method);
+        Dictionary<HBlock, List<HBlock>>? predecessors = null;
         for (int i = 0; i < s.Count; i++)
         {
             if (s[i] is not HAssign { Target: HField { Object: { } place } first } || first.Field.IsStatic) continue;
@@ -491,6 +662,10 @@ internal static class StructFolding
             if (union && NoUnionFold) continue;
             TypeLayout? shared = union ? program.Layouts.Of(place.Type!) : null;
             if (place is not (HLocal or HArg or HField or HElement or HDeref)) continue;
+            HExpr root = place;
+            while (root is HField { Object: { } inner } part && !part.Field.IsStatic && IsStruct(inner.Type)) root = inner;
+            HVar? inLocal = !NoPartsAcross && root is HLocal { Variable: var variable, Type: not (ByRefSig or PointerSig) } ? variable : null;
+            HVar? own = block.Scope < 0 ? inLocal : null;
 
             // The run: stores into fields of this one place, with nothing between them but values on their way.
             var stores = new List<Store>();
@@ -509,6 +684,13 @@ internal static class StructFolding
                 // Something else being filled at the same time (the compiler clears a struct in whatever
                 // order suits it): it can stay where it is as long as it has nothing to do with this place.
                 if (IsBystander(s[j], place, pipeline)) continue;
+                // A struct in a variable of the method is memory nothing else reaches: what does not name the
+                // variable - a call too - leaves it alone. The compiler fills such a struct field by field
+                // between the other work ("v.x = 0; t = Random.Range(..); v.z = 0; v.y = t * k"), where the
+                // source made it in one go ("new Vector3(0, t * k, 0)"), as the argument of a call it then
+                // pasted in. Outside a try region, nothing can see it half filled when one of those calls
+                // throws: the variable is gone then.
+                if (own != null && s[j] is HAssign or HEval && !MentionsStatement(s[j], own)) continue;
                 break;
             }
             if (shared != null && !Tiles(shared, stores)) continue;
@@ -529,8 +711,15 @@ internal static class StructFolding
                     break;
                 }
             }
+            // ... and values kept in a variable that still holds a field of a struct: what a copy is made of when
+            // the compiler read the field once for two copies ("t = item.name" before a test, then
+            // "a.name = t" on one way and "b.name = t" on the other).
+            if (!NoHeldParts)
+                foreach (Store store in stores)
+                    if (store.TempAt < 0 && Unconverted(store.Value, store.Field.Type) is HLocal { Variable: var kept } && !kept.AddressTaken)
+                        store.Held = HeldPart(method, block, store.Index, kept, predecessors ??= Predecessors(method));
 
-            HStmt? folded = Fold(method, place, owner, stores, s, end, program, pipeline, whole: shared != null);
+            HStmt? folded = Fold(method, place, owner, stores, s, end, program, pipeline, whole: shared != null, own: inLocal != null, guarded: block.Scope >= 0);
             if (folded == null) continue;
 
             folded.Address = stores[0].Statement.Address;
@@ -607,7 +796,7 @@ internal static class StructFolding
 
     /// <summary>The single assignment a run of stores amounts to, or null when it is not one.</summary>
     private static HStmt? Fold(HMethod method, HExpr place, TypeDef owner, List<Store> stores, List<HStmt> statements, int end,
-        ProgramAnalysis program, MethodPipeline pipeline, bool whole = false)
+        ProgramAnalysis program, MethodPipeline pipeline, bool whole = false, bool own = false, bool guarded = false)
     {
         TypeSig type = place.Type!;
         var values = new Dictionary<FieldDef, Store>();
@@ -621,8 +810,18 @@ internal static class StructFolding
         // before it put in must then be something no call can change, wherever it ends up being computed.)
         Store? closing = stores.FirstOrDefault(x => x.Index == end && x.TempAt < 0);
         bool works = closing != null && !HirBuilder.IsPure(closing.Value);
+        // Stores one right after the other into a struct of a variable of the method (see FoldBlock), where
+        // several values do work ("v.x = Random.Range(..) * k; v.y = Random.Range(..) * k"): made in one go,
+        // they are worked out in the order of the constructor's parameters - the order they stand in here, which
+        // is checked below. What the others put in must be something no call can change.
+        // (In a try region, what is stored after the first store must be something that cannot fail: a handler
+        // would see the struct half filled otherwise.)
+        bool inOrder = own && !NoPartsAcross && stores.Count > 1 && stores.Any(x => x.TempAt < 0 && !HirBuilder.IsPure(x.Value));
+        for (int k = 0; k < stores.Count && inOrder; k++)
+            inOrder = stores[k].Index == stores[0].Index + k && (!HirBuilder.IsPure(stores[k].Value) ? stores[k].TempAt < 0 && (!guarded || k == 0) : CallProof(stores[k].Value));
         bool Settled(Store store) => store.TempAt >= 0 || store.Index == end || Movable(store.Value, statements, store.Index, end, null) ||
-                                     (works && CallProof(store.Value) && Movable(store.Value, statements, store.Index, end - 1, null));
+                                     (works && CallProof(store.Value) && Movable(store.Value, statements, store.Index, end - 1, null)) ||
+                                     inOrder;
         bool Independent(HExpr value)
         {
             // What the new value is made of must not be the place that is being overwritten.
@@ -633,31 +832,34 @@ internal static class StructFolding
         }
 
         // A copy: every field from the same field of one other struct.
-        if (complete)
+        HStmt? Copy(bool viaHeld)
         {
             HExpr? source = null;
-            bool copy = true;
             foreach (Store store in stores)
             {
-                if (Unconverted(store.Value, store.Field.Type) is not HField { Object: { } from } read || !ReferenceEquals(read.Field, store.Field) ||
-                    !SameType(from.Type, type) || (source != null && !HirCleanup.Same(source, from)) || !Settled(store))
-                {
-                    copy = false;
-                    break;
-                }
+                // (A field kept in a variable is read from the struct where the copy is made.)
+                bool held = viaHeld && store.Held != null && (store.Index == end || Movable(store.Held, statements, store.Index, end, null));
+                if ((held ? store.Held : Unconverted(store.Value, store.Field.Type)) is not HField { Object: { } from } read || !ReferenceEquals(read.Field, store.Field) ||
+                    !SameType(from.Type, type) || (source != null && !HirCleanup.Same(source, from)) || !(held || Settled(store)))
+                    return null;
                 source ??= from;
             }
             // The other struct is named once for each field, so naming it must do nothing - unless there is
             // one field only, read where it is stored: then it is named once here as well.
-            if (copy && source != null && !HirCleanup.Same(source, place) &&
+            if (source != null && !HirCleanup.Same(source, place) &&
                 (HirBuilder.IsPure(source) || (stores.Count == 1 && stores[0].TempAt < 0)))
                 return new HAssign(place, source);
+            return null;
         }
+        // Only where nothing else says what the stores make: fields kept in variables (see HeldPart).
+        HStmt? CopyOfHeld() => complete && stores.Any(x => x.Held != null) ? Copy(true) : null;
+
+        if (complete && Copy(false) is { } copied) return copied;
 
         // Building a struct in its own constructor is that constructor's body, not a use of it.
         bool ownConstruction = place is HArg { Index: < 0 } && method.Method.IsConstructor && ReferenceEquals(method.Method.DeclaringType, owner);
         if (ownConstruction) return null;
-        if (!stores.All(Settled)) return null;
+        if (!stores.All(Settled)) return CopyOfHeld();
 
         HExpr Default() => new HTypeExpr(HTypeOp.Default, type, null) { Type = type };
 
@@ -671,6 +873,20 @@ internal static class StructFolding
             if (flag != null && held != null && stores.Count == 2 && flag.Value is HConst { Value: true or 1 } && Independent(held.Value) &&
                 owner.Methods.FirstOrDefault(m => m.Name == ".ctor" && !m.IsStatic && m.Parameters.Length == 1) is { } wrap)
                 return new HAssign(place, new HNewObject { Constructor = wrap, DeclaringType = type is GenericInstSig ? type : null, Arguments = [held.Value], Type = type });
+            // The flag worked out (a copy that went through registers): a value or none, by that flag. A Nullable
+            // that holds no value holds the default in its value field - nothing else makes one - so the value
+            // given with a cleared flag is that default, whatever it is written as here.
+            if (!NoNullableFlags && flag != null && held != null && stores.Count == 2 && flag.Value is not HConst && HirBuilder.IsPure(flag.Value) &&
+                HirBuilder.IsPure(held.Value) && Independent(flag.Value) && Independent(held.Value) &&
+                owner.Methods.FirstOrDefault(m => m.Name == ".ctor" && !m.IsStatic && m.Parameters.Length == 1) is { } wrapped)
+            {
+                HExpr flagged = flag.Value is HCompare or HUnary { Op: HUnaryOp.LogicalNot } || flag.Value.Type is PrimitiveSig { Element: Il2CppTypeEnum.Boolean }
+                    ? flag.Value
+                    : new HCompare(HCompareOp.Ne, flag.Value, new HConst(0, flag.Value.Type)) { Type = program.Model.Sigs.Primitive(Il2CppTypeEnum.Boolean) };
+                return new HAssign(place, new HSelect(flagged,
+                    new HNewObject { Constructor = wrapped, DeclaringType = type is GenericInstSig ? type : null, Arguments = [held.Value], Type = type },
+                    Default()) { Type = type });
+            }
             return null;
         }
         if (!complete) return null;
@@ -690,21 +906,39 @@ internal static class StructFolding
             List<HStmt> formulas = body.Blocks[0].Statements;
             var arguments = new HExpr?[constructor.Parameters.Length];
             var assigned = new HashSet<FieldDef>();
+            // (inOrder: the parameter each value that does work is given to, in the order of the stores.)
+            var worked = new List<(int Store, int Parameter)>();
             bool matches = true;
             for (int k = 0; k < formulas.Count - 1 && matches; k++)
             {
-                matches = formulas[k] is HAssign { Target: HField { Object: HArg { Index: < 0 } } target, Value: var formula } &&
-                          assigned.Add(target.Field) && values.TryGetValue(target.Field, out Store? actual) &&
-                          Unify(formula, actual.Value, arguments, actual.Index == end && actual.TempAt < 0);
+                if (formulas[k] is not HAssign { Target: HField { Object: HArg { Index: < 0 } } target, Value: var formula } ||
+                    !assigned.Add(target.Field) || !values.TryGetValue(target.Field, out Store? actual))
+                {
+                    matches = false;
+                    break;
+                }
+                bool working = inOrder && !HirBuilder.IsPure(actual.Value);
+                matches = Unify(formula, actual.Value, arguments, (actual.Index == end && actual.TempAt < 0) || working);
+                if (matches && working)
+                {
+                    if (formula is HArg { Index: >= 0 } given) worked.Add((actual.Index, given.Index));
+                    else matches = false;
+                }
             }
             if (!matches) continue;
+            if (inOrder)
+            {
+                worked.Sort((x, y) => x.Store.CompareTo(y.Store));
+                for (int k = 1; k < worked.Count && matches; k++) matches = worked[k - 1].Parameter < worked[k].Parameter;
+                if (!matches) continue;
+            }
             // A field the constructor leaves alone is zero in a new struct.
             if (stores.Any(x => !assigned.Contains(x.Field) && !IsZero(x.Value))) continue;
             if (arguments.Any(a => a != null && !Independent(a))) continue;
             best = constructor;
             bestArguments = arguments;
         }
-        if (best == null || bestArguments == null) return null;
+        if (best == null || bestArguments == null) return CopyOfHeld();
 
         var final = new HExpr[best.Parameters.Length];
         for (int k = 0; k < final.Length; k++)
@@ -831,7 +1065,7 @@ internal static class StructFolding
     /// "t = value; return t;" and "t = value; place = t;" with a temporary that serves nothing else: the value
     /// goes where it is going.
     /// </summary>
-    private static bool ForwardWholeValues(HMethod method)
+    private static bool ForwardWholeValues(HMethod method, MethodPipeline pipeline)
     {
         bool any = false;
         Usage usage = Usage.Of(method);
@@ -859,6 +1093,197 @@ internal static class StructFolding
                 i = Math.Max(-1, i - 2);
             }
         }
+        if (!NoArgumentCopies && ForwardArgumentCopies(method, pipeline)) any = true;
         return any;
     }
+
+    private static readonly bool NoArgumentCopies = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_ARGUMENT_COPIES") != null;
+
+    /// <summary>
+    /// "t = v; f(.., t, ..)": a struct copied into a variable only to be handed to a call, which gets a copy of
+    /// its own anyway - "f(.., v, ..)". The compiler makes that copy in one place and not in another (code pasted
+    /// in from a method that hands its parameter on, where the place already has the value in a variable of its
+    /// own), so the two read alike once neither has it. Only for a value no call can change - a variable, a part of one,
+    /// or a struct written out of such (the call's other arguments are worked out before it is handed over) - and a copy
+    /// nothing looks at afterwards (the variable may be a slot the place uses for one thing after another).
+    /// </summary>
+    private static bool ForwardArgumentCopies(HMethod method, MethodPipeline pipeline)
+    {
+        bool any = false;
+        Usage usage = Usage.Of(method);
+        foreach (HBlock block in method.Blocks)
+        {
+            List<HStmt> s = block.Statements;
+            for (int i = 0; i + 1 < s.Count; i++)
+            {
+                if (s[i] is not HAssign { Target: HLocal t, Value: var value } || (t.Variable.AddressTaken && AddressNamed(method, t.Variable)) || !IsStruct(t.Variable.Type) ||
+                    !(value is HLocal or HArg or HField && CallProofIn(method, value) || Written(value, pipeline)) || Mentions(value, t.Variable) || !SameType(value.Type, t.Variable.Type)) continue;
+                HCall? call = s[i + 1] switch
+                {
+                    HEval { Expression: HCall c } => c,
+                    HAssign { Target: var target, Value: HCall c } when !Mentions(target, t.Variable) => c,
+                    _ => null,
+                };
+                if (call == null || Mentions(call.This, t.Variable)) continue;
+                int at = -1, named = 0;
+                for (int k = 0; k < call.Arguments.Length; k++)
+                {
+                    if (call.Arguments[k] is HLocal { Variable: var v } && ReferenceEquals(v, t.Variable)) at = k;
+                    if (Mentions(call.Arguments[k], t.Variable)) named++;
+                }
+                // (A variable set once and read once is a temporary of this alone, in a try region too.)
+                if (at < 0 || named != 1 || !(usage.IsTemp(t.Variable) || InlineFolding.Renewed(method, block, i + 2, t.Variable))) continue;
+                call.Arguments[at] = value;
+                s.RemoveAt(i);
+                usage = Usage.Of(method);
+                any = true;
+                i = Math.Max(-1, i - 2);
+            }
+        }
+        return any;
+    }
+
+    private static readonly bool NoUnionCopies = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_UNION_COPIES") != null;
+    private static readonly bool NoNullableFlags = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_NULLABLE_FLAGS") != null;
+
+    /// <summary>
+    /// A struct made anew from the bytes of another of its type, read through a field that lies over the others:
+    /// "new Color32((byte)c.rgba, (byte)(c.rgba >> 8), (byte)(c.rgba >> 16), (byte)(c.rgba >> 24))" is "c". The
+    /// compiler copies a small struct as one number; read back as fields, the number is the union's field over
+    /// them all (and that field is the type's own business). Each byte the constructor fills must come from
+    /// the same byte of the same struct, and every byte that is a field's must be filled.
+    /// </summary>
+    private static bool UnionCopies(HMethod method, ProgramAnalysis program, MethodPipeline pipeline)
+    {
+        bool any = false;
+        HExpr? Map(HExpr e)
+        {
+            if (e is not HNewObject made || !IsStruct(made.Type) || made.Arguments.Length == 0 || CopiedBytes(made, program, pipeline) is not { } whole) return null;
+            any = true;
+            return whole;
+        }
+        foreach (HBlock block in method.Blocks)
+            foreach (HStmt s in block.Statements)
+                EnumeratorLoops.Rewrite(s, Map);
+        return any;
+    }
+
+    private static HExpr? CopiedBytes(HNewObject made, ProgramAnalysis program, MethodPipeline pipeline)
+    {
+        TypeSig type = made.Type!;
+        if (type.Definition is not { } definition || (definition.Flags & TypeDef.LayoutMask) != TypeDef.ExplicitLayout) return null;
+        TypeLayout layout = program.Layouts.Of(type);
+        if (!layout.Known || layout.Size <= 0 || layout.Size > 64) return null;
+        TypeSig[] classArguments = type is GenericInstSig g ? g.Arguments : [];
+        if (pipeline.ConstructorBody(made.Constructor, classArguments) is not { } body) return null;
+        FieldSlot? SlotOf(FieldDef f)
+        {
+            foreach (FieldSlot slot in layout.Fields)
+                if (ReferenceEquals(slot.Field, f))
+                    return slot;
+            return null;
+        }
+        // What each byte holds once the constructor is done: a byte of one of its parameters, or not that.
+        var from = new (int Parameter, int Byte)[layout.Size];
+        Array.Fill(from, (-1, -1));
+        var placed = new Dictionary<int, (int Offset, int Size)>();
+        List<HStmt> statements = body.Blocks[0].Statements;
+        for (int k = 0; k < statements.Count - 1; k++)
+        {
+            if (statements[k] is not HAssign { Target: HField { Object: HArg { Index: < 0 } } target, Value: var value } || SlotOf(target.Field) is not { } slot ||
+                slot.Offset < 0 || slot.Offset + slot.Size > layout.Size)
+                return null;
+            int parameter = value is HArg { Index: >= 0 } p && p.Index < made.Arguments.Length ? p.Index : value is HConst ? -1 : -2;
+            if (parameter == -2) return null;
+            if (parameter >= 0)
+            {
+                if (placed.ContainsKey(parameter)) return null;
+                placed[parameter] = (slot.Offset, slot.Size);
+            }
+            for (int b = 0; b < slot.Size; b++) from[slot.Offset + b] = (parameter, b);
+        }
+        foreach (FieldSlot slot in layout.Fields)
+            for (int b = slot.Offset; b < slot.Offset + slot.Size && b < layout.Size; b++)
+                if (from[b].Parameter < 0)
+                    return null;
+        if (placed.Count != made.Arguments.Length) return null;
+
+        HExpr? whole = null;
+        foreach ((int parameter, (int offset, int size)) in placed)
+        {
+            // The argument: a field of the other struct, shifted down to the bytes wanted and cut to their width.
+            HExpr argument = made.Arguments[parameter];
+            int width = size;
+            while (argument is HConv { Kind: var kind } conv)
+            {
+                int to = kind switch
+                {
+                    HConvKind.I1 or HConvKind.U1 => 1,
+                    HConvKind.I2 or HConvKind.U2 => 2,
+                    HConvKind.I4 or HConvKind.U4 => 4,
+                    HConvKind.I8 or HConvKind.U8 => 8,
+                    _ => 0,
+                };
+                if (to == 0) return null;
+                width = Math.Min(width, to);
+                argument = conv.Operand;
+            }
+            if (width != size) return null;
+            int shift = 0;
+            if (argument is HBinary { Op: HBinaryOp.Shr or HBinaryOp.ShrUn, Right: HConst { Value: var bits } } shifted && Whole(bits) is { } by && by % 8 == 0)
+            {
+                shift = (int)by / 8;
+                argument = shifted.Left;
+                while (argument is HConv { Kind: HConvKind.I8 or HConvKind.U8 or HConvKind.I4 or HConvKind.U4 } wider) argument = wider.Operand;
+            }
+            if (argument is not HField { Object: { } of, Field: var over } || !SameType(of.Type, type) || SlotOf(over) is not { } read) return null;
+            // (Signed or not, a shift leaves the bytes wanted as they are while they lie within the field.)
+            if (read.Offset + shift != offset || shift + size > read.Size) return null;
+            if (whole == null) whole = of;
+            else if (!Twins(whole, of)) return null;
+        }
+        return whole;
+
+        static long? Whole(object? value) => value switch
+        {
+            int n => n,
+            long n => n,
+            uint n => n,
+            byte n => n,
+            _ => null,
+        };
+    }
+
+    /// <summary>The same expression written twice - calls included (a value the builder wrote out at each of its uses).</summary>
+    private static bool Twins(HExpr a, HExpr b)
+    {
+        if (HirCleanup.Same(a, b)) return true;
+        switch (a, b)
+        {
+            case (HCall x, HCall y):
+                if (!ReferenceEquals(x.Method, y.Method) || x.Virtual != y.Virtual || x.Arguments.Length != y.Arguments.Length ||
+                    (x.This == null) != (y.This == null) || (x.This != null && !Twins(x.This, y.This!)))
+                    return false;
+                for (int k = 0; k < x.Arguments.Length; k++)
+                    if (!Twins(x.Arguments[k], y.Arguments[k]))
+                        return false;
+                return true;
+            case (HField x, HField y):
+                return ReferenceEquals(x.Field, y.Field) && x.Object != null && y.Object != null && Twins(x.Object, y.Object);
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>CallProof, with a variable whose address the statements never name (see AddressNamed) counted as one nothing points to.</summary>
+    private static bool CallProofIn(HMethod method, HExpr e) => e switch
+    {
+        HLocal l => !l.Variable.AddressTaken || !AddressNamed(method, l.Variable),
+        HField { Object: { } o } f => !f.Field.IsStatic && o.Type is { IsValueType: true } and not (ByRefSig or PointerSig) && CallProofIn(method, o),
+        _ => CallProof(e),
+    };
+
+    /// <summary>A struct written out from values no call can change, by a constructor that only stores them: making it does nothing else.</summary>
+    private static bool Written(HExpr value, MethodPipeline pipeline) =>
+        value is HNewObject { Constructor: var constructor } made && IsStruct(made.Type) && made.Arguments.All(a => CallProof(a)) && OnlyStores(constructor, made.Type, pipeline);
 }

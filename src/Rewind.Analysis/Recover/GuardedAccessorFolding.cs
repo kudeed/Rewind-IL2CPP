@@ -339,9 +339,9 @@ internal sealed class GuardedAccessorFolding(MethodPipeline pipeline)
         }
     }
 
-    public void Run(HMethod method)
+    public bool Run(HMethod method)
     {
-        if (Disabled) return;
+        if (Disabled) return false;
 
         // The classes whose replicated memory this method touches.
         var classes = new HashSet<TypeDef>();
@@ -361,7 +361,7 @@ internal sealed class GuardedAccessorFolding(MethodPipeline pipeline)
                     case HBranch b: Note(b.Condition); break;
                     case HSwitch sw: Note(sw.Value); break;
                 }
-        if (classes.Count == 0) return;
+        if (classes.Count == 0) return false;
 
         Unhold(method);
 
@@ -553,7 +553,7 @@ internal sealed class GuardedAccessorFolding(MethodPipeline pipeline)
             block.Statements[^1] = new HJump(access) { Address = branch.Address };
             any = true;
         }
-        if (!any) return;
+        if (!any) return false;
         HirCleanup.Run(method);
 
         bool left = false;
@@ -569,5 +569,6 @@ internal sealed class GuardedAccessorFolding(MethodPipeline pipeline)
                     _ => false,
                 };
         if (left) method.Notes.Add("replicated memory of a networked object is accessed directly (an inlined accessor that was not recognized)");
+        return true;
     }
 }
