@@ -54,7 +54,6 @@ internal static class GapCover
             }
         }
         Console.WriteLine($"{total} methods: {clean} complete ({100.0 * clean / Math.Max(1, total):F1}%), {perMethod.Count} blocked, {crashed} crashed");
-        if (program.ProposalsChecked != 0) Console.WriteLine($"model proposals: {program.ProposalsChecked} checked, {program.ProposalsConfirmed} confirmed by equal recovered code");
 
         var fixedKinds = new HashSet<string>();
         int done = clean;

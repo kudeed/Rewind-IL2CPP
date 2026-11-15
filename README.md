@@ -65,7 +65,6 @@ Options:
 | `--metadata <file>`, `--binary <file>` | use these files instead of searching for them |
 | `--abi <name>` | which Android ABI to use from a package (`arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`) |
 | `--unity <version>` | the Unity version, if Rewind can't work it out (for example `2022.3.33f1`) |
-| `--identifications <file>` | answers from the separate function identification model, which isn't part of this repo |
 | `-v`, `--verbose` | print more progress details |
 
 Running `rewind` with no arguments prints the same list.
@@ -138,8 +137,6 @@ to the arguments.
   method bodies come out as gaps.
 - Metadata versions other than 39 and 31.1 are written from the format's history but haven't been tested.
   Unity 6.5 and later (metadata v104 and up) isn't supported. Mach-O input hasn't been tested either.
-- When more than one candidate fits, Rewind chooses with hand-written rules. A learned ranking model isn't
-  hooked up yet.
 
 ## Supporting another Unity version
 

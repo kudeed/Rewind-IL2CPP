@@ -396,30 +396,11 @@ public sealed partial class HirBuilder
         if (!target.IsManaged && target.Helper == null && !NoNamedCopies && NamedCopy(call, info.Target) is { } named) target = named;
         if (target.IsManaged)
         {
-            if (target.Model is { Verified: true } && BestScore(call, target) < -40)
-            {
-                // The code is known (it equals these methods'), but the receiver here is none of their classes: the
-                // method meant is one the model did not propose. Its code, lifted in place, says the same thing.
-                _h.UnfitTargets.Add(info.Target);
-                Problem($"no method with the code of 0x{info.Target:X} fits this call");
-            }
-            else
-            {
-                if (target.Model is { } copy)
-                    _h.Notes.Add($"call target 0x{info.Target:X} {(copy.Verified ? "has the same recovered code as" : "identified by the model as a copy of")} " +
-                                 $"{(target.Methods.Count != 0 ? target.Methods[0].FullName : target.Insts[0].ToString())} (similarity {copy.Score:F3})");
-                EmitManagedCall(call, target, tail);
-                return;
-            }
+            EmitManagedCall(call, target, tail);
+            return;
         }
-        if (target.IsManaged)
+        if (target.Helper != null)
         {
-            // falls through to the unidentified form below
-        }
-        if (target.Helper != null && !target.IsManaged)
-        {
-            if (_p.ModelHelpers.TryGetValue(info.Target, out var helper))
-                _h.Notes.Add($"call target 0x{info.Target:X} identified by the model as the runtime function {target.Helper.Kind} (similarity {helper.Score:F3})");
             EmitHelperCall(call, target.Helper, tail);
             return;
         }
@@ -711,15 +692,6 @@ public sealed partial class HirBuilder
             }
         }
         return _resultPlaces[call] = type;
-    }
-
-    /// <summary>How well the best candidate of a call target fits the call (see Score).</summary>
-    private int BestScore(Node call, CallTarget target)
-    {
-        int best = int.MinValue;
-        foreach (MethodDef m in target.Methods) best = Math.Max(best, Score(call, m, [], [], null));
-        foreach (MethodInst inst in target.Insts) best = Math.Max(best, Score(call, inst.Method, inst.ClassArguments, inst.MethodArguments, inst));
-        return best;
     }
 
     private void EmitManagedCall(Node call, CallTarget target, bool tail)

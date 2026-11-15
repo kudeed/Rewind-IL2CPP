@@ -31,7 +31,6 @@ public sealed class MethodPipeline
         _program = program;
         _lifter = program.NewLifter();
         _normalizer = new Normalizer(program);
-        program.CopyVerifier ??= VerifyCopy;
     }
 
     /// <summary>
@@ -113,13 +112,6 @@ public sealed class MethodPipeline
         return false;
     }
 
-    /// <summary>
-    /// Checks a proposal of the identification model: is the unnamed function at <paramref name="address"/> a
-    /// private copy of the listed method(s) at <paramref name="originals"/>? It is when reading its machine code
-    /// as that method gives, statement for statement, the code the method's own machine code gives - both
-    /// recovered completely. The compiler may lay the two out differently and use other registers; what they do
-    /// is then the same as far as recovery can tell, which is as far as its output goes anyway.
-    /// </summary>
     /// <summary>For inspection: the listed method at <paramref name="original"/> recovered from its own code and from the code at <paramref name="address"/>.</summary>
     public (MethodDef? Method, HMethod? Own, HMethod? Copy, string? Error) RecoverBoth(ulong address, ulong original)
     {
@@ -142,43 +134,7 @@ public sealed class MethodPipeline
         }
     }
 
-    private bool VerifyCopy(ulong address, ulong[] originals)
-    {
-        foreach (ulong original in originals)
-        {
-            MethodDef? method = null;
-            TypeSig[] classArgs = [], methodArgs = [];
-            if (_program.Model.MethodsByAddress.TryGetValue(original, out List<MethodDef>? defs))
-                method = defs.FirstOrDefault(m => m.DeclaringType.GenericParameters.Length == 0 && m.GenericParameters.Length == 0);
-            if (method == null && _program.Model.InstsByAddress.TryGetValue(original, out List<MethodInst>? insts) && insts.Count != 0)
-                (method, classArgs, methodArgs) = (insts[0].Method, insts[0].ClassArguments, insts[0].MethodArguments);
-            if (method == null) continue;
-            try
-            {
-                // A check can start while this pipeline is in the middle of lifting (the lifter asks about a call
-                // target): the work is done by a pipeline of its own.
-                var inner = new MethodPipeline(_program);
-                if (!_program.OwnCanonical.TryGetValue(original, out string? own))
-                {
-                    HMethod recovered = inner.Build(inner.Lift(method, classArgs, methodArgs, original));
-                    _program.OwnCanonical[original] = own = recovered.Problems.Count == 0 ? HirPrinter.Canonical(recovered) : null;
-                }
-                if (own == null) return false;
-                HMethod copy = inner.Build(inner.Lift(method, classArgs, methodArgs, address));
-                return copy.Problems.Count == 0 && HirPrinter.Canonical(copy) == own;
-            }
-            catch (Exception e) when (e is not OutOfMemoryException and not StackOverflowException)
-            {
-                return false;
-            }
-        }
-        return false;
-    }
-
-    /// <summary>
-    /// Lifts and builds; when a call could only be named by methods that do not fit it (HMethod.UnfitTargets),
-    /// once more with those targets' code lifted in place.
-    /// </summary>
+    /// <summary>Lifts and builds the method from the code at <paramref name="address"/>.</summary>
     private HMethod RecoverAt(MethodDef method, TypeSig[]? classArgs, TypeSig[]? methodArgs, ulong address)
     {
         // A definition's own type parameters as the arguments: the body its reference-type instantiations share
@@ -192,26 +148,11 @@ public sealed class MethodPipeline
         (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters) = (own, own);
         try
         {
-            return RecoverBody(method, classArgs, methodArgs, address);
-        }
-        finally
-        {
-            (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters) = (builder, layouts);
-        }
-    }
-
-    private HMethod RecoverBody(MethodDef method, TypeSig[]? classArgs, TypeSig[]? methodArgs, ulong address)
-    {
-        HMethod result = Build(Lift(method, classArgs, methodArgs, address));
-        if (result.UnfitTargets.Count == 0) return result;
-        var forced = result.UnfitTargets.Where(_program.Unresolved.Add).ToList();
-        try
-        {
             return Build(Lift(method, classArgs, methodArgs, address));
         }
         finally
         {
-            foreach (ulong target in forced) _program.Unresolved.Remove(target);
+            (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters) = (builder, layouts);
         }
     }
 
@@ -780,7 +721,7 @@ public sealed class MethodPipeline
                 if (call.Dead || call.Op is not (Op.Call or Op.TailCall) || call.Aux is not CallInfo { Indirect: false, Intrinsic: null } info) continue;
                 if (info.Slots.Count != call.In.Length || call.In.Length == 0) continue;
                 CallTarget target = _program.Resolve(info.Target);
-                if (!target.IsManaged || target.Helper != null || target.Model != null || target.Forwarded) continue;
+                if (!target.IsManaged || target.Helper != null || target.Forwarded) continue;
                 var integer = new HashSet<int>();
                 var floating = new HashSet<int>();
                 bool unknown = false;

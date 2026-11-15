@@ -14,8 +14,6 @@ public sealed class CallTarget
     public List<MethodInst> Insts = [];
     /// <summary>The address is the native implementation of these "extern" methods, not their generated wrapper.</summary>
     public bool Forwarded;
-    /// <summary>Set when the identification model named this target (not exact evidence; see ModelIdentifications).</summary>
-    public ModelIdentification? Model;
     public bool IsManaged => Methods.Count != 0 || Insts.Count != 0;
 }
 
@@ -111,21 +109,6 @@ public sealed class ProgramAnalysis
     }
 
     /// <summary>
-    /// Set by the method pipeline: whether the unnamed function at an address, read as one of the listed methods
-    /// at the given addresses (identical among themselves), comes out as the same code as that method.
-    /// </summary>
-    public Func<ulong, ulong[], bool>? CopyVerifier { get; set; }
-    private readonly Dictionary<ulong, CallTarget?> _checkedProposals = [];
-    /// <summary>How many of the model's proposals were looked at, and how many the check confirmed.</summary>
-    public int ProposalsChecked, ProposalsConfirmed;
-
-    /// <summary>
-    /// Call targets to treat as unknown for now, although a checked proposal names them: none of the methods with
-    /// that code fits a call site of the method being recovered, so its code is lifted in place there instead.
-    /// </summary>
-    public HashSet<ulong> Unresolved { get; } = [];
-
-    /// <summary>
     /// Set by the method pipeline: the check for a function that its caller names (it is handed a method's
     /// descriptor): whether, read as the listed method at the given address, it uses what that method uses.
     /// </summary>
@@ -133,47 +116,6 @@ public sealed class ProgramAnalysis
 
     /// <summary>What listed methods use (see MethodPipeline.Uses; null: not recovered completely), by address.</summary>
     public Dictionary<ulong, string?> OwnUses { get; } = [];
-
-    /// <summary>What listed methods recover to (canonical text; null: not completely), by address. Shared by the checks.</summary>
-    public Dictionary<ulong, string?> OwnCanonical { get; } = [];
-
-    /// <summary>
-    /// A model proposal the decompiler confirmed, as a call target; null when none of the candidates holds. Every
-    /// candidate that holds is kept: methods of unrelated classes can have the same code, and which one a call
-    /// means shows at the call site (the receiver's type).
-    /// </summary>
-    private CallTarget? CheckedProposal(ulong address)
-    {
-        if (Identified == null || CopyVerifier == null || !Identified.Proposals.TryGetValue(address, out var candidates)) return null;
-        if (Unresolved.Contains(address)) return null;
-        lock (_checkedProposals)
-        {
-            if (_checkedProposals.TryGetValue(address, out CallTarget? known)) return known;
-            if (Unresolved.Count != 0) return null; // a check made now would see those targets as unknown: not one to remember
-            _checkedProposals[address] = null;      // unknown while it is being checked (the check may come back here)
-        }
-        CallTarget? confirmed = null;
-        ProposalsChecked++;
-        foreach (var (score, group) in candidates)
-        {
-            if (!CopyVerifier(address, group)) continue;
-            confirmed ??= new CallTarget { Model = new ModelIdentification { Address = address, IsCopy = true, Score = score, Verified = true } };
-            foreach (ulong original in group)
-            {
-                confirmed.Model!.Originals.Add(original);
-                if (Model.MethodsByAddress.TryGetValue(original, out List<MethodDef>? ms))
-                    foreach (MethodDef m in ms)
-                        if (!confirmed.Methods.Contains(m)) confirmed.Methods.Add(m);
-                if (Model.InstsByAddress.TryGetValue(original, out List<MethodInst>? instances))
-                    foreach (MethodInst i in instances)
-                        if (!confirmed.Insts.Contains(i)) confirmed.Insts.Add(i);
-            }
-        }
-        if (confirmed is { IsManaged: false }) confirmed = null;
-        if (confirmed != null) ProposalsConfirmed++;
-        lock (_checkedProposals) _checkedProposals[address] = confirmed;
-        return confirmed;
-    }
 
     /// <summary>
     /// Whether what is being translated right now is the method a recovery was asked for (and not one recovered
@@ -283,10 +225,6 @@ public sealed class ProgramAnalysis
     {
         lock (_inlinable)
         {
-            // Forced unknown for the method being recovered (see Unresolved): decided afresh, not remembered.
-            if (Unresolved.Contains(target))
-                return Model.Image.SectionAt(target) is { Name: "il2cpp", IsExecutable: true } && !Context.NoReturn.Contains(target) &&
-                       Helpers.At(target) == null && SizeBound(target) <= 2048 && ExceptionInfo(target) == null;
             if (_inlinable.TryGetValue(target, out bool known)) return known;
             if (Environment.GetEnvironmentVariable("REWIND_NO_INLINE") == "1") return _inlinable[target] = false;
             bool result = Model.Image.SectionAt(target) is { Name: "il2cpp", IsExecutable: true } &&
@@ -363,34 +301,6 @@ public sealed class ProgramAnalysis
         }
     }
 
-    /// <summary>
-    /// The managed "extern" method an internal-call implementation stands for, from its C++ name:
-    /// ?Method@Type@Namespace...@Assembly@icalls@il2cpp@@... (MSVC). Null unless exactly one method fits.
-    /// </summary>
-    private MethodDef? InternalCallFromSymbol(IEnumerable<string> names)
-    {
-        const ushort InternalCall = 0x1000;
-        MethodDef? found = null;
-        foreach (string name in names)
-        {
-            if (!name.StartsWith('?')) continue;
-            int end = name.IndexOf("@icalls@il2cpp@@", StringComparison.Ordinal);
-            if (end < 0) continue;
-            string[] parts = name[1..end].Split('@');
-            if (parts.Length < 3) continue;
-            // parts: Method, Type, Namespace (innermost first)..., Assembly
-            string method = parts[0], type = parts[1];
-            string ns = string.Join(".", parts[2..^1].Reverse());
-            TypeDef? def = Model.FindType(ns.Length == 0 ? type : ns + "." + type);
-            if (def == null) continue;
-            var candidates = def.Methods.Where(m => m.Name == method && (m.ImplFlags & InternalCall) != 0).ToList();
-            if (candidates.Count != 1) continue;
-            if (found != null && !ReferenceEquals(found, candidates[0])) return null;
-            found = candidates[0];
-        }
-        return found;
-    }
-
     private readonly Dictionary<ulong, MethodDef?> _internalCalls = [];
 
     /// <summary>
@@ -465,47 +375,10 @@ public sealed class ProgramAnalysis
     /// <summary>Position-independent descriptions of the image's functions (computed on demand).</summary>
     public CodeIndex Code => _code ??= new CodeIndex(Context);
 
-    /// <summary>Answers of the identification model, when given (used only where exact evidence names nothing).</summary>
-    public ModelIdentifications? Identified { get; }
-    /// <summary>Runtime helpers known only from the model's answers, with the answer.</summary>
-    public Dictionary<ulong, ModelIdentification> ModelHelpers { get; } = [];
-    private readonly Dictionary<ulong, CallTarget> _modelTargets = [];
-
-    public ProgramAnalysis(Il2CppModel model, RuntimeHelpers helpers, ModelCodeContext? context = null, ModelIdentifications? identified = null)
+    public ProgramAnalysis(Il2CppModel model, RuntimeHelpers helpers, ModelCodeContext? context = null)
     {
         Model = model;
         Helpers = helpers;
-        Identified = identified;
-        if (identified != null)
-        {
-            // Runtime functions the signature library did not find: a helper when the name is one the decompiler
-            // translates. Added before anything looks at the helpers (calls that never return shape the code).
-            foreach (var (address, id) in identified.ByAddress)
-            {
-                if (id.IsCopy || helpers.At(address) != null || model.MethodsByAddress.ContainsKey(address) || model.InstsByAddress.ContainsKey(address)) continue;
-                HelperInfo? info = null;
-                foreach (string name in id.Names)
-                {
-                    HelperInfo? candidate = RuntimeHelpers.Classify(name);
-                    if (candidate == null) continue;
-                    // Code-identical functions under different names must agree on what they are.
-                    if (info != null && candidate.Kind != info.Kind) { info = null; break; }
-                    info ??= candidate;
-                }
-                if (info == null)
-                {
-                    // The implementation of an "extern" method (an internal call) is that method.
-                    if (InternalCallFromSymbol(id.Names) is { } method)
-                    {
-                        ForwardedMethods[address] = [method];
-                        ModelHelpers[address] = id;
-                    }
-                    continue;
-                }
-                helpers.Add(address, info);
-                ModelHelpers[address] = id;
-            }
-        }
         Context = context ?? new ModelCodeContext(model);
         Context.ShapeProvider = ShapeOf;
         Context.ExceptionProvider = ExceptionInfo;
@@ -592,28 +465,6 @@ public sealed class ProgramAnalysis
             }
             return copy;
         }
-        if (!target.IsManaged && target.Helper == null && Identified != null && Identified.ByAddress.TryGetValue(address, out ModelIdentification? id) &&
-            id.IsCopy && !ForwardedMethods.ContainsKey(address) && !ForwardedInsts.ContainsKey(address) && !InlineCopies.ContainsKey(address))
-        {
-            // The model's answer: a copy of these listed methods (a group with identical code; the call site chooses).
-            if (!_modelTargets.TryGetValue(address, out CallTarget? copy))
-            {
-                copy = new CallTarget { Model = id };
-                foreach (ulong original in id.Originals)
-                {
-                    if (Model.MethodsByAddress.TryGetValue(original, out List<MethodDef>? ms))
-                        foreach (MethodDef m in ms)
-                            if (!copy.Methods.Contains(m))
-                                copy.Methods.Add(m);
-                    if (Model.InstsByAddress.TryGetValue(original, out List<MethodInst>? instances))
-                        foreach (MethodInst i in instances)
-                            if (!copy.Insts.Contains(i))
-                                copy.Insts.Add(i);
-                }
-                _modelTargets[address] = copy;
-            }
-            if (copy.IsManaged) return copy;
-        }
         if (!target.IsManaged && target.Helper == null)
         {
             if (ForwardedMethods.TryGetValue(address, out List<MethodDef>? forwarded)) target.Methods = forwarded;
@@ -624,8 +475,6 @@ public sealed class ProgramAnalysis
                 if (copy.Insts.Count != 0) target.Insts = copy.Insts;
                 else target.Methods = [copy.Method];
             }
-            // Last: what the model could only propose, once checked.
-            if (!target.IsManaged && CheckedProposal(address) is { } proposal) return proposal;
             // A function that only jumps on to another (the linker makes these where a call cannot reach
             // what it calls directly): a call to it is a call to that one.
             if (!target.IsManaged && !NoThunkCalls && Code.ThunkTarget(address) is var onward && onward != address && onward != 0)
