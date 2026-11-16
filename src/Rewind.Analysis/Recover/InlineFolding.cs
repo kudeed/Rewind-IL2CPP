@@ -1636,6 +1636,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
 
     private static readonly bool NoApart = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_APART") != null;
     private static readonly bool NoCallFirst = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_CALL_FIRST") != null;
+    private static readonly bool NoTempUse = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_TEMP_USE") != null;
     private const int ApartMost = 6;
 
     /// <summary>
@@ -1745,45 +1746,59 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             {
                 user = apart ? at : start + n;
                 if (user >= site.Count) continue;
-                var candidates = new List<HExpr>();
-                FinallyFolding.Visit(site[user], candidates.Add);
+                // A method that only hands back what it reads, where the place keeps part of that read in a
+                // temporary of its own ("t = list._data; n = *t - 1" for "n = list.Count - 1"): the member the method
+                // is found by is in the temporary's statement, the value is used in the next one. That one is
+                // looked at too; the temporary is read through (and goes with the call put back).
+                int lastUser = user;
+                if (!NoTempUse && !apart && n == 0 && user == at && at + 1 < site.Count &&
+                    site[at] is HAssign { Target: HLocal { Variable: var held } } && counts.IsTemp(held))
+                    lastUser = at + 1;
                 // (A method that is one call of what it is handed, in order, reads its parameters first too.)
                 bool loose = n == 0 ? OneExpression(template) || (!NoCallFirst && ReadsFirst(template)) : early && !apart;
-                foreach (HExpr candidate in candidates)
+                for (int u = user; u <= lastUser && replaced == null; u++)
                 {
-                    // An assignment's target is a place, not a value.
-                    if (site[user] is HAssign { Target: var target } && ReferenceEquals(target, candidate)) continue;
-                    Unifier trial = unifier.Clone();
-                    trial.At = user;
-                    trial.Position = n;
-                    trial.Loose = loose;
-                    bool turned = false;
-                    if (!trial.Expression(template.Result, candidate))
+                    var candidates = new List<HExpr>();
+                    FinallyFolding.Visit(site[u], candidates.Add);
+                    foreach (HExpr candidate in candidates)
                     {
-                        // A test the place asks the other way round (the compiler turned it to suit its jump):
-                        // the method's answer, negated.
-                        if (NoTurned || template.Result is not HCompare { Op: var asked } question || candidate is not HCompare { Op: var other } ||
-                            other != Opposite(asked) || (asked is not (HCompareOp.Eq or HCompareOp.Ne) && !(Whole(question.Left.Type) && Whole(question.Right.Type))))
-                            continue;
-                        trial = unifier.Clone();
-                        trial.At = user;
+                        // An assignment's target is a place, not a value.
+                        if (site[u] is HAssign { Target: var target } && ReferenceEquals(target, candidate)) continue;
+                        Unifier trial = unifier.Clone();
+                        trial.At = u;
                         trial.Position = n;
                         trial.Loose = loose;
-                        if (!trial.Expression(new HCompare(other, question.Left, question.Right) { Type = question.Type }, candidate)) continue;
-                        turned = true;
+                        bool turned = false;
+                        if (!trial.Expression(template.Result, candidate))
+                        {
+                            // A test the place asks the other way round (the compiler turned it to suit its jump):
+                            // the method's answer, negated.
+                            if (NoTurned || template.Result is not HCompare { Op: var asked } question || candidate is not HCompare { Op: var other } ||
+                                other != Opposite(asked) || (asked is not (HCompareOp.Eq or HCompareOp.Ne) && !(Whole(question.Left.Type) && Whole(question.Right.Type))))
+                                continue;
+                            trial = unifier.Clone();
+                            trial.At = u;
+                            trial.Position = n;
+                            trial.Loose = loose;
+                            if (!trial.Expression(new HCompare(other, question.Left, question.Right) { Type = question.Type }, candidate)) continue;
+                            turned = true;
+                        }
+                        // Arguments that do work are worked out in the order of the parameters, after the object
+                        // the method is called on: that must be the order they stand in here.
+                        if (trial.Working)
+                        {
+                            bool ordered = Stable(trial.This) || ThisFirst(template);
+                            for (int k = 1; k < trial.Order.Count && ordered; k++) ordered = trial.Order[k - 1] < trial.Order[k];
+                            if (!ordered) continue;
+                        }
+                        // In the next statement, only through the temporary: the read must be the one it holds.
+                        if (u != user && !trial.Consumed.Contains(at)) continue;
+                        unifier = trial;
+                        replaced = candidate;
+                        negated = turned;
+                        user = u;
+                        break;
                     }
-                    // Arguments that do work are worked out in the order of the parameters, after the object
-                    // the method is called on: that must be the order they stand in here.
-                    if (trial.Working)
-                    {
-                        bool ordered = Stable(trial.This) || ThisFirst(template);
-                        for (int k = 1; k < trial.Order.Count && ordered; k++) ordered = trial.Order[k - 1] < trial.Order[k];
-                        if (!ordered) continue;
-                    }
-                    unifier = trial;
-                    replaced = candidate;
-                    negated = turned;
-                    break;
                 }
                 if (replaced == null)
                 {
