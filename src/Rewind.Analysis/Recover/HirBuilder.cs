@@ -227,6 +227,7 @@ public sealed partial class HirBuilder
         {
             if (votes.Count != 1 || _fakeBoxes.ContainsKey(offset - _header)) continue;
             TypeSig voted = votes.First();
+            if (!Nameable(voted)) continue;
             if (_frameTypes.TryGetValue(offset, out TypeSig? current) && ReferenceEquals(current, voted)) continue;
             if (current == null && ReferenceEquals(voted, _long)) continue; // what an untyped slot already is
             RefinedFrameTypes[offset] = voted;

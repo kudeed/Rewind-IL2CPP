@@ -1900,7 +1900,7 @@ public sealed partial class HirBuilder
             SNewObject o => o.Type,
             _ => null,
         };
-        TypeSig vote = type != null && IsReference(type) && !Open(type) ? type : _long;
+        TypeSig vote = type != null && IsReference(type) && !Open(type) && Nameable(type) ? type : _long;
         if (!_frameVotes.TryGetValue(offset, out HashSet<TypeSig>? votes)) _frameVotes[offset] = votes = [];
         votes.Add(vote);
     }

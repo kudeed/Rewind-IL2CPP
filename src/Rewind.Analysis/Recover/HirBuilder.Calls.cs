@@ -176,14 +176,15 @@ public sealed partial class HirBuilder
                         }
                         else
                         {
+                            // (Of the methods that share the code, only one this code could call says anything.)
                             foreach (MethodDef m in target.Methods)
-                                if ((type = PointeeOf(_p.Abi.For(m, [], []), position)) != null) break;
+                                if ((NoReachableAssemblies || Reachable(m.DeclaringType.Assembly)) && (type = PointeeOf(_p.Abi.For(m, [], []), position)) != null) break;
                             if (type == null)
                                 foreach (MethodInst inst in target.Insts)
-                                    if ((type = PointeeOf(_p.Abi.For(inst), position)) != null) break;
+                                    if ((NoReachableAssemblies || Reachable(inst.Method.DeclaringType.Assembly)) && (type = PointeeOf(_p.Abi.For(inst), position)) != null) break;
                         }
                     }
-                    if (type != null && !Open(type)) _frameTypes.TryAdd(offset, type);
+                    if (type != null && !Open(type) && Nameable(type)) _frameTypes.TryAdd(offset, type);
                 }
             }
         }
@@ -232,6 +233,8 @@ public sealed partial class HirBuilder
     /// <summary>The storage location a pointer argument refers to.</summary>
     private HExpr? LocationOf(Node pointer, TypeSig? expected)
     {
+        // (What the code cannot name says nothing about its stack.)
+        if (!Nameable(expected)) expected = null;
         Sem s = Eval(pointer);
         switch (s)
         {
@@ -658,7 +661,47 @@ public sealed partial class HirBuilder
         // Code that could not have been written here (a private member of an unrelated class) can still show
         // up through inlining, so this is a strong hint rather than a rule.
         if (!IsAccessible(method)) score -= 25;
+        // An assembly's code can only name what is in it or in the assemblies it uses: a plugin cannot call into
+        // the game that uses it. (Inlined code comes from such assemblies too, so it is no exception.)
+        if (!NoReachableAssemblies && !Reachable(method.DeclaringType.Assembly)) score -= 200;
         return score;
+    }
+
+    private static readonly bool NoReachableAssemblies = Environment.GetEnvironmentVariable("REWIND_NO_REACHABLE_ASSEMBLIES") != null;
+
+    /// <summary>
+    /// Whether code of this method's assembly can name a type at all (it and its type arguments come from
+    /// assemblies it can reach): a type it cannot name is never what one of its locals is.
+    /// </summary>
+    private bool Nameable(TypeSig? type, int depth = 0)
+    {
+        if (NoReachableAssemblies || type == null || depth > 16) return true;
+        if (type.ElementType is { } element) return Nameable(element, depth + 1);
+        if (type is GenericInstSig g && g.Arguments.Any(a => !Nameable(a, depth + 1))) return false;
+        return type.Definition is not { } definition || Reachable(definition.Assembly);
+    }
+    private HashSet<AssemblyModel>? _reachable;
+
+    /// <summary>
+    /// Whether code of this method's assembly can refer to something in <paramref name="assembly"/>: it is the
+    /// assembly itself or one it refers to, directly or through others (a facade forwards to the core library).
+    /// Where the metadata lists no references for the assembly at all, anything is taken to be reachable.
+    /// </summary>
+    private bool Reachable(AssemblyModel assembly)
+    {
+        AssemblyModel own = _method.DeclaringType.Assembly;
+        if (ReferenceEquals(assembly, own)) return true;
+        if (_reachable == null)
+        {
+            _reachable = [own];
+            var pending = new Stack<AssemblyModel>();
+            pending.Push(own);
+            while (pending.Count > 0)
+                foreach (AssemblyModel reference in pending.Pop().References)
+                    if (_reachable.Add(reference))
+                        pending.Push(reference);
+        }
+        return own.References.Count == 0 || _reachable.Contains(assembly);
     }
 
     private static readonly bool NoResultPlaces = Environment.GetEnvironmentVariable("REWIND_NO_RESULT_PLACES") != null;
