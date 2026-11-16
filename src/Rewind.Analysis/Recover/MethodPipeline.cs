@@ -350,6 +350,7 @@ public sealed class MethodPipeline
         CheckShape(fn, "loop values");
         if (Environment.GetEnvironmentVariable("REWIND_NO_CLASS_SPLIT") == null && ClassMerges.Run(fn, IsClassOrMethodSlot)) _normalizer.Cleanup(fn);
         CheckShape(fn, "class merges");
+        if (Environment.GetEnvironmentVariable("REWIND_NO_WIDENED_CONSTANTS") == null) FoldWidenedConstants(fn);
         return new LiftedMethod
         {
             Method = method,
@@ -360,6 +361,49 @@ public sealed class MethodPipeline
             Normalization = normalization,
             Frame = frame,
         };
+    }
+
+    /// <summary>
+    /// A constant made wider or narrower is a constant. The passes above can leave one standing as an operation
+    /// (a register found to hold zero wherever it is read, behind the "mov ecx, r13d" that reads it): what asks
+    /// "is this a constant?" - the slot number handed to an interface call, a size, a shift count - then says no.
+    /// </summary>
+    private static void FoldWidenedConstants(Function fn)
+    {
+        Dictionary<Node, Node>? replace = null;
+        for (int round = 0; round < 4; round++)
+        {
+            bool any = false;
+            foreach (Block b in fn.Blocks)
+                foreach (Node n in b.Nodes)
+                {
+                    if (n.Dead || n.Op is not (Op.ZExt or Op.SExt or Op.Trunc) || n.In.Length != 1 || !n.Type.IsInt()) continue;
+                    Node from = n.In[0];
+                    while (replace != null && replace.TryGetValue(from, out Node? known)) from = known;
+                    if (!from.IsConst || !from.Type.IsInt() || from.Type == VT.I1 || n.Type == VT.I1) continue;
+                    long value = n.Op == Op.SExt ? IrBuilder.SImm(from) : (long)from.UImm;
+                    Node constant = fn.NewNode(Op.Const, n.Type, null);
+                    constant.Imm = n.Type.Bits() >= 64 ? value : (long)((ulong)value & n.Type.Mask());
+                    (replace ??= [])[n] = constant;
+                    n.Dead = true;
+                    any = true;
+                }
+            if (!any) break;
+        }
+        if (replace == null) return;
+        Node Resolve(Node n)
+        {
+            while (replace.TryGetValue(n, out Node? next)) n = next;
+            return n;
+        }
+        foreach (Block b in fn.Blocks)
+        {
+            foreach (Node n in b.Phis)
+                for (int i = 0; i < n.In.Length; i++) n.In[i] = Resolve(n.In[i]);
+            foreach (Node n in b.Nodes)
+                for (int i = 0; i < n.In.Length; i++) n.In[i] = Resolve(n.In[i]);
+            b.Nodes.RemoveAll(n => n.Dead);
+        }
     }
 
     /// <summary>The arguments a method is handed on the stack: where (from the entry stack pointer), and how many bytes of the slot they are.</summary>
