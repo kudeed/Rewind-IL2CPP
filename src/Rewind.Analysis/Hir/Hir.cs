@@ -478,6 +478,8 @@ public static class HirPrinter
             case HCall call:
             {
                 string target = call.This != null ? Print(call.This, m) : (call.DeclaringType ?? call.Method.DeclaringType.Sig).ShortName;
+                // A virtual method called as it is in a base class, not as the object's class has it.
+                if (call.This is HArg { Index: -1 } && !call.Virtual && call.Method.IsVirtual && !call.Method.DeclaringType.IsValueType) target = "base";
                 string generic = call.MethodArguments.Length == 0 ? "" : "<" + string.Join(", ", call.MethodArguments.Select(a => a.ShortName)) + ">";
                 string alt = call.Alternatives.Count == 0 ? "" : $" /*or {call.Alternatives.Count} more*/";
                 return $"{target}.{call.Method.Name}{generic}({string.Join(", ", call.Arguments.Select(a => Print(a, m)))}){alt}";

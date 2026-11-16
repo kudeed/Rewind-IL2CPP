@@ -166,6 +166,18 @@ public static class AccessorFolding
         return false;
     }
 
+    /// <summary>Whether a class between this one and the method's own (this one included) has its own version of a virtual method.</summary>
+    private static bool Overridden(MethodDef method, TypeDef from)
+    {
+        if (!method.HasSlot) return false;
+        int guard = 0;
+        for (TypeDef? t = from; t != null && guard++ < 64 && !ReferenceEquals(t, method.DeclaringType); t = t.BaseType?.Definition)
+            foreach (MethodDef m in t.Methods)
+                if (m.IsVirtual && !m.IsStatic && m.HasSlot && m.Slot == method.Slot)
+                    return true;
+        return false;
+    }
+
     public static bool IsAccessible(FieldDef field, MethodDef from)
     {
         TypeDef user = from.DeclaringType, owner = field.DeclaringType;
@@ -196,10 +208,18 @@ public static class AccessorFolding
         bool Nameable(FieldDef field) => !AccessorIndex.IsBackingField(field) && IsAccessible(field, current);
         bool OwnConstructor(FieldDef field) => current.IsConstructor && ReferenceEquals(current.DeclaringType, field.DeclaringType);
 
+        // The storage of a base class's property, used on "this" in a class that has its own version of the
+        // accessor: the source said "base.X". (A virtual call there would come back to the class's own version -
+        // in that version itself, without end.)
+        bool ViaBase(MethodDef accessor, HExpr? on) =>
+            accessor.IsVirtual && !accessor.IsStatic && !current.IsStatic && on is HArg { Index: -1 } &&
+            !ReferenceEquals(current.DeclaringType, accessor.DeclaringType) && Derives(current.DeclaringType, accessor.DeclaringType) &&
+            Overridden(accessor, current.DeclaringType);
+
         HCall? Getter(HField f)
         {
             if (index.GetterOf(f.Field) is not { } getter || ReferenceEquals(getter, current)) return null;
-            return new HCall { Method = getter, DeclaringType = f.DeclaringType is GenericInstSig ? f.DeclaringType : null, This = f.Object, Arguments = [], Virtual = getter.IsVirtual, Type = f.Type };
+            return new HCall { Method = getter, DeclaringType = f.DeclaringType is GenericInstSig ? f.DeclaringType : null, This = f.Object, Arguments = [], Virtual = getter.IsVirtual && !ViaBase(getter, f.Object), Type = f.Type };
         }
 
         // What a field is reached through, when the field is written or its address is taken: a struct that
@@ -313,7 +333,7 @@ public static class AccessorFolding
                             if (Nameable(f.Field) || (AccessorIndex.IsBackingField(f.Field) && OwnConstructor(f.Field))) break;
                             if (index.SetterOf(f.Field) is { } setter && !ReferenceEquals(setter, current))
                             {
-                                var call = new HCall { Method = setter, DeclaringType = f.DeclaringType is GenericInstSig ? f.DeclaringType : null, This = f.Object, Arguments = [a.Value], Virtual = setter.IsVirtual, Type = setter.ReturnType };
+                                var call = new HCall { Method = setter, DeclaringType = f.DeclaringType is GenericInstSig ? f.DeclaringType : null, This = f.Object, Arguments = [a.Value], Virtual = setter.IsVirtual && !ViaBase(setter, f.Object), Type = setter.ReturnType };
                                 block.Statements[i] = new HEval(call) { Address = a.Address };
                             }
                             else if (!IsAccessible(f.Field, current)) unfolded.Add(f.Field);
