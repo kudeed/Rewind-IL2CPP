@@ -29,6 +29,7 @@ internal static class DelegateFolding
             note.EndsWith(" was inlined here; the object is allocated raw and its statements follow", StringComparison.Ordinal) &&
             !method.Blocks.Any(b => b.Statements.Any(s => s is HAssign { Value: HTypeExpr { Op: HTypeOp.Allocate } a } &&
                 note == $"the constructor of {a.Target.ShortName} was inlined here; the object is allocated raw and its statements follow")));
+        InlineClosureInstances(method);
         // Anything left writing those fields is a constructor that was not recognized.
         if (method.Method.DeclaringType.FullName is "System.Delegate" or "System.MulticastDelegate") return;
         foreach (HBlock block in method.Blocks)
@@ -38,6 +39,44 @@ internal static class DelegateFolding
                     method.Problems.Add("inlined delegate constructor not folded back");
                     return;
                 }
+    }
+
+    private static readonly bool NoClosureInstances = Environment.GetEnvironmentVariable("REWIND_NO_CLOSURE_INSTANCES") != null;
+
+    /// <summary>
+    /// A lambda that captures nothing is a method of a class the compiler made, called on the one object of
+    /// that class it keeps ("&lt;&gt;c.&lt;&gt;9"). The machine code reads that object before it allocates the
+    /// delegate, so it sat in a temporary of its own: "t = &lt;&gt;c.&lt;&gt;9; d = new D(t, method)". No source has
+    /// such a statement (the class has no name that can be written). The object is the same whenever it is read
+    /// - it is made once, when its class is first used - so it is read where the delegate is made.
+    /// </summary>
+    private static void InlineClosureInstances(HMethod method)
+    {
+        if (NoClosureInstances) return;
+        foreach (HBlock block in method.Blocks)
+            for (int i = 0; i < block.Statements.Count - 1; i++)
+            {
+                if (block.Statements[i] is not HAssign { Target: HLocal { Variable: var temp }, Value: HField { Object: null, Field: { Name: "<>9", IsStatic: true } } instance } ||
+                    temp.AddressTaken) continue;
+                int mentions = 0;
+                foreach (HBlock b in method.Blocks)
+                    foreach (HStmt s in b.Statements)
+                        if (ConstructorFolding.Mentions(s, temp)) mentions++;
+                if (mentions != 2) continue;
+                for (int k = i + 1; k < block.Statements.Count && k <= i + 6; k++)
+                {
+                    if (!ConstructorFolding.Mentions(block.Statements[k], temp)) continue;
+                    if (block.Statements[k] is HAssign { Value: HNewObject { Arguments: [HLocal { Variable: var given }, HMethodPointer] } made } &&
+                        ReferenceEquals(given, temp) && made.Type != null && IsDelegate(made.Type))
+                    {
+                        made.Arguments[0] = instance;
+                        block.Statements.RemoveAt(i);
+                        method.Locals.Remove(temp);
+                        i--;
+                    }
+                    break;
+                }
+            }
     }
 
     private static bool IsDelegate(TypeSig type)
