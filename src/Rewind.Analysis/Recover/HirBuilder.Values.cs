@@ -1741,6 +1741,12 @@ public sealed partial class HirBuilder
                 return;
             case PPair pair:
             {
+                // A whole number where two floats are - a sum, a count widened to 64 bits, a constant that read
+                // as floats is no number anyone writes: other data in a reused slot (a loop's spilled offset
+                // where a vector was). Each lifetime gets its own memory (see StackSplitting).
+                if (!NoPairConflicts && (IsFloat(pair.Low.Type) || IsFloat(pair.High.Type)) && IsFrameAddress(n.In[0], out int pairAt) &&
+                    IsWholeNumber(valueNode, IsFloat(pair.Low.Type), IsFloat(pair.High.Type)))
+                    FrameConflicts.Add(pairAt);
                 Sem s = Eval(valueNode);
                 HExpr low, high;
                 if (s is SPair p) (low, high) = (p.Low, p.High);
@@ -1962,6 +1968,25 @@ public sealed partial class HirBuilder
     }
 
     private static readonly bool NoWidePairs = Environment.GetEnvironmentVariable("REWIND_NO_WIDE_PAIRS") != null;
+    private static readonly bool NoPairConflicts = Environment.GetEnvironmentVariable("REWIND_NO_PAIR_CONFLICTS") != null;
+
+    /// <summary>
+    /// True when eight bytes are a whole number and not two floats side by side: the result of integer
+    /// arithmetic, or a constant one of whose float halves would be a denormal or an odd "not a number".
+    /// </summary>
+    private static bool IsWholeNumber(Node value, bool lowIsFloat, bool highIsFloat)
+    {
+        if (value.Type != VT.I64) return false;
+        if (value.Op is Op.Add or Op.Sub or Op.Mul or Op.SExt) return true;
+        if (!value.IsConst) return false;
+        static bool Unlikely(uint bits)
+        {
+            uint exponent = (bits >> 23) & 0xFF, fraction = bits & 0x7FFFFF;
+            // (Infinity and the one "not a number" a program names are numbers people do write.)
+            return (exponent == 0 && fraction != 0) || (exponent == 0xFF && fraction != 0 && fraction != 0x400000);
+        }
+        return (lowIsFloat && Unlikely((uint)(value.UImm & 0xFFFFFFFF))) || (highIsFloat && Unlikely((uint)(value.UImm >> 32)));
+    }
 
     private Place FramePlace(int offset, int size)
     {

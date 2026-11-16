@@ -740,6 +740,8 @@ public sealed class MethodPipeline
         }
     }
 
+    private static readonly bool NoLoopValuesAgain = Environment.GetEnvironmentVariable("REWIND_NO_LOOP_VALUES_AGAIN") != null;
+
     private HMethod BuildCoreOf(LiftedMethod lifted)
     {
         (HirBuilder builder, HMethod result) = BuildRounds(lifted);
@@ -768,6 +770,8 @@ public sealed class MethodPipeline
             lifted.Frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, after, current), StackArguments(lifted.Abi));
             DeadCode.Run(fn);
             _normalizer.Cleanup(fn);
+            // A loop variable that was kept in the memory just separated is a merged value only now.
+            if (!NoLoopValuesAgain && LoopValues.Run(fn, ArgumentBits)) _normalizer.Cleanup(fn);
             (builder, result) = BuildRounds(lifted);
         }
         FieldOwners.Run(result, _program.Model);
