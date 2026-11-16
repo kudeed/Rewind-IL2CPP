@@ -76,15 +76,17 @@ public static class InlineCopyFinder
                 }
 
                 // Track which metadata slot a register was loaded from; anything else written to it forgets that.
-                if (ins.Mnemonic == Mnemonic.Mov && ins.Op0Kind == OpKind.Register && ins.Op0Register.GetSize() == 8)
+                // Only general-purpose registers are tracked: other 64-bit registers (control, debug, MMX - in bytes
+                // that decode as `mov rax, cr0` and the like) have no place in the table.
+                if (ins.Mnemonic == Mnemonic.Mov && ins.Op0Kind == OpKind.Register && ins.Op0Register.IsGPR64())
                 {
                     int destination = Index(ins.Op0Register);
                     if (ins.Op1Kind == OpKind.Memory && ins.IsIPRelativeMemoryOperand) slotOf[destination] = ins.IPRelativeMemoryAddress;
-                    else if (ins.Op1Kind == OpKind.Register && ins.Op1Register.GetSize() == 8) slotOf[destination] = slotOf[Index(ins.Op1Register)];
+                    else if (ins.Op1Kind == OpKind.Register && ins.Op1Register.IsGPR64()) slotOf[destination] = slotOf[Index(ins.Op1Register)];
                     else slotOf[destination] = 0;
                 }
                 else if (ins.Mnemonic == Mnemonic.Mov && ins.Op0Kind == OpKind.Memory && ins.MemoryBase == Register.RSP && ins.MemoryIndex == Register.None &&
-                         ins.Op1Kind == OpKind.Register && ins.Op1Register.GetSize() == 8)
+                         ins.Op1Kind == OpKind.Register && ins.Op1Register.IsGPR64())
                 {
                     long offset = (long)ins.MemoryDisplacement64 - 0x20;
                     if (offset is >= 0 and < 32 && offset % 8 == 0) stackSlots[offset / 8] = slotOf[Index(ins.Op1Register)];
