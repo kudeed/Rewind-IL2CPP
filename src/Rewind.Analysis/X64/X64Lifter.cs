@@ -442,7 +442,7 @@ public sealed class X64Lifter
     }
 
     /// <summary>Callee-saved registers as variable numbers: rbx, rbp, rsi, rdi, r12-r15.</summary>
-    private static readonly int[] CalleeSaved = [3, 5, 6, 7, 12, 13, 14, 15];
+    internal static readonly int[] CalleeSaved = [3, 5, 6, 7, 12, 13, 14, 15];
 
     /// <summary>The first instruction after the prologue (register homing, pushes, frame allocation).</summary>
     private ulong PrologueEnd(ulong start)

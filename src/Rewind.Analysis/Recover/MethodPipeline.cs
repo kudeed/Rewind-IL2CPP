@@ -827,6 +827,8 @@ public sealed class MethodPipeline
     /// The entry values the calling convention gives no meaning: the scratch registers, and the argument
     /// registers this method has no parameter for.
     /// </summary>
+    private static readonly bool NoSavedLeftovers = Environment.GetEnvironmentVariable("REWIND_NO_SAVED_LEFTOVERS") != null;
+
     private static Func<Node, bool> Leftovers(Function fn, MethodAbi abi)
     {
         var leftovers = new HashSet<Node>();
@@ -837,6 +839,13 @@ public sealed class MethodPipeline
         Add(0);   // rax
         Add(10);  // r10
         Add(11);  // r11
+        // What the caller left in a register this method must preserve means nothing to the method itself: it
+        // is only saved and put back. Writing one byte of such a register ("mov bl, [isOn]") keeps the caller's
+        // other seven, which no one reads.
+        if (!NoSavedLeftovers)
+            foreach (int saved in X64Lifter.CalleeSaved)
+                if (saved != X64Lifter.VarRsp)
+                    Add(saved);
         if (abi.Known)
         {
             var taken = new HashSet<int>();
