@@ -818,11 +818,55 @@ public sealed partial class HirBuilder
         foreach (var (node, scale) in terms)
         {
             if (ReferenceEquals(node, baseNode)) continue;
-            if (index != null) return new AddressParts(baseNode, baseSem, offset, null, -1); // more than one index term
+            if (index != null) return CombinedIndex(address, baseNode, baseSem, offset, terms); // more than one index term
             index = node;
             indexScale = scale;
         }
         return new AddressParts(baseNode, baseSem, offset, index, indexScale);
+    }
+
+    private static readonly bool NoCombinedIndex = Environment.GetEnvironmentVariable("REWIND_NO_COMBINED_INDEX") != null;
+    private readonly Dictionary<Node, Node?> _combinedIndexes = [];
+
+    /// <summary>
+    /// An address with several terms besides its base: "grid + (row + col) * 4", which the expansion above takes
+    /// apart, or an element reached from a pointer that is already part way into the array ("p = src + offset",
+    /// then p[i]). One index stands for all of them: the terms in units of the largest step they share
+    /// ("grid[row + col]", "src[offset + i]"). Whether that step is the element's size is for the caller to see.
+    /// </summary>
+    private AddressParts CombinedIndex(Node address, Node? baseNode, Sem? baseSem, long offset, List<(Node Node, long Scale)> terms)
+    {
+        var parts = new AddressParts(baseNode, baseSem, offset, null, -1);
+        if (NoCombinedIndex || baseNode == null) return parts;
+        var indexTerms = terms.Where(t => !ReferenceEquals(t.Node, baseNode)).ToList();
+        // (Full-width terms only: what they add up to is then the same as the address computes.)
+        if (indexTerms.Any(t => t.Node.Type != VT.I64)) return parts;
+        long unit = 0;
+        foreach (var (_, scale) in indexTerms) unit = Gcd(unit, Math.Abs(scale));
+        if (unit is <= 0 or > 4096) return parts;
+        if (!_combinedIndexes.TryGetValue(address, out Node? sum))
+        {
+            sum = null;
+            foreach (var (node, scale) in indexTerms)
+            {
+                Node term = node;
+                if (scale != unit)
+                {
+                    Node factor = _fn.NewNode(Op.Const, VT.I64, null);
+                    factor.Imm = scale / unit;
+                    term = _fn.NewNode(Op.Mul, VT.I64, null, node, factor);
+                }
+                sum = sum == null ? term : _fn.NewNode(Op.Add, VT.I64, null, sum, term);
+            }
+            _combinedIndexes[address] = sum;
+        }
+        return sum == null ? parts : new AddressParts(baseNode, baseSem, offset, sum, unit);
+    }
+
+    private static long Gcd(long a, long b)
+    {
+        while (b != 0) (a, b) = (b, a % b);
+        return a;
     }
 
     /// <summary>Follows struct fields inward until the accessed bytes line up with one field (or a pair).</summary>
