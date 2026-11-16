@@ -883,7 +883,9 @@ public sealed class BodyEmitter
         private void Compare(HCompare c)
         {
             bool isFloat = IsFloat(c.Left.Type) || IsFloat(c.Right.Type);
-            bool wide = !isFloat && (StackBits(c.Left) == 64 || StackBits(c.Right) == 64);
+            // ("x as long" is an object or null, not a number of 64 bits: nothing to widen the other side to.)
+            bool tested = c.Left is HTypeExpr { Op: HTypeOp.IsInst } || c.Right is HTypeExpr { Op: HTypeOp.IsInst };
+            bool wide = !isFloat && !tested && (StackBits(c.Left) == 64 || StackBits(c.Right) == 64);
             Value(c.Left);
             if (wide && StackBits(c.Left) == 32 && c.Left.Type is PrimitiveSig) _il.Emit(IsUnsigned(c.Left.Type) ? OpCodes.Conv_U8 : OpCodes.Conv_I8);
             // A T is compared (with null, with another reference) as the object it is when boxed.

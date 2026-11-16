@@ -416,6 +416,15 @@ public sealed partial class HirBuilder
         return IntValue(c);
     }
 
+    /// <summary>Whether a value compared at 8 or 16 bits is one the program holds as a signed number of that width.</summary>
+    private bool HeldSigned(Node n)
+    {
+        int bits = n.Type.Bits();
+        if (bits is not (8 or 16) || n.IsConst) return false;
+        HExpr e = ScalarOf(Value(n), bits);
+        return e is not HConst && BitsOf(e.Type) == bits && !IsBool(e.Type) && IsSignedSmall(e.Type);
+    }
+
     /// <summary>
     /// An operand of a comparison performed on 8 or 16 bits. Only those bits take part, so a wider expression
     /// is cut down first (with the signedness the comparison uses).
@@ -424,7 +433,16 @@ public sealed partial class HirBuilder
     {
         int bits = n.Type.Bits();
         HExpr e = ScalarOf(Value(n), bits);
-        if (bits is not (8 or 16) || e is HConst) return e;
+        if (bits is not (8 or 16)) return e;
+        // A constant, as a number of the kind the other side is compared as: the byte 0xFF is 255 next to an
+        // unsigned value and -1 next to a signed one. ("(byte)x != -1" is always true.)
+        if (e is HConst { Value: int or long } constant && !IsBool(constant.Type))
+        {
+            long value = Convert.ToInt64(constant.Value);
+            long ranged = (bits, signed) switch { (8, true) => (sbyte)value, (8, false) => (byte)value, (16, true) => (short)value, _ => (ushort)value };
+            return ranged == value ? e : new HConst(constant.Value is long ? ranged : (int)ranged, constant.Type);
+        }
+        if (e is HConst) return e;
         int known = BitsOf(e.Type);
         if (known == bits && (IsBool(e.Type) || IsSignedSmall(e.Type) == signed)) return e;
         HConvKind kind = (bits, signed) switch
@@ -440,6 +458,8 @@ public sealed partial class HirBuilder
         return new HConv(kind, e) { Type = type };
     }
 
+    private static readonly bool NoHeldSigned = Environment.GetEnvironmentVariable("REWIND_NO_HELD_SIGNED") != null;
+
     private Sem CompareSem(Node n)
     {
         HCompareOp op = n.Op switch
@@ -453,6 +473,8 @@ public sealed partial class HirBuilder
         };
         if (TypeTestCompare(n) is { } typeTest) return typeTest;
         bool signedCompare = n.Op is Op.CmpLtS or Op.CmpLeS;
+        // Equal or not is the same question either way: asked the way the values are held ("x != -1" of an sbyte).
+        if (n.Op is Op.CmpEq or Op.CmpNe && !NoHeldSigned) signedCompare = HeldSigned(n.In[0]) || HeldSigned(n.In[1]);
         HExpr left = CompareOperand(n.In[0], signedCompare), right = CompareOperand(n.In[1], signedCompare);
 
         // A truth value compared with zero is the value itself, or its negation.
@@ -464,6 +486,16 @@ public sealed partial class HirBuilder
                 bool wantTrue = (n.Op == Op.CmpNe) == (zeroOrOne == 0);
                 return new SVal(wantTrue ? left : new HUnary(HUnaryOp.LogicalNot, left) { Type = _bool });
             }
+        }
+
+        // "x as T" is the object or nothing, also where T is a struct (the object is then a boxed one): measured
+        // against zero it asks whether there is one. (Taken as a T, the zero became a number, and the test an
+        // unboxing of the object as that number.)
+        if (n.Op is Op.CmpEq or Op.CmpNe)
+        {
+            if (right is HTypeExpr { Op: HTypeOp.IsInst } && left is HConst) (left, right) = (right, left);
+            if (left is HTypeExpr { Op: HTypeOp.IsInst, Target: var tested } && !IsReference(tested) && right is HConst { Value: null or 0 or 0L or false })
+                return new SVal(new HCompare(op, left, new HConst(null, _object)) { Type = _bool });
         }
 
         // Comparing a reference with the constant 0 is a null test.

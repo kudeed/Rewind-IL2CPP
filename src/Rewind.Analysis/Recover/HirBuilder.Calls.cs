@@ -1691,7 +1691,8 @@ public sealed partial class HirBuilder
             {
                 // class_is_assignable_from(K, obj->klass): "obj is K" (the object is not null: its class was read).
                 if (a0 == null || a1 == null || EvalKlass(a0) is not { } type || Eval(a1) is not SObjKlass { Object: var subject }) break;
-                HExpr test = new HCompare(HCompareOp.Ne, new HTypeExpr(HTypeOp.IsInst, type, Value(subject)) { Type = type }, new HConst(null, type)) { Type = _bool };
+                // (Of a struct type the object is a boxed one: there is one or there is none, as with any object.)
+                HExpr test = new HCompare(HCompareOp.Ne, new HTypeExpr(HTypeOp.IsInst, type, Value(subject)) { Type = type }, new HConst(null, IsReference(type) ? type : _object)) { Type = _bool };
                 FinishCall(call, test, ReturnKind.Integer, _bool, tail);
                 return;
             }
