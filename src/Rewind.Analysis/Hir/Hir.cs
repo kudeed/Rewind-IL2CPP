@@ -287,6 +287,8 @@ public sealed class HMethod
     public List<string> Problems = [];
     /// <summary>Remarks that do not affect what the code does (for instance: it contains inlined code).</summary>
     public List<string> Notes = [];
+    /// <summary>The methods whose statements, pasted in here, were put back as a call of the method.</summary>
+    public HashSet<MethodDef>? PutBack;
     /// <summary>Try regions by index (see HBlock.Scope).</summary>
     public Dictionary<int, HTryRegion> TryRegions = [];
     /// <summary>For inspection: the types the recovery gave stack memory, by offset from the entry stack pointer.</summary>

@@ -960,7 +960,9 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         if (Disabled) return;
         MethodDef current = method.Method;
         MethodDef? outer = _current;
+        HashSet<MethodDef>? outerBarred = _barred;
         _current = current;
+        _barred = pipeline.BarredFor(current);
         try
         {
             Fold(method, current);
@@ -968,11 +970,14 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         finally
         {
             _current = outer;
+            _barred = outerBarred;
         }
     }
 
     /// <summary>The method whose statements are being looked at (null outside Run).</summary>
     private MethodDef? _current;
+    /// <summary>The methods that one must not be written as a call of.</summary>
+    private HashSet<MethodDef>? _barred;
     private static readonly bool NoStoredBehind = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_STORED_BEHIND") != null;
 
     /// <summary>
@@ -1011,7 +1016,9 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         bool Foreign(object member) => member is FieldDef f
             ? !AccessorIndex.IsBackingField(f) && !AccessorFolding.IsAccessible(f, current)
             : !IsAccessible((MethodDef)member, current);
-        bool Usable(Template t) => !ReferenceEquals(t.Method, current) && IsAccessible(t.Method, current);
+        // (Not a method this one must not be written as a call of: see MethodPipeline.TwinOf.)
+        HashSet<MethodDef>? barred = _barred;
+        bool Usable(Template t) => !ReferenceEquals(t.Method, current) && IsAccessible(t.Method, current) && !(barred?.Contains(t.Method) ?? false);
         // The methods with branches first: the larger a method, the more of the smaller ones' statements it contains.
         _putBack = !NoPutBack;
         _putBackBudget = 48;
@@ -1159,7 +1166,11 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                         if (Tracing(template.Method)) Console.Error.WriteLine($"[inline] {method.Method.Name}: trying {template.Method.Name}{(template.Flow != null ? " (with branches)" : "")} for {anchor} at L{block.Id}:{i}");
                         counts ??= Counts.Of(method);
                         _partly = false;
-                        if (template.Flow != null ? TryFoldFlow(method, block, i, template, counts) : TryFold(method, block, i, template, anchor, counts)) return true;
+                        if (template.Flow != null ? TryFoldFlow(method, block, i, template, counts) : TryFold(method, block, i, template, anchor, counts))
+                        {
+                            (method.PutBack ??= []).Add(template.Method);
+                            return true;
+                        }
                         if (template.Flow != null && _partly && _putBack && _putBackBudget > 0 && PutBack(method, block, template, counts)) return true;
                     }
                 }
@@ -1207,6 +1218,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         {
             if (member is not MethodDef callee || ReferenceEquals(callee, template.Method) || ReferenceEquals(callee, method.Method)) continue;
             if (callee.DeclaringType.GenericParameters.Length != 0 || callee.GenericParameters.Length != 0) continue;
+            if (ReferenceEquals(method.Method, _current) && (_barred?.Contains(callee) ?? false)) continue;
             foreach (Template inner in TemplatesOf(callee.DeclaringType))
             {
                 if (!ReferenceEquals(inner.Method, callee)) continue;
@@ -1222,6 +1234,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                         });
                         if (anchor == null) continue;
                         if (!(inner.Flow != null ? TryFoldFlow(method, b, i, inner, counts) : TryFold(method, b, i, inner, anchor, counts))) continue;
+                        (method.PutBack ??= []).Add(callee);
                         if (tracing) Console.Error.WriteLine($"[inline] {method.Method.Name}: {callee.FullName} put back for {template.Method.Name}");
                         return true;
                     }

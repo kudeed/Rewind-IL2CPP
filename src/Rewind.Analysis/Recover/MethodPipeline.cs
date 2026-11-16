@@ -149,12 +149,152 @@ public sealed class MethodPipeline
         (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters) = (own, own);
         try
         {
-            return Build(Lift(method, classArgs, methodArgs, address));
+            HMethod built = Build(Lift(method, classArgs, methodArgs, address));
+            // Written as nothing but a call of a method that is itself nothing but such a call: see TwinOf.
+            for (int round = 0; round < 8 && !NoTwins && !_probing && (TwinOf(built, address != 0 ? address : method.Address) ?? CallerPutBack(built)) is { } twin; round++)
+            {
+                if (!_barred.TryGetValue(method, out HashSet<MethodDef>? barred)) _barred[method] = barred = [];
+                if (!barred.Add(twin)) break;
+                built = Build(Lift(method, classArgs, methodArgs, address));
+            }
+            return built;
         }
         finally
         {
             (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters) = (builder, layouts);
         }
+    }
+
+    private static readonly bool NoTwins = Environment.GetEnvironmentVariable("REWIND_NO_TWIN_CHECK") != null;
+    private readonly Dictionary<MethodDef, HashSet<MethodDef>> _barred = [];
+    private readonly Dictionary<MethodDef, MethodDef?> _passesOn = [];
+    private bool _probing;
+
+    /// <summary>The methods a method must not be written as a call of (null while the question is how it reads without that rule).</summary>
+    internal HashSet<MethodDef>? BarredFor(MethodDef method) => _probing ? null : _barred.GetValueOrDefault(method);
+
+    /// <summary>
+    /// The method called, when the whole of a method was found to be the pasted-in statements of another and
+    /// is now nothing but a call of that one.
+    /// </summary>
+    private static MethodDef? PassedOnTo(HMethod h)
+    {
+        if (h.PutBack == null || h.Problems.Count != 0 || h.Blocks.Count == 0 || h.TryRegions.Count != 0) return null;
+        // (Its statements, through the jumps that only lead on to the next block.)
+        var statements = new List<HStmt>();
+        HBlock? block = h.Blocks[0];
+        for (int guard = 0; block != null && guard < 8; guard++)
+        {
+            HBlock? next = null;
+            foreach (HStmt s in block.Statements)
+            {
+                if (s is HJump jump) next = jump.Target;
+                else statements.Add(s);
+            }
+            block = next;
+        }
+        if (block != null) return null;
+        HExpr? only = statements switch
+        {
+            [HEval { Expression: var e }, HReturn { Value: null }] => e,
+            [HReturn { Value: { } e }] => e,
+            [HAssign { Target: HLocal { Variable: var set }, Value: var e }, HReturn { Value: HLocal { Variable: var returned } }] when ReferenceEquals(set, returned) => e,
+            _ => null,
+        };
+        return only is HCall call && h.PutBack.Contains(call.Method) && !ReferenceEquals(call.Method, h.Method) ? call.Method : null;
+    }
+
+    /// <summary>The method that a method, read without the rules below, comes out as nothing but a call of (having its statements); null when it is more than that.</summary>
+    private MethodDef? PassesOnTo(MethodDef method)
+    {
+        if (_passesOn.TryGetValue(method, out MethodDef? known)) return known;
+        if (method.Address == 0 || method.DeclaringType.GenericParameters.Length != 0 || method.GenericParameters.Length != 0) return null;
+        _passesOn[method] = null; // asked again while it is being read: no
+        MethodDef? passes = null;
+        (HashSet<GenericParam>? builder, HashSet<GenericParam>? layouts) = (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters);
+        (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters) = (null, null);
+        bool probing = _probing;
+        _probing = true;
+        try
+        {
+            passes = PassedOnTo(Build(Lift(method)));
+        }
+        catch (Exception e) when (e is not OutOfMemoryException and not StackOverflowException)
+        {
+            passes = null;
+        }
+        finally
+        {
+            _probing = probing;
+            (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters) = (builder, layouts);
+        }
+        return _passesOn[method] = passes;
+    }
+
+    /// <summary>
+    /// How much a method looks like one whose source was a single call of another, where the code of the two
+    /// is the same and cannot tell: one the compiler made (a lambda), one with more parameters (a call from one
+    /// with fewer would have to make their values up), one the engine or a base class calls by name or slot, one
+    /// that more code can see.
+    /// </summary>
+    private static int PassingRank(MethodDef m)
+    {
+        bool made = m.Name.Contains('<') || m.DeclaringType.Name.Contains('<');
+        bool message = !m.IsStatic && (m.IsVirtual || m.Name is "Awake" or "Start" or "Update" or "FixedUpdate" or "LateUpdate" or "OnEnable" or "OnDisable" or "OnDestroy"
+            or "OnValidate" or "Reset" or "OnGUI" or "OnApplicationQuit" or "OnApplicationPause" or "OnApplicationFocus" or "Spawned" or "Despawned" or "FixedUpdateNetwork" or "Render");
+        int access = (m.Flags & MethodDef.AccessMask) switch { 6 => 3, 5 or 4 => 2, 3 or 2 => 1, _ => 0 };
+        return (made ? 1000 : 0) + Math.Min(m.Parameters.Length, 9) * 100 + (message ? 10 : 0) + access;
+    }
+
+    /// <summary>
+    /// Two methods with the same statements - one function in the image (the linker keeps one copy of identical
+    /// code), or each with the other, or the same third one, pasted in - would each be found to be the pasted-in
+    /// statements of the other, and each be written as a call of the other: a method that calls itself without
+    /// end. Which of them called which, the code does not say. So a method that has become nothing but a call of
+    /// another, which read on its own would be such a call too, stays that only if it looks more like the
+    /// caller of the two (PassingRank); otherwise it keeps its statements. Returns the method it must not be a
+    /// call of.
+    /// </summary>
+    private MethodDef? TwinOf(HMethod built, ulong address)
+    {
+        if (PassedOnTo(built) is not { } target) return null;
+        MethodDef method = built.Method;
+        bool generic = target.DeclaringType.GenericParameters.Length != 0 || target.GenericParameters.Length != 0;
+        bool twin = generic ? target.Address != 0 && target.Address == address : PassesOnTo(target) != null;
+        if (!twin) return null;
+        return PassingRank(method) > PassingRank(target) ? null : target;
+    }
+
+    /// <summary>
+    /// The same in part: statements of a method were found to be the pasted-in statements of another and put
+    /// back as a call of it - of one that is itself nothing but a call of this method ("int Count => _count;"
+    /// seen in the getter of _count). Those statements are this method's own: the other one has them because
+    /// this one was pasted into it. Returns that other method, which this one must not be written as a call of.
+    /// </summary>
+    private MethodDef? CallerPutBack(HMethod built)
+    {
+        if (built.PutBack == null) return null;
+        MethodDef method = built.Method;
+        foreach (MethodDef other in built.PutBack)
+        {
+            if (ReferenceEquals(other, method) || (_barred.TryGetValue(method, out HashSet<MethodDef>? barred) && barred.Contains(other))) continue;
+            // (A method that only passes a call on to one of another class does so through something of its
+            // own - a field, a parameter: its statements are not found in that one as they stand.)
+            if (!Related(other.DeclaringType, method.DeclaringType)) continue;
+            if (ReferenceEquals(PassesOnTo(other), method)) return other;
+        }
+        return null;
+    }
+
+    private static bool Related(TypeDef a, TypeDef b)
+    {
+        int guard = 0;
+        for (TypeDef? t = a; t != null && guard++ < 64; t = t.BaseType?.Definition)
+            if (ReferenceEquals(t, b)) return true;
+        guard = 0;
+        for (TypeDef? t = b; t != null && guard++ < 64; t = t.BaseType?.Definition)
+            if (ReferenceEquals(t, a)) return true;
+        return false;
     }
 
     public LiftedMethod Lift(MethodDef method, TypeSig[]? classArgs = null, TypeSig[]? methodArgs = null, ulong address = 0)
