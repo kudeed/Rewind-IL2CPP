@@ -276,9 +276,11 @@ public static class Decompiler
                     }
                     catch (Exception e)
                     {
-                        Interlocked.Increment(ref errors);
+                        failed = true;
                         text = DecompileMemberwise(decompiler, item.Name, e);
                     }
+                    if (MarkFailedMembers(ref text)) failed = true;
+                    if (failed) Interlocked.Increment(ref errors);
                     string file = Path.Combine(targetDirectory, item.File);
                     Directory.CreateDirectory(Path.GetDirectoryName(file)!);
                     File.WriteAllText(file, text);
@@ -293,6 +295,37 @@ public static class Decompiler
             result.Types += types.Count;
             result.TypesWithErrors += errors;
         }
+    }
+
+    private const string FailedMember = "// ILSpy could not decompile this member";
+
+    /// <summary>
+    /// A member the C# decompiler gave up on comes out as a body of comments: an empty method, which compiles and
+    /// does nothing. That must not pass for recovered code, so the body is given the marker a gap has. True when
+    /// there was such a member.
+    /// </summary>
+    private static bool MarkFailedMembers(ref string text)
+    {
+        if (!text.Contains(FailedMember, StringComparison.Ordinal)) return false;
+        var sb = new StringBuilder(text.Length + 256);
+        int at = 0;
+        while (at < text.Length)
+        {
+            int end = text.IndexOf('\n', at);
+            end = end < 0 ? text.Length : end + 1;
+            ReadOnlySpan<char> line = text.AsSpan(at, end - at);
+            ReadOnlySpan<char> trimmed = line.TrimStart();
+            if (trimmed.StartsWith(FailedMember, StringComparison.Ordinal))
+            {
+                sb.Append(line[..(line.Length - trimmed.Length)]);
+                sb.Append("__Rewind.Note(\"the C# decompiler could not write this member: its code is in the rebuilt assembly only\");");
+                sb.Append(line.EndsWith("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n");
+            }
+            sb.Append(line);
+            at = end;
+        }
+        text = sb.ToString();
+        return true;
     }
 
     /// <summary>
