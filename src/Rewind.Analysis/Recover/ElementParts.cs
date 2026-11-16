@@ -181,6 +181,147 @@ internal static class ElementParts
     }
 
     /// <summary>
+    /// Whether every use of a variable in an expression reads only parts of it that the given stores set (or does
+    /// not read it at all). Its address taken counts as a read of all of it.
+    /// </summary>
+    private static bool Explained(HExpr? e, HVar x, List<List<FieldDef>> set)
+    {
+        switch (e)
+        {
+            case null or HConst or HArg:
+                return true;
+            case HLocal local:
+                return !ReferenceEquals(local.Variable, x) || set.Any(q => q.Count == 0);
+            case HField { Object: not null } field when !field.Field.IsStatic:
+            {
+                List<FieldDef> path = Path(field, out HExpr root);
+                if (root is not HLocal { Variable: var owner } || !ReferenceEquals(owner, x)) return Explained(root, x, set);
+                if (set.Any(q => q.Count <= path.Count && Overlap(q, path))) return true;
+                return Covers(field.Type?.Definition, set.Where(q => q.Count > path.Count && Overlap(q, path)).ToList(), path.Count);
+            }
+            case HField:
+                return true;
+            case HElement element:
+                return Explained(element.Array, x, set) && Explained(element.Index, x, set);
+            case HArrayLength length:
+                return Explained(length.Array, x, set);
+            case HDeref pointer:
+                return Explained(pointer.Pointer, x, set);
+            case HUnary unary:
+                return Explained(unary.Operand, x, set);
+            case HBinary binary:
+                return Explained(binary.Left, x, set) && Explained(binary.Right, x, set);
+            case HCompare compare:
+                return Explained(compare.Left, x, set) && Explained(compare.Right, x, set);
+            case HConv conversion:
+                return Explained(conversion.Operand, x, set);
+            case HCall call:
+                return Explained(call.This, x, set) && call.Arguments.All(a => Explained(a, x, set));
+            case HNewObject made:
+                return made.Arguments.All(a => Explained(a, x, set));
+            case HNewArray array:
+                return Explained(array.Length, x, set);
+            case HTypeExpr typed:
+                return Explained(typed.Operand, x, set);
+            case HSelect select:
+                return Explained(select.Condition, x, set) && Explained(select.WhenTrue, x, set) && Explained(select.WhenFalse, x, set);
+            default:
+                return !ConstructorFolding.Mentions(e, x);
+        }
+    }
+
+    private static bool Explained(HStmt s, HVar x, List<List<FieldDef>> set) => s switch
+    {
+        HAssign a => Explained(a.Target, x, set) && Explained(a.Value, x, set),
+        HEval e => Explained(e.Expression, x, set),
+        HReturn r => Explained(r.Value, x, set),
+        HThrow t => Explained(t.Exception, x, set),
+        HBranch b => Explained(b.Condition, x, set),
+        HSwitch choice => Explained(choice.Value, x, set),
+        _ => true,
+    };
+
+    /// <summary>
+    /// Whether, going on from the end of a block, the variable can be read before it is set again as a whole
+    /// (in one go, or part by part within one block). At the end of <paramref name="head"/> the parts in
+    /// <paramref name="there"/> are set as well.
+    /// </summary>
+    private static bool ReadAfter(HMethod method, HBlock from, HVar x, HBlock head, List<List<FieldDef>> there)
+    {
+        // (Its address kept anywhere: it can be read without being named.)
+        List<List<FieldDef>> all = [[]];
+        foreach (HBlock b in method.Blocks)
+            foreach (HStmt s in b.Statements)
+                if (!Explained(s, x, all))
+                    return true;
+
+        var seen = new HashSet<HBlock>();
+        var work = new Stack<HBlock>();
+        void Enter(HBlock b)
+        {
+            if (seen.Add(b)) work.Push(b);
+        }
+        // An exception leads to the handlers of the protected code a block is in, from anywhere in the block.
+        void Handlers(int scope)
+        {
+            for (int s = scope, guard = 0; s >= 0 && guard < 64; guard++, s = method.OuterOf(s))
+                if ((s & 1) == 0 && method.TryRegions.TryGetValue(s >> 1, out HTryRegion? region))
+                    Enter(region.HandlerEntry);
+        }
+        if (from.Statements.Count == 0 || from.Statements[^1] is not HJump onward) return true;
+        Enter(onward.Target);
+        Handlers(from.Scope);
+        while (work.Count != 0)
+        {
+            HBlock b = work.Pop();
+            Handlers(b.Scope);
+            var set = new List<List<FieldDef>>();
+            bool whole = false;
+            for (int i = 0; i < b.Statements.Count && !whole; i++)
+            {
+                HStmt s = b.Statements[i];
+                if (ReferenceEquals(b, head) && i == b.Statements.Count - 1)
+                {
+                    set.AddRange(there);
+                    if (Covers(x.Type.Definition, set, 0))
+                    {
+                        whole = true;
+                        break;
+                    }
+                }
+                if (s is HAssign { Target: var target, Value: var value })
+                {
+                    List<FieldDef> path = Path(target, out HExpr root);
+                    if (root is HLocal { Variable: var written } && ReferenceEquals(written, x))
+                    {
+                        if (!Explained(value, x, set)) return true;
+                        set.Add(path);
+                        whole = Covers(x.Type.Definition, set, 0);
+                        continue;
+                    }
+                }
+                if (!Explained(s, x, set)) return true;
+            }
+            if (whole || b.Statements.Count == 0) continue;
+            switch (b.Statements[^1])
+            {
+                case HJump jump:
+                    Enter(jump.Target);
+                    break;
+                case HBranch branch:
+                    Enter(branch.WhenTrue);
+                    Enter(branch.WhenFalse);
+                    break;
+                case HSwitch choice:
+                    foreach (HBlock target in choice.Targets) Enter(target);
+                    Enter(choice.Default);
+                    break;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
     /// What follows the two paths, where the compiler gave each a copy of its own (the "i++" of the loop both are
     /// in, on the storing path somewhere among its stores): variables set from variables, the same on both and
     /// read by nothing else there. It becomes one block both lead to, so that the paths end where the pasted
@@ -345,7 +486,10 @@ internal static class ElementParts
 
         // The struct is the method's own copy of what it hands over: nothing else looks at it.
         if (ConstructorFolding.Mentions(branch.Condition, whole) || ConstructorFolding.Mentions(place, whole)) return false;
-        if (!OnlySetElsewhere(method, whole, (b, _) => ReferenceEquals(b, head) || ReferenceEquals(b, passing))) return false;
+        for (int i = 0; i < first; i++)
+            if (ConstructorFolding.Mentions(d[i], whole))
+                return false;
+        if (ReadAfter(method, direct, whole, head, parts.Select(part => part.Path).ToList())) return false;
         if (copy != null && !OnlySetElsewhere(method, copy, (b, s) => ReferenceEquals(b, direct) && d.IndexOf(s) >= first)) return false;
 
         int at = head.Statements.Count - 1;
