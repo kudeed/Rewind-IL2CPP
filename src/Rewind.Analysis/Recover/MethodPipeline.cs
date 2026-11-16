@@ -334,13 +334,14 @@ public sealed class MethodPipeline
         }
         CheckShape(fn, "parked addresses");
         ParkedAddresses.Canonicalize(fn);
-        List<FrameObject> frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, boxes));
+        Dictionary<int, int>? stackArguments = StackArguments(abi);
+        List<FrameObject> frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, boxes), stackArguments);
         DeadCode.Run(fn);
         // A promoted slot that held a stack address turns what was read through it into direct stack accesses:
         // with those in view, more can be promoted.
         for (int again = 0; again < 2 && ParkedAddresses.Canonicalize(fn); again++)
         {
-            frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, boxes));
+            frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, boxes), stackArguments);
             DeadCode.Run(fn);
         }
         _normalizer.Cleanup(fn);
@@ -359,6 +360,26 @@ public sealed class MethodPipeline
             Normalization = normalization,
             Frame = frame,
         };
+    }
+
+    /// <summary>The arguments a method is handed on the stack: where (from the entry stack pointer), and how many bytes of the slot they are.</summary>
+    private static Dictionary<int, int>? StackArguments(MethodAbi abi)
+    {
+        if (!abi.Known) return null;
+        Dictionary<int, int>? result = null;
+        foreach (AbiParam p in abi.Params)
+        {
+            if (p.Role != ParamRole.Argument || p.Position < Win64Abi.RegisterSlots) continue;
+            int bytes = p.Pass switch
+            {
+                PassKind.Indirect => 8,
+                PassKind.Float => p.IsDouble ? 8 : 4,
+                _ => p.Size is 1 or 2 or 4 or 8 ? p.Size : 8,
+            };
+            // (Above the return address and the four slots kept for the arguments that come in registers.)
+            (result ??= [])[8 + 8 * p.Position] = bytes;
+        }
+        return result;
     }
 
     private static readonly bool CheckShapes = Environment.GetEnvironmentVariable("REWIND_CHECK_SHAPE") != null;
@@ -699,7 +720,7 @@ public sealed class MethodPipeline
                 break;
             Dictionary<int, int> after = InPlaceBoxes(fn);
             ParkedAddresses.Canonicalize(fn);
-            lifted.Frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, after, current));
+            lifted.Frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, after, current), StackArguments(lifted.Abi));
             DeadCode.Run(fn);
             _normalizer.Cleanup(fn);
             (builder, result) = BuildRounds(lifted);
