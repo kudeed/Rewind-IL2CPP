@@ -500,6 +500,7 @@ public sealed class MethodPipeline
         // A networked property read in the middle of a struct being filled kept the stores apart (its check is a
         // branch): with the read put back they are one run, which may be one struct made in one go.
         if ((_guardedAccessors ??= new GuardedAccessorFolding(this)).Run(result) && !NoStructsAgain) StructFolding.Run(result, _program, this);
+        ElementParts.Run(result);
         (_inlineFolding ??= new InlineFolding(this, _program)).Run(result);
         if (WrapperFolding.Lift(result, this))
         {
