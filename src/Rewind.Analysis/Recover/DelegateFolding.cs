@@ -23,6 +23,12 @@ internal static class DelegateFolding
                 if (block.Statements[i] is HAssign { Target: HLocal target, Value: HTypeExpr { Op: HTypeOp.Allocate } allocation } &&
                     IsDelegate(allocation.Target))
                     TryFold(method, block, i, target, allocation.Target, program);
+        // ConstructorFolding, which comes first, noted the raw allocation of each delegate it saw; what is no
+        // longer allocated raw needs no note.
+        method.Notes.RemoveAll(note => note.StartsWith("the constructor of ", StringComparison.Ordinal) &&
+            note.EndsWith(" was inlined here; the object is allocated raw and its statements follow", StringComparison.Ordinal) &&
+            !method.Blocks.Any(b => b.Statements.Any(s => s is HAssign { Value: HTypeExpr { Op: HTypeOp.Allocate } a } &&
+                note == $"the constructor of {a.Target.ShortName} was inlined here; the object is allocated raw and its statements follow")));
         // Anything left writing those fields is a constructor that was not recognized.
         if (method.Method.DeclaringType.FullName is "System.Delegate" or "System.MulticastDelegate") return;
         foreach (HBlock block in method.Blocks)

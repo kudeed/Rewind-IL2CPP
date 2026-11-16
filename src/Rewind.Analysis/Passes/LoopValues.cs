@@ -23,7 +23,7 @@ public static class LoopValues
     public static bool Run(Function fn, Func<Node, Node, int>? callObserves = null)
     {
         bool changed = false;
-        for (int round = 0; round < 4; round++)
+        for (int round = 0; round < 8; round++)
         {
             bool step = MergeCongruentPhis(fn);
             step |= NarrowPhis(fn);
@@ -31,6 +31,9 @@ public static class LoopValues
             if (step) DeadCode.Run(fn);
             step |= RewritePointerInduction(fn);
             step |= RewriteScaledOffsets(fn);
+            // Only once nothing else changes: what the others do first (two pointers found to be one) leaves
+            // less to work out here. A counter of the loop's own is looked for everywhere before one is made.
+            if (!step && !NoPairedPointers) step = RewritePairedPointers(fn, makeCounters: false) || (!NoMadeCounters && RewritePairedPointers(fn, makeCounters: true));
             if (!step) break;
             DeadCode.Run(fn);
             changed = true;
@@ -647,6 +650,256 @@ public static class LoopValues
             default:
                 return false;
         }
+    }
+
+    private static readonly bool NoPairedPointers = Environment.GetEnvironmentVariable("REWIND_NO_PAIRED_POINTERS") != null;
+
+    /// <summary>
+    /// A pointer that walks an array in step with a counter, where the simple form (RewritePointerInduction)
+    /// does not apply: the loop goes round by several ways that advance both by different amounts ("i += 1" on
+    /// one, "i += 2" on another, the pointer by one or two elements with it), or the counter starts at a value
+    /// only known when the loop runs ("for (i = start; ...)" with the pointer at element [start]). On every way
+    /// round, the pointer moves by the same multiple of what the counter moves by - or neither moves - so the
+    /// pointer is always where it started plus that multiple of how far the counter got: the address of element
+    /// [counter].
+    /// </summary>
+    private static bool RewritePairedPointers(Function fn, bool makeCounters)
+    {
+        var cfg = new Cfg(fn);
+        Dictionary<Node, List<Node>>? uses = null;
+        foreach (Block header in fn.Blocks)
+        {
+            if (header.Preds.Count < 2 || header.Phis.Count < 2) continue;
+            var back = new bool[header.Preds.Count];
+            bool isLoop = false;
+            for (int i = 0; i < back.Length; i++) isLoop |= back[i] = cfg.Dominates(header, header.Preds[i]);
+            if (!isLoop) continue;
+            foreach (Node pointer in header.Phis)
+            {
+                if (pointer.Dead || pointer.Type != VT.I64 || pointer.In.Length != back.Length) continue;
+                uses ??= DeadCode.Uses(fn);
+                if (!UsedAsAddress(pointer, uses)) continue;
+                foreach (Node counter in header.Phis)
+                {
+                    if (ReferenceEquals(counter, pointer) || counter.Dead || counter.Type is not (VT.I32 or VT.I64) || counter.In.Length != back.Length) continue;
+                    if (!Paired(pointer, counter, back, out long scale, out Node? startPointer, out Node? startCounter, out bool forward)) continue;
+                    var b = new IrBuilder(fn) { Current = header, InsertIndex = 0, CurrentAddr = header.Start };
+                    Node? address = null;
+                    // The start is element [start of the counter] of something: the same element expression with the counter.
+                    if (StartTerms(startPointer!, startCounter!, scale, out List<Node>? rest, out Op? extension) &&
+                        (counter.Type == VT.I64 ? extension == null : extension != null))
+                    {
+                        Node index = extension is { } widen ? b.Raw(widen, VT.I64, counter) : counter;
+                        Node scaled = scale == 1 ? index : b.Mul(index, b.Const(VT.I64, scale));
+                        // (Nothing else: the value is the counter itself, widened - an index kept in 64 bits.)
+                        if (rest!.Count == 0) address = scaled;
+                        else
+                        {
+                            Node sum = rest[0];
+                            for (int k = 1; k < rest.Count; k++) sum = b.Add(sum, rest[k]);
+                            address = b.Add(sum, scaled);
+                        }
+                    }
+                    // A counter from a constant, counting up: start + scale * (counter - first), as RewritePointerInduction has it.
+                    else if (startCounter!.IsConst && forward && IrBuilder.SImm(startCounter) >= 0)
+                    {
+                        long first = IrBuilder.SImm(startCounter);
+                        Node count = counter.Type == VT.I64 ? counter : b.Raw(Op.ZExt, VT.I64, counter);
+                        if (first != 0) count = b.Add(count, b.Const(VT.I64, -first));
+                        address = b.Add(startPointer!, b.Mul(count, b.Const(VT.I64, scale)));
+                    }
+                    b.InsertIndex = -1;
+                    if (address == null) continue;
+                    var increments = new HashSet<Node>(pointer.In.Where((x, i) => back[i] && !ReferenceEquals(x, pointer)));
+                    foreach (Block block in fn.Blocks)
+                    {
+                        foreach (Node n in block.Phis)
+                            if (!ReferenceEquals(n, pointer))
+                                for (int i = 0; i < n.In.Length; i++)
+                                    if (ReferenceEquals(n.In[i], pointer)) n.In[i] = address;
+                        foreach (Node n in block.Nodes)
+                        {
+                            if (increments.Contains(n) || ReferenceEquals(n, address)) continue;
+                            for (int i = 0; i < n.In.Length; i++)
+                                if (ReferenceEquals(n.In[i], pointer)) n.In[i] = address;
+                        }
+                    }
+                    return true; // use lists and the tree of dominators are stale: the next round goes on
+                }
+                if (makeCounters && CountSteps(fn, header, pointer, back)) return true;
+            }
+        }
+        return false;
+    }
+
+    private static readonly bool NoMadeCounters = Environment.GetEnvironmentVariable("REWIND_NO_MADE_COUNTERS") != null;
+
+    /// <summary>
+    /// A pointer that walks an array with no counter kept beside it at all - the compiler kept only what the
+    /// source computed from the counter ("(slots[i] &amp; 7) &lt;&lt; (i * 3)" with i gone and i * 3 counted in
+    /// threes). Where it moves by one and the same step on every way round that moves it, it is where it
+    /// started plus that step times how often it moved: a counter of that is made, and the pointer is the
+    /// address of element [counter].
+    /// </summary>
+    private static bool CountSteps(Function fn, Block header, Node pointer, bool[] back)
+    {
+        Node? start = null;
+        long step = 0;
+        var increments = new List<Node>();
+        for (int i = 0; i < back.Length; i++)
+        {
+            Node p = pointer.In[i];
+            if (!back[i])
+            {
+                if (start != null && !ReferenceEquals(start, p)) return false;
+                start = p;
+                continue;
+            }
+            if (ReferenceEquals(p, pointer)) continue;
+            if (p.Op != Op.Add || !ReferenceEquals(p.In[0], pointer) || !p.In[1].IsConst) return false;
+            long s = IrBuilder.SImm(p.In[1]);
+            if (s is < 1 or > 4096 || (step != 0 && s != step)) return false;
+            step = s;
+            if (!increments.Contains(p)) increments.Add(p);
+        }
+        if (start == null || step == 0) return false;
+        // Only a pointer: something added to a base. (A number widened, or one written out, is a counter of its
+        // own, which the other forms take care of.)
+        if (start.Op != Op.Add || (start.In[0].IsConst && start.In[1].IsConst) || start.In[0].Op is Op.SExt or Op.ZExt) return false;
+        // Where each step is taken: the counter counts one there.
+        var nexts = new Dictionary<Node, Node>();
+        Node counter = fn.NewNode(Op.Phi, VT.I32, header);
+        counter.Addr = pointer.Addr;
+        foreach (Node increment in increments)
+        {
+            Block? at = fn.Blocks.FirstOrDefault(b => b.Nodes.Contains(increment));
+            if (at == null) return false;
+            Node one = fn.NewNode(Op.Const, VT.I32, null);
+            one.Imm = 1;
+            Node next = fn.NewNode(Op.Add, VT.I32, at, counter, one);
+            next.Addr = increment.Addr;
+            at.Nodes.Insert(at.Nodes.IndexOf(increment), next);
+            nexts[increment] = next;
+        }
+        var inputs = new Node[back.Length];
+        for (int i = 0; i < back.Length; i++)
+        {
+            Node p = pointer.In[i];
+            if (!back[i]) inputs[i] = fn.NewNode(Op.Const, VT.I32, null);
+            else if (ReferenceEquals(p, pointer)) inputs[i] = counter;
+            else inputs[i] = nexts[p];
+        }
+        counter.In = inputs;
+        header.Phis.Add(counter);
+        var b = new IrBuilder(fn) { Current = header, InsertIndex = 0, CurrentAddr = header.Start };
+        Node address = b.Add(start, b.Mul(b.Raw(Op.ZExt, VT.I64, counter), b.Const(VT.I64, step)));
+        b.InsertIndex = -1;
+        foreach (Block block in fn.Blocks)
+        {
+            foreach (Node n in block.Phis)
+                if (!ReferenceEquals(n, pointer) && !ReferenceEquals(n, counter))
+                    for (int i = 0; i < n.In.Length; i++)
+                        if (ReferenceEquals(n.In[i], pointer)) n.In[i] = address;
+            foreach (Node n in block.Nodes)
+            {
+                if (increments.Contains(n) || ReferenceEquals(n, address)) continue;
+                for (int i = 0; i < n.In.Length; i++)
+                    if (ReferenceEquals(n.In[i], pointer)) n.In[i] = address;
+            }
+        }
+        return true;
+    }
+
+    /// <summary>Whether memory is accessed through a value: directly, or after adding a constant or a base.</summary>
+    private static bool UsedAsAddress(Node value, Dictionary<Node, List<Node>> uses)
+    {
+        if (!uses.TryGetValue(value, out List<Node>? users)) return false;
+        foreach (Node u in users)
+        {
+            if (u.Op is Op.Load or Op.Store && ReferenceEquals(u.In[0], value)) return true;
+            if (u.Op == Op.Add && uses.TryGetValue(u, out List<Node>? inner) &&
+                inner.Any(w => (w.Op is Op.Load or Op.Store && ReferenceEquals(w.In[0], u)) ||
+                               (w.Op == Op.Add && uses.TryGetValue(w, out List<Node>? outer) && outer.Any(x => x.Op is Op.Load or Op.Store && ReferenceEquals(x.In[0], w)))))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// True when on every way into the loop both start from one value each, and on every way round both stay
+    /// as they are or the pointer moves by <paramref name="scale"/> times what the counter moves by.
+    /// </summary>
+    private static bool Paired(Node pointer, Node counter, bool[] back, out long scale, out Node? startPointer, out Node? startCounter, out bool forward)
+    {
+        scale = 0;
+        startPointer = startCounter = null;
+        forward = true;
+        bool moves = false;
+        for (int i = 0; i < back.Length; i++)
+        {
+            Node p = pointer.In[i], c = counter.In[i];
+            if (!back[i])
+            {
+                // (One value each, the same node on every way in: it is there before the loop starts.)
+                if (startPointer != null && !ReferenceEquals(startPointer, p)) return false;
+                if (startCounter != null && !ReferenceEquals(startCounter, c)) return false;
+                startPointer = p;
+                startCounter = c;
+                continue;
+            }
+            if (ReferenceEquals(p, pointer) && ReferenceEquals(c, counter)) continue;
+            if (p.Op != Op.Add || !ReferenceEquals(p.In[0], pointer) || !p.In[1].IsConst) return false;
+            if (c.Op != Op.Add || !ReferenceEquals(c.In[0], counter) || !c.In[1].IsConst) return false;
+            long byPointer = IrBuilder.SImm(p.In[1]), byCounter = IrBuilder.SImm(c.In[1]);
+            if (counter.Type == VT.I32) byCounter = (int)byCounter;
+            if (byCounter == 0 || byPointer % byCounter != 0) return false;
+            long ratio = byPointer / byCounter;
+            if (ratio is < 1 or > 4096 || (scale != 0 && ratio != scale)) return false;
+            scale = ratio;
+            if (byCounter < 0) forward = false;
+            moves = true;
+        }
+        return moves && startPointer != null && startCounter != null;
+    }
+
+    /// <summary>
+    /// Splits a start address into "rest + scale * ext(start)" where start is the counter's start: the terms of
+    /// the rest (the address of element [0]), and the extension the counter's start was widened with (null: none).
+    /// </summary>
+    private static bool StartTerms(Node start, Node counterStart, long scale, out List<Node>? rest, out Op? extension)
+    {
+        rest = null;
+        extension = null;
+        var terms = new List<Node>();
+        void Flatten(Node n, int depth)
+        {
+            if (n.Op == Op.Add && depth < 6) { Flatten(n.In[0], depth + 1); Flatten(n.In[1], depth + 1); }
+            else terms.Add(n);
+        }
+        Flatten(start, 0);
+        int found = -1;
+        for (int k = 0; k < terms.Count && found < 0; k++)
+        {
+            Node t = terms[k];
+            Node? of = null;
+            if (t.Op == Op.Mul && t.In[1].IsConst && IrBuilder.SImm(t.In[1]) == scale) of = t.In[0];
+            else if (t.Op == Op.Shl && t.In[1].IsConst && t.In[1].UImm < 16 && 1L << (int)t.In[1].UImm == scale) of = t.In[0];
+            else if (scale == 1) of = t;
+            if (of == null) continue;
+            Op? ext = null;
+            if (of.Op is Op.SExt or Op.ZExt && of.In[0].Type == counterStart.Type)
+            {
+                ext = of.Op;
+                of = of.In[0];
+            }
+            if (!Normalizer.SameValue(of, counterStart)) continue;
+            found = k;
+            extension = ext;
+        }
+        if (found < 0) return false;
+        terms.RemoveAt(found);
+        rest = terms;
+        return true;
     }
 
     private static bool RewritePointerInduction(Function fn)

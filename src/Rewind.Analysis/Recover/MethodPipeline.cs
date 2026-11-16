@@ -302,6 +302,7 @@ public sealed class MethodPipeline
             _inlineFolding.Run(result);
         }
         AccessorFolding.Run(result, _program);
+        LibraryInternals.Run(result, _program);
         InitializerOrder.Run(result);
         UnsetLocals.Run(result);
         FlagMarkers(result);
@@ -377,13 +378,21 @@ public sealed class MethodPipeline
     }
 
     private readonly Dictionary<(MethodDef, string), HMethod?> _constructorBodies = [];
+    internal static readonly bool NoConstructorFlows = Environment.GetEnvironmentVariable("REWIND_NO_CONSTRUCTOR_FLOWS") != null;
     private readonly HashSet<MethodDef> _recovering = [];
 
     /// <summary>
     /// The recovered statements of a constructor, when they are complete and a plain run without branches:
     /// what a creation site is compared with to put an inlined constructor back.
     /// </summary>
-    internal HMethod? ConstructorBody(MethodDef constructor, TypeSig[] classArguments)
+    internal HMethod? ConstructorBody(MethodDef constructor, TypeSig[] classArguments) =>
+        ConstructorFlow(constructor, classArguments) is { Blocks: [{ Statements: [.., HReturn { Value: null }] }] } body ? body : null;
+
+    /// <summary>
+    /// The recovered statements of a constructor, when they are complete, branches and all: what a creation site
+    /// is compared with along every way through it (ConstructorFolding).
+    /// </summary>
+    internal HMethod? ConstructorFlow(MethodDef constructor, TypeSig[] classArguments)
     {
         string key = classArguments.Length == 0 ? "" : string.Join(",", classArguments.Select(a => a.Key));
         if (_constructorBodies.TryGetValue((constructor, key), out HMethod? known)) return known;
@@ -418,7 +427,9 @@ public sealed class MethodPipeline
             if (lifted != null)
             {
                 HMethod h = BuildCore(lifted);
-                if (h.Problems.Count == 0 && h.Blocks.Count == 1 && h.Blocks[0].Statements is [.., HReturn { Value: null }]) body = h;
+                if (h.Problems.Count == 0 && h.Blocks.Count != 0 && h.TryRegions.Count == 0 &&
+                    (h.Blocks.Count == 1 ? h.Blocks[0].Statements is [.., HReturn { Value: null }] : !NoConstructorFlows))
+                    body = h;
             }
         }
         catch (Exception)
@@ -827,6 +838,8 @@ public sealed class MethodPipeline
     /// The entry values the calling convention gives no meaning: the scratch registers, and the argument
     /// registers this method has no parameter for.
     /// </summary>
+    private static readonly bool NoSavedLeftovers = Environment.GetEnvironmentVariable("REWIND_NO_SAVED_LEFTOVERS") != null;
+
     private static Func<Node, bool> Leftovers(Function fn, MethodAbi abi)
     {
         var leftovers = new HashSet<Node>();
@@ -837,6 +850,13 @@ public sealed class MethodPipeline
         Add(0);   // rax
         Add(10);  // r10
         Add(11);  // r11
+        // What the caller left in a register this method must preserve means nothing to the method itself: it
+        // is only saved and put back. Writing one byte of such a register ("mov bl, [rcx+18h]") keeps the caller's
+        // other seven, which no one reads.
+        if (!NoSavedLeftovers)
+            foreach (int saved in X64Lifter.CalleeSaved)
+                if (saved != X64Lifter.VarRsp)
+                    Add(saved);
         if (abi.Known)
         {
             var taken = new HashSet<int>();

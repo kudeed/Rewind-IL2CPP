@@ -176,14 +176,39 @@ public sealed partial class HirBuilder
                         }
                         else
                         {
-                            foreach (MethodDef m in target.Methods)
-                                if ((type = PointeeOf(_p.Abi.For(m, [], []), position)) != null) break;
-                            if (type == null)
+                            if (NoReachableAssemblies)
+                            {
+                                foreach (MethodDef m in target.Methods)
+                                    if ((type = PointeeOf(_p.Abi.For(m, [], []), position)) != null) break;
+                                if (type == null)
+                                    foreach (MethodInst inst in target.Insts)
+                                        if ((type = PointeeOf(_p.Abi.For(inst), position)) != null) break;
+                            }
+                            else
+                            {
+                                // Of the methods that share the code, only those this code could call say anything:
+                                // the first of them that takes a pointer there, where few do. Where more do (an empty
+                                // function serves thousands of methods), the first is a guess unless they all say the
+                                // same; which was called is then decided with the call, and the type with it.
+                                var pointees = new List<TypeSig>();
+                                bool differ = false;
+                                int wanted = SharedPointeeLimit == int.MaxValue ? 1 : 64;
+                                void Add(TypeSig t)
+                                {
+                                    if (pointees.Count != 0 && !ReferenceEquals(t, pointees[0]) && t.Key != pointees[0].Key) differ = true;
+                                    pointees.Add(t);
+                                }
+                                foreach (MethodDef m in target.Methods)
+                                    if (pointees.Count < wanted && Reachable(m.DeclaringType.Assembly) && PointeeOf(_p.Abi.For(m, [], []), position) is { } t)
+                                        Add(t);
                                 foreach (MethodInst inst in target.Insts)
-                                    if ((type = PointeeOf(_p.Abi.For(inst), position)) != null) break;
+                                    if (pointees.Count < wanted && Reachable(inst.Method.DeclaringType.Assembly) && PointeeOf(_p.Abi.For(inst), position) is { } t)
+                                        Add(t);
+                                if (pointees.Count != 0 && (pointees.Count <= SharedPointeeLimit || !differ)) type = pointees[0];
+                            }
                         }
                     }
-                    if (type != null && !Open(type)) _frameTypes.TryAdd(offset, type);
+                    if (type != null && !Open(type) && Nameable(type)) _frameTypes.TryAdd(offset, type);
                 }
             }
         }
@@ -232,6 +257,8 @@ public sealed partial class HirBuilder
     /// <summary>The storage location a pointer argument refers to.</summary>
     private HExpr? LocationOf(Node pointer, TypeSig? expected)
     {
+        // (What the code cannot name says nothing about its stack.)
+        if (!Nameable(expected)) expected = null;
         Sem s = Eval(pointer);
         switch (s)
         {
@@ -598,6 +625,9 @@ public sealed partial class HirBuilder
             Sem s = Eval(node);
             // An argument the caller never set: this method takes more than the call passes.
             if (p.Role == ParamRole.Argument && (node.Op == Op.Undef || (node.Op == Op.Param && s is SJunk))) score -= 15;
+            // A runtime class pointer is no object a method could be called on: what is called takes no receiver
+            // (a static method sharing the code) and the register merely still holds it.
+            if (p.Role == ParamRole.This && !NoReachableAssemblies && s is SKlass) score -= 50;
             // A method of a struct is called on the address of one. A receiver that is no address of anything
             // (a number, a leftover) means the call is to something else that shares this code.
             if (p.Role == ParamRole.This && p.Type.Definition is { IsValueType: true } &&
@@ -609,8 +639,25 @@ public sealed partial class HirBuilder
             // with every other empty method of the program; of all of those, this is the one that is meant.
             if (p.Role == ParamRole.This && !_baseConstructorCalled && _method.Name == ".ctor" && method.Name == ".ctor" &&
                 !ReferenceEquals(method, _method) && s is SVal { Expr: HArg { Index: -1 } } &&
-                (ReferenceEquals(method.DeclaringType, _method.DeclaringType.BaseType?.Definition) || ReferenceEquals(method.DeclaringType, _method.DeclaringType)))
+                (ReferenceEquals(method.DeclaringType, _method.DeclaringType.BaseType?.Definition) || ReferenceEquals(method.DeclaringType, _method.DeclaringType) ||
+                 // (The base class's constructor pasted in: the one it calls in turn is further up.)
+                 (!NoFreshReceivers && Derives(_method.DeclaringType, method.DeclaringType))))
                 score += 40;
+            // Before a constructor has run the one of its base class, nothing but stores is done to the object:
+            // an empty method of its class called there is the empty base constructor that shares its code.
+            if (p.Role == ParamRole.This && !NoFreshReceivers && !_baseConstructorCalled && _method.Name == ".ctor" && !_method.IsStatic &&
+                !_method.DeclaringType.IsValueType && method.Name != ".ctor" && s is SVal { Expr: HArg { Index: -1 } })
+                score -= 40;
+            // The first thing run on a freshly allocated object is a constructor of its class or of a class it
+            // derives from ("new T()", or T's constructor pasted in and its base constructor called). An empty
+            // constructor shares its code with every other empty method - a Dispose that does nothing, say - and
+            // calling one of those on an object no constructor has run on is not what was written.
+            if (p.Role == ParamRole.This && !NoFreshReceivers && s is SNewObject { Constructed: false } fresh && fresh.Type.Definition is { } allocated)
+            {
+                if (method.Name != ".ctor") score -= 40;
+                else if (Derives(allocated, method.DeclaringType)) score += 40;
+                else score -= 100;
+            }
             TypeSig? actual = s switch
             {
                 SVal v => v.Type,
@@ -641,10 +688,40 @@ public sealed partial class HirBuilder
         // Code that could not have been written here (a private member of an unrelated class) can still show
         // up through inlining, so this is a strong hint rather than a rule.
         if (!IsAccessible(method)) score -= 25;
+        // An assembly's code can only name what is in it or in the assemblies it uses: a plugin cannot call into
+        // the game that uses it. (Inlined code comes from such assemblies too, so it is no exception.)
+        if (!NoReachableAssemblies && !Reachable(method.DeclaringType.Assembly)) score -= 200;
         return score;
     }
 
+    /// <summary>More methods than this taking a pointer where one piece of code they share is handed one (see InferFrameTypes): the first of them is a guess.</summary>
+    private static readonly int SharedPointeeLimit = int.TryParse(Environment.GetEnvironmentVariable("REWIND_SHARED_POINTEE_LIMIT"), out int limit) ? limit : 2;
+    private static readonly bool NoReachableAssemblies = Environment.GetEnvironmentVariable("REWIND_NO_REACHABLE_ASSEMBLIES") != null;
+
+    /// <summary>
+    /// Whether IL of this method's assembly can name a type at all (it and its type arguments come from the
+    /// assembly or one it refers to directly): a type it cannot name is never what one of its locals is.
+    /// </summary>
+    private bool Nameable(TypeSig? type) => NoReachableAssemblies || AssemblyScope.Names(_method.DeclaringType.Assembly, type);
+
+    /// <summary>
+    /// Whether code of this method's assembly can end up calling into <paramref name="assembly"/>: it is the
+    /// assembly itself or one it refers to, directly or through others (see AssemblyScope).
+    /// </summary>
+    private bool Reachable(AssemblyModel assembly) => NoReachableAssemblies || AssemblyScope.Reaches(_method.DeclaringType.Assembly, assembly);
+
     private static readonly bool NoResultPlaces = Environment.GetEnvironmentVariable("REWIND_NO_RESULT_PLACES") != null;
+    private static readonly bool NoFreshReceivers = Environment.GetEnvironmentVariable("REWIND_NO_FRESH_RECEIVERS") != null;
+
+    /// <summary>Whether <paramref name="type"/> is <paramref name="ancestor"/> or derives from it.</summary>
+    private static bool Derives(TypeDef type, TypeDef ancestor)
+    {
+        int guard = 0;
+        for (TypeDef? t = type; t != null && guard++ < 64; t = t.BaseType?.Definition)
+            if (ReferenceEquals(t, ancestor))
+                return true;
+        return false;
+    }
 
     private readonly Dictionary<Node, TypeSig?> _resultPlaces = [];
 
@@ -760,7 +837,56 @@ public sealed partial class HirBuilder
                 return;
             }
         }
+        // Every method known to share this code is in an assembly this code cannot reach: what was called is
+        // something else with the same code (a helper the compiler made, folded with them by the linker). What a
+        // tiny body computes is certain; anything else is called as one of them, and said to be uncertain.
+        if (!NoReachableAssemblies && !Reachable(best.DeclaringType.Assembly))
+        {
+            if (!tail && Projections(call).TryGetValue(CallResult.IntReturn, out Node? sharedResult))
+            {
+                if (ConstantFunction(best.Address) is { } constant)
+                {
+                    _sem[sharedResult] = new SVal(sharedResult.Type == VT.I64 ? new HConst(constant, _long) : new HConst((int)constant, _int));
+                    return;
+                }
+                if (SumFunction(best.Address) is { } wide && IntAt(call, 0) is { } left && IntAt(call, 1) is { } right)
+                {
+                    TypeSig type = wide ? _long : _int;
+                    HExpr Operand(Node n)
+                    {
+                        HExpr v = IntValue(n);
+                        return wide || BitsOf(v.Type) is > 0 and <= 32 ? v : new HConv(HConvKind.I4, v) { Type = _int };
+                    }
+                    _sem[sharedResult] = new SVal(new HBinary(HBinaryOp.Add, Operand(left), Operand(right)) { Type = type });
+                    return;
+                }
+            }
+            Problem($"call to code shared only by methods this assembly cannot reach ({best.DeclaringType.Name}.{best.Name})");
+        }
         BuildCall(call, best, bestInst?.ClassArguments ?? [], bestInst?.MethodArguments ?? [], isVirtual: false, tail, ties, skipFirst: false);
+    }
+
+    private readonly Dictionary<ulong, bool?> _sumFunctions = [];
+
+    /// <summary>
+    /// A function that only adds its first two arguments ("lea eax, [rcx+rdx]; ret"): true when it does so in 64
+    /// bits, false in 32, null for any other function.
+    /// </summary>
+    private bool? SumFunction(ulong address)
+    {
+        if (address == 0) return null;
+        if (_sumFunctions.TryGetValue(address, out bool? known)) return known;
+        bool? wide = null;
+        X64Cfg cfg = X64Cfg.Build(_p.Context, address);
+        if (cfg.Blocks.Count == 1 && cfg.Blocks[0].Instructions.Count == 2 && cfg.Blocks[0].Instructions[1].Mnemonic == Iced.Intel.Mnemonic.Ret)
+        {
+            Iced.Intel.Instruction lea = cfg.Blocks[0].Instructions[0];
+            if (lea.Mnemonic == Iced.Intel.Mnemonic.Lea && lea.Op0Kind == Iced.Intel.OpKind.Register && lea.Op0Register is Iced.Intel.Register.EAX or Iced.Intel.Register.RAX &&
+                lea.MemoryDisplacement64 == 0 && lea.MemoryIndexScale == 1 &&
+                ((lea.MemoryBase == Iced.Intel.Register.RCX && lea.MemoryIndex == Iced.Intel.Register.RDX) || (lea.MemoryBase == Iced.Intel.Register.RDX && lea.MemoryIndex == Iced.Intel.Register.RCX)))
+                wide = lea.Op0Register == Iced.Intel.Register.RAX;
+        }
+        return _sumFunctions[address] = wide;
     }
 
     private static readonly bool NoIdentityCalls = Environment.GetEnvironmentVariable("REWIND_NO_IDENTITY_CALLS") != null;
@@ -939,6 +1065,7 @@ public sealed partial class HirBuilder
     }
 
     private readonly Dictionary<ulong, long?> _constantFunctions = [];
+    private static readonly bool NoByteConstants = Environment.GetEnvironmentVariable("REWIND_NO_BYTE_CONSTANTS") != null;
 
     /// <summary>What a function gives when giving a constant is all it does ("xor eax, eax; ret"); null for any other.</summary>
     private long? ConstantFunction(ulong address)
@@ -954,6 +1081,13 @@ public sealed partial class HirBuilder
             if (whole && set.Mnemonic == Iced.Intel.Mnemonic.Xor && set.Op1Kind == Iced.Intel.OpKind.Register && set.Op1Register == set.Op0Register) value = 0;
             else if (whole && set.Mnemonic == Iced.Intel.Mnemonic.Mov && set.Op0Register == Iced.Intel.Register.EAX && set.Op1Kind == Iced.Intel.OpKind.Immediate32)
                 value = set.Immediate32;
+            else if (whole && set.Mnemonic == Iced.Intel.Mnemonic.Mov && set.Op0Register == Iced.Intel.Register.RAX &&
+                     set.Op1Kind is Iced.Intel.OpKind.Immediate32to64 or Iced.Intel.OpKind.Immediate64)
+                value = (long)set.GetImmediate(1);
+            // A yes/no or a byte: only the low byte of the register is set, and only it is looked at ("mov al, 1").
+            else if (!NoByteConstants && set.Mnemonic == Iced.Intel.Mnemonic.Mov && set.Op0Kind == Iced.Intel.OpKind.Register &&
+                     set.Op0Register == Iced.Intel.Register.AL && set.Op1Kind == Iced.Intel.OpKind.Immediate8)
+                value = set.Immediate8;
         }
         return _constantFunctions[address] = value;
     }

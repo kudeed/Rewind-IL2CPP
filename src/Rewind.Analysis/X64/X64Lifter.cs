@@ -442,7 +442,8 @@ public sealed class X64Lifter
     }
 
     /// <summary>Callee-saved registers as variable numbers: rbx, rbp, rsi, rdi, r12-r15.</summary>
-    private static readonly int[] CalleeSaved = [3, 5, 6, 7, 12, 13, 14, 15];
+    internal static readonly int[] CalleeSaved = [3, 5, 6, 7, 12, 13, 14, 15];
+    private static readonly bool NoTailStackFix = Environment.GetEnvironmentVariable("REWIND_NO_TAIL_STACK_ARGS") != null;
 
     /// <summary>The first instruction after the prologue (register homing, pushes, frame allocation).</summary>
     private ulong PrologueEnd(ulong start)
@@ -1112,7 +1113,7 @@ public sealed class X64Lifter
 
     // ---- calls -------------------------------------------------------------------------------------------------
 
-    private Node[] CaptureArguments(CallInfo info, CallShape? shape, Node? indirectTarget)
+    private Node[] CaptureArguments(CallInfo info, CallShape? shape, Node? indirectTarget, bool tail = false)
     {
         var inputs = new List<Node>();
         if (indirectTarget != null)
@@ -1145,9 +1146,12 @@ public sealed class X64Lifter
         // speculatively and dropped later if the resolved signature does not use them.
         int stackSlots = shape != null ? Math.Max(0, shape.Count - 4) : 4;
         Node sp = Var(VarRsp);
+        // A call pushes the return address on top of them; a jump to another function leaves the caller's
+        // return address where it is, so there they sit one slot further up already.
+        int first = tail && !NoTailStackFix ? 0x28 : 0x20;
         for (int i = 0; i < stackSlots; i++)
         {
-            inputs.Add(_b.Load(_b.Add(sp, _b.Const(VT.I64, 0x20 + 8 * i)), VT.I64));
+            inputs.Add(_b.Load(_b.Add(sp, _b.Const(VT.I64, first + 8 * i)), VT.I64));
             info.Slots.Add(new ArgSlot(ArgSlotKind.Stack, i));
         }
         return inputs.ToArray();
@@ -1197,7 +1201,7 @@ public sealed class X64Lifter
             info.Indirect = true;
             indirect = ReadOp(ins, 0, VT.I64);
         }
-        Node[] inputs = CaptureArguments(info, shape, indirect);
+        Node[] inputs = CaptureArguments(info, shape, indirect, tail);
         Node call = _b.Raw(tail ? Op.TailCall : Op.Call, VT.None, inputs);
         call.Aux = info;
         return call;
