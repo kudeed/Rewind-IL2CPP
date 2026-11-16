@@ -609,8 +609,25 @@ public sealed partial class HirBuilder
             // with every other empty method of the program; of all of those, this is the one that is meant.
             if (p.Role == ParamRole.This && !_baseConstructorCalled && _method.Name == ".ctor" && method.Name == ".ctor" &&
                 !ReferenceEquals(method, _method) && s is SVal { Expr: HArg { Index: -1 } } &&
-                (ReferenceEquals(method.DeclaringType, _method.DeclaringType.BaseType?.Definition) || ReferenceEquals(method.DeclaringType, _method.DeclaringType)))
+                (ReferenceEquals(method.DeclaringType, _method.DeclaringType.BaseType?.Definition) || ReferenceEquals(method.DeclaringType, _method.DeclaringType) ||
+                 // (The base class's constructor pasted in: the one it calls in turn is further up.)
+                 (!NoFreshReceivers && Derives(_method.DeclaringType, method.DeclaringType))))
                 score += 40;
+            // Before a constructor has run the one of its base class, nothing but stores is done to the object:
+            // an empty method of its class called there is the empty base constructor that shares its code.
+            if (p.Role == ParamRole.This && !NoFreshReceivers && !_baseConstructorCalled && _method.Name == ".ctor" && !_method.IsStatic &&
+                !_method.DeclaringType.IsValueType && method.Name != ".ctor" && s is SVal { Expr: HArg { Index: -1 } })
+                score -= 40;
+            // The first thing run on a freshly allocated object is a constructor of its class or of a class it
+            // derives from ("new T()", or T's constructor pasted in and its base constructor called). An empty
+            // constructor shares its code with every other empty method - a Dispose that does nothing, say - and
+            // calling one of those on an object no constructor has run on is not what was written.
+            if (p.Role == ParamRole.This && !NoFreshReceivers && s is SNewObject { Constructed: false } fresh && fresh.Type.Definition is { } allocated)
+            {
+                if (method.Name != ".ctor") score -= 40;
+                else if (Derives(allocated, method.DeclaringType)) score += 40;
+                else score -= 100;
+            }
             TypeSig? actual = s switch
             {
                 SVal v => v.Type,
@@ -645,6 +662,17 @@ public sealed partial class HirBuilder
     }
 
     private static readonly bool NoResultPlaces = Environment.GetEnvironmentVariable("REWIND_NO_RESULT_PLACES") != null;
+    private static readonly bool NoFreshReceivers = Environment.GetEnvironmentVariable("REWIND_NO_FRESH_RECEIVERS") != null;
+
+    /// <summary>Whether <paramref name="type"/> is <paramref name="ancestor"/> or derives from it.</summary>
+    private static bool Derives(TypeDef type, TypeDef ancestor)
+    {
+        int guard = 0;
+        for (TypeDef? t = type; t != null && guard++ < 64; t = t.BaseType?.Definition)
+            if (ReferenceEquals(t, ancestor))
+                return true;
+        return false;
+    }
 
     private readonly Dictionary<Node, TypeSig?> _resultPlaces = [];
 
@@ -939,6 +967,7 @@ public sealed partial class HirBuilder
     }
 
     private readonly Dictionary<ulong, long?> _constantFunctions = [];
+    private static readonly bool NoByteConstants = Environment.GetEnvironmentVariable("REWIND_NO_BYTE_CONSTANTS") != null;
 
     /// <summary>What a function gives when giving a constant is all it does ("xor eax, eax; ret"); null for any other.</summary>
     private long? ConstantFunction(ulong address)
@@ -954,6 +983,13 @@ public sealed partial class HirBuilder
             if (whole && set.Mnemonic == Iced.Intel.Mnemonic.Xor && set.Op1Kind == Iced.Intel.OpKind.Register && set.Op1Register == set.Op0Register) value = 0;
             else if (whole && set.Mnemonic == Iced.Intel.Mnemonic.Mov && set.Op0Register == Iced.Intel.Register.EAX && set.Op1Kind == Iced.Intel.OpKind.Immediate32)
                 value = set.Immediate32;
+            else if (whole && set.Mnemonic == Iced.Intel.Mnemonic.Mov && set.Op0Register == Iced.Intel.Register.RAX &&
+                     set.Op1Kind is Iced.Intel.OpKind.Immediate32to64 or Iced.Intel.OpKind.Immediate64)
+                value = (long)set.GetImmediate(1);
+            // A yes/no or a byte: only the low byte of the register is set, and only it is looked at ("mov al, 1").
+            else if (!NoByteConstants && set.Mnemonic == Iced.Intel.Mnemonic.Mov && set.Op0Kind == Iced.Intel.OpKind.Register &&
+                     set.Op0Register == Iced.Intel.Register.AL && set.Op1Kind == Iced.Intel.OpKind.Immediate8)
+                value = set.Immediate8;
         }
         return _constantFunctions[address] = value;
     }
