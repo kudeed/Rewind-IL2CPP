@@ -851,7 +851,7 @@ public sealed class MethodPipeline
         Add(10);  // r10
         Add(11);  // r11
         // What the caller left in a register this method must preserve means nothing to the method itself: it
-        // is only saved and put back. Writing one byte of such a register ("mov bl, [isOn]") keeps the caller's
+        // is only saved and put back. Writing one byte of such a register ("mov bl, [rcx+18h]") keeps the caller's
         // other seven, which no one reads.
         if (!NoSavedLeftovers)
             foreach (int saved in X64Lifter.CalleeSaved)

@@ -117,6 +117,7 @@ internal static class StructFolding
 
     /// <summary>REWIND_NO_STRUCT_PARTS_ACROSS: a struct filled field by field is put together only where nothing else is done in between.</summary>
     private static readonly bool NoPartsAcross = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_PARTS_ACROSS") != null;
+    private static readonly bool NoFreshObjects = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_PAST_NEW") != null;
 
     // ---- which memory two places can share -------------------------------------------------------------------------
 
@@ -290,6 +291,18 @@ internal static class StructFolding
         {
             HStmt s = statements[k];
             if (ReferenceEquals(s, except)) continue;
+            // A new object, and object's own constructor run on it, change nothing that was there before.
+            if (!NoFreshObjects)
+            {
+                if (s is HAssign { Target: HLocal fresh, Value: HTypeExpr { Op: HTypeOp.Allocate } })
+                {
+                    if (Mentions(value, fresh.Variable)) return false;
+                    continue;
+                }
+                if (s is HEval { Expression: HCall { Method: { Name: ".ctor", IsStatic: false, Parameters.Length: 0 } created, This: HLocal } } &&
+                    created.DeclaringType.BaseType == null && !created.DeclaringType.IsValueType)
+                    continue;
+            }
             // A call made for what it does: only what no call can change is still what it was.
             if (s is HEval && !NoPartsAcross)
             {

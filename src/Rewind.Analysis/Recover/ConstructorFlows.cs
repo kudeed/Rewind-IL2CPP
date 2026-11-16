@@ -6,7 +6,7 @@ namespace Rewind.Analysis.Recover;
 /// <summary>
 /// Constructors with branches, and constructors of base classes, put back.
 ///
-/// A constructor that decides something ("_identifier = identifier ?? GetType().Name") is more than one run of
+/// A constructor that decides something ("_name = name ?? GetType().Name") is more than one run of
 /// statements, and pasted into another method it spans several blocks there. Its statements are compared along
 /// every way through it: the same statements, the same tests leading to the same places, until each way ends -
 /// and every way that returns must go on at one place in the code at hand. What was matched becomes one call
@@ -43,7 +43,7 @@ internal static partial class ConstructorFolding
             {
                 // (Only what comes before the first mention of the new object can be skipped.)
                 if (start > at + 1 && Mentions(block.Statements[start - 1], created)) break;
-                if (MatchFlow(template, block, start, created, constructor) is not { } match) continue;
+                if (MatchFlow(template, block, start, created, constructor, pipeline) is not { } match) continue;
                 HExpr[] arguments = Arguments(match.Unifier, constructor, type, program);
                 var creation = new HAssign(target, new HNewObject
                 {
@@ -106,6 +106,10 @@ internal static partial class ConstructorFolding
             int size = template.Blocks.Sum(b => b.Statements.Count);
             // (A constructor that does nothing at all would match anywhere.)
             if (size <= 1) continue;
+            // Only one that runs a constructor on its object - its base class's, or another of its own: that
+            // call is what makes a run of statements a constructor's and not just stores that look alike.
+            if (!template.Blocks.Any(b => b.Statements.Any(s => s is HEval { Expression: HCall { Method.Name: ".ctor", This: HArg { Index: < 0 } } })))
+                continue;
             found.Add((constructor, template, size));
         }
         return [.. found.OrderByDescending(f => f.Item3).Select(f => (f.Item1, f.Item2))];
@@ -129,7 +133,7 @@ internal static partial class ConstructorFolding
             for (int start = from; start <= last; start++)
             {
                 if (block.Statements[start] is not (HAssign or HEval)) break;
-                if (MatchFlow(template, block, start, created, constructor) is not { } match) continue;
+                if (MatchFlow(template, block, start, created, constructor, pipeline) is not { } match) continue;
                 HExpr[] arguments = Arguments(match.Unifier, constructor, owner, program);
                 var call = new HEval(new HCall
                 {
@@ -178,14 +182,30 @@ internal static partial class ConstructorFolding
         public int FirstEffect = int.MaxValue;
         /// <summary>Locals of the site given a value by the statements found.</summary>
         public readonly HashSet<HVar> Assigned = [];
+        /// <summary>Tests of the constructor that the site does not make: which way to take there.</summary>
+        public Dictionary<HBlock, bool> Choices = [];
+        /// <summary>The tests taken one way without the site making them, to be checked against the values found.</summary>
+        public readonly List<(HBlock Block, HExpr Condition, bool Taken)> Decided = [];
     }
 
-    private static Flow? MatchFlow(HMethod template, HBlock block, int start, HVar? created, MethodDef constructor)
+    private static Flow? MatchFlow(HMethod template, HBlock block, int start, HVar? created, MethodDef constructor, MethodPipeline pipeline)
     {
-        var flow = new Flow(new Unifier(created, constructor.Parameters.Length) { Constructor = constructor }, block, start);
-        if (!Match(flow, template.Blocks[0], block, start, 0) || flow.Continuation == null) return null;
-        if (!flow.Unifier.ArgumentsHoldBefore(flow.FirstEffect, flow.Assigned)) return null;
-        return flow;
+        var choices = new Dictionary<HBlock, bool>();
+        var flipped = new HashSet<HBlock>();
+        for (int attempt = 0; attempt < 4; attempt++)
+        {
+            var unifier = new Unifier(created, constructor.Parameters.Length) { Constructor = constructor, Quiet = c => QuietConstructor(c, pipeline) };
+            var flow = new Flow(unifier, block, start) { Choices = choices };
+            bool matched = Match(flow, template.Blocks[0], block, start, 0) && flow.Continuation != null;
+            if (matched && flow.Decided.All(d => unifier.Decides(d.Condition) == d.Taken) && unifier.ArgumentsHoldBefore(flow.FirstEffect, flow.Assigned))
+                return flow;
+            // A test taken the other way might be the one the values decide.
+            (HBlock Block, HExpr Condition, bool Taken) other = flow.Decided.FirstOrDefault(d => !flipped.Contains(d.Block));
+            if (other.Block == null) return null;
+            flipped.Add(other.Block);
+            choices = new Dictionary<HBlock, bool>(choices) { [other.Block] = !other.Taken };
+        }
+        return null;
     }
 
     /// <summary>The site position a jump at it leads to (the jumps passed count as used).</summary>
@@ -205,13 +225,35 @@ internal static partial class ConstructorFolding
         if (!flow.Touched.TryGetValue(block, out int first) || index < first) flow.Touched[block] = index;
     }
 
-    /// <summary>Whether a statement found does nothing but fill the new object (nothing else can see it yet).</summary>
-    private static bool Inert(Flow flow, HStmt s) => s switch
+    private static readonly bool NoQuiet = Environment.GetEnvironmentVariable("REWIND_NO_QUIET_CONSTRUCTORS") != null;
+    private static readonly bool NoDecided = Environment.GetEnvironmentVariable("REWIND_NO_DECIDED_CONSTRUCTOR_TESTS") != null;
+
+    /// <summary>
+    /// A constructor of a class that does nothing but fill the object it runs on - stores of values that only
+    /// compute, and a base constructor that is the same - given arguments that only compute: running it on a
+    /// new object changes nothing anyone else could see.
+    /// </summary>
+    internal static bool QuietConstructor(HCall call, MethodPipeline pipeline, int depth = 0)
     {
-        HAssign { Target: HField { Object: { } o }, Value: var value } => flow.Unifier.IsCreated(o) && HirBuilder.IsPure(value),
-        HEval { Expression: HCall { Method: { Name: ".ctor", Parameters.Length: 0 } m, This: { } o } } => flow.Unifier.IsCreated(o) && m.DeclaringType.BaseType == null,
-        _ => false,
-    };
+        MethodDef m = call.Method;
+        if (NoQuiet || depth > 8 || m.Name != ".ctor" || m.IsStatic || m.DeclaringType.IsValueType) return false;
+        if (m.DeclaringType.BaseType == null) return m.Parameters.Length == 0;
+        if (!call.Arguments.All(HirBuilder.IsPure)) return false;
+        TypeSig[] classArguments = call.DeclaringType is GenericInstSig g ? g.Arguments : [];
+        if (pipeline.ConstructorBody(m, classArguments) is not { } body) return false;
+        List<HStmt> statements = body.Blocks[0].Statements;
+        for (int k = 0; k < statements.Count - 1; k++)
+            switch (statements[k])
+            {
+                case HAssign { Target: HField { Object: HArg { Index: < 0 }, Field.IsStatic: false }, Value: var value } when HirBuilder.IsPure(value):
+                    continue;
+                case HEval { Expression: HCall { This: HArg { Index: < 0 } } inner } when QuietConstructor(inner, pipeline, depth + 1):
+                    continue;
+                default:
+                    return false;
+            }
+        return true;
+    }
 
     private static bool Match(Flow flow, HBlock constructor, HBlock block, int index, int depth)
     {
@@ -229,7 +271,7 @@ internal static partial class ConstructorFolding
             if (statements[k] is not (HAssign or HEval) || site is not (HAssign or HEval)) return false;
             if (!flow.Unifier.Statement(statements[k], site, flow.Counter)) return false;
             Touch(flow, block, index);
-            if (!Inert(flow, site)) flow.FirstEffect = Math.Min(flow.FirstEffect, flow.Counter);
+            if (!flow.Unifier.Inert(site)) flow.FirstEffect = Math.Min(flow.FirstEffect, flow.Counter);
             if (site is HAssign { Target: HLocal assigned }) flow.Assigned.Add(assigned.Variable);
             flow.Counter++;
             index++;
@@ -248,7 +290,20 @@ internal static partial class ConstructorFolding
             case HBranch branch:
             {
                 (block, index) = Follow(flow, block, index);
-                if (index >= block.Statements.Count || block.Statements[index] is not HBranch test) return false;
+                if (index >= block.Statements.Count) return false;
+                if (block.Statements[index] is not HBranch)
+                {
+                    // No test here: the values handed over decide it, and the compiler kept the one way they take
+                    // ("if (count <= 0) throw ..." with count 1). Which way that is is checked once all
+                    // the values are known.
+                    if (NoDecided) return false;
+                    // (First guess: the way that does not throw.)
+                    bool taken = flow.Choices.TryGetValue(constructor, out bool chosen) ? chosen
+                        : branch.WhenFalse.Statements is [.., HThrow] && branch.WhenTrue.Statements is not [.., HThrow];
+                    flow.Decided.Add((constructor, branch.Condition, taken));
+                    return Match(flow, taken ? branch.WhenTrue : branch.WhenFalse, block, index, depth + 1);
+                }
+                HBranch test = (HBranch)block.Statements[index];
                 HExpr wanted = branch.Condition, found = test.Condition;
                 bool inverted = false;
                 if (wanted is HCompare c && found is HCompare f && c.Op != f.Op)

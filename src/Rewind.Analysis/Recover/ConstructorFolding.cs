@@ -82,13 +82,14 @@ internal static partial class ConstructorFolding
             int lastStart = length == 0 ? at + 1 : Math.Min(firstMention, site.Count - length);
             for (int start = at + 1; start <= lastStart; start++)
             {
-                var unifier = new Unifier(created, constructor.Parameters.Length) { Constructor = constructor };
+                var unifier = new Unifier(created, constructor.Parameters.Length) { Constructor = constructor, Quiet = c => QuietConstructor(c, pipeline) };
                 bool matched = true;
                 for (int k = 0; k < length && matched; k++)
                     matched = unifier.Statement(statements[k], site[start + k], k);
                 if (!matched && Reordered(statements, length, site, start, created, constructor.Parameters.Length, pipeline) is { } other)
                 {
                     unifier = other;
+                    unifier.Quiet = c => QuietConstructor(c, pipeline);
                     matched = true;
                 }
                 if (!matched || !unifier.ArgumentsAreValid(site, start, length)) continue;
@@ -550,6 +551,21 @@ internal static partial class ConstructorFolding
         /// <summary>The site's local variables that stand for temporaries of the constructor.</summary>
         public IReadOnlyCollection<HVar> SiteLocals => _siteLocals;
 
+        /// <summary>A constructor call that does nothing but fill the object it runs on (see QuietConstructor).</summary>
+        public Func<HCall, bool>? Quiet;
+
+        /// <summary>What a test of the constructor comes to with the values found for its parameters; null when that is not certain.</summary>
+        public bool? Decides(HExpr condition) => Worth(condition, -1, 0) is long v ? v != 0 : null;
+
+        /// <summary>Whether a statement found does nothing but fill the new object (nothing else can see it yet).</summary>
+        public bool Inert(HStmt s) => s switch
+        {
+            HAssign { Target: HField { Object: { } o }, Value: var value } => IsCreated(o) && HirBuilder.IsPure(value),
+            HEval { Expression: HCall { Method: { Name: ".ctor" } m, This: { } o } call } =>
+                IsCreated(o) && ((m.Parameters.Length == 0 && m.DeclaringType.BaseType == null) || Quiet?.Invoke(call) == true),
+            _ => false,
+        };
+
         /// <summary>What the site has where the constructor has each parameter.</summary>
         public readonly HExpr?[] Arguments = new HExpr?[parameters];
         private readonly int[] _boundAt = new int[parameters];
@@ -894,14 +910,7 @@ internal static partial class ConstructorFolding
             int firstEffect = length;
             for (int k = 0; k < length; k++)
             {
-                bool inert = site[start + k] switch
-                {
-                    HAssign { Target: HField { Object: { } o }, Value: var value } => IsCreated(o) && HirBuilder.IsPure(value),
-                    HEval { Expression: HCall { Method: { Name: ".ctor", Parameters.Length: 0 } m, This: { } o } } =>
-                        IsCreated(o) && m.DeclaringType.BaseType == null,
-                    _ => false,
-                };
-                if (!inert)
+                if (!Inert(site[start + k]))
                 {
                     firstEffect = k;
                     break;
