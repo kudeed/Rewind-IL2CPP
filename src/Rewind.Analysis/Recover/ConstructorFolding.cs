@@ -15,23 +15,26 @@ namespace Rewind.Analysis.Recover;
 /// by a call of that constructor with those values. Where nothing matches, the raw form stays: it does the same
 /// thing either way.
 /// </summary>
-internal static class ConstructorFolding
+internal static partial class ConstructorFolding
 {
     /// <param name="again">A second look, after other things were put back: only what is found now changes anything.</param>
     public static void Run(HMethod method, ProgramAnalysis program, MethodPipeline pipeline, bool again = false)
     {
         // Later allocations first, so that an object created inside another constructor's statements has
         // already taken its final form when the outer one is compared.
-        for (int b = method.Blocks.Count - 1; b >= 0; b--)
+        // (Folding a constructor with branches takes blocks away: what is gone is passed over.)
+        List<HBlock> blocks = [.. method.Blocks];
+        for (int b = blocks.Count - 1; b >= 0; b--)
         {
-            HBlock block = method.Blocks[b];
+            HBlock block = blocks[b];
+            if (!method.Blocks.Contains(block)) continue;
             for (int i = block.Statements.Count - 1; i >= 0; i--)
             {
                 if (i >= block.Statements.Count) continue;
                 if (block.Statements[i] is not HAssign { Target: HLocal target, Value: HTypeExpr { Op: HTypeOp.Allocate } allocation }) continue;
                 string problem = $"the constructor of {allocation.Target.ShortName} was inlined and could not be folded back";
                 string note = $"the constructor of {allocation.Target.ShortName} was inlined here; the object is allocated raw and its statements follow";
-                if (TryFold(block, i, target, allocation.Target, program, pipeline))
+                if (TryFold(block, i, target, allocation.Target, program, pipeline) || TryFoldChain(method, block, i, target, allocation.Target, program, pipeline))
                 {
                     if (again)
                     {
@@ -41,10 +44,13 @@ internal static class ConstructorFolding
                     continue;
                 }
                 if (again) continue;
+                if (TryFoldAcrossJoin(method, block, i, program, pipeline)) continue;
                 if (program.RawAllocator == null) method.Problems.Add(problem);
                 else method.Notes.Add(note);
             }
         }
+        // Inside a constructor: the base class's constructor, pasted in.
+        FoldOwnChain(method, program, pipeline);
     }
 
     private static bool TryFold(HBlock block, int at, HLocal target, TypeSig type, ProgramAnalysis program, MethodPipeline pipeline)
@@ -80,7 +86,7 @@ internal static class ConstructorFolding
                 bool matched = true;
                 for (int k = 0; k < length && matched; k++)
                     matched = unifier.Statement(statements[k], site[start + k], k);
-                if (!matched && Reordered(statements, length, site, start, created, constructor.Parameters.Length) is { } other)
+                if (!matched && Reordered(statements, length, site, start, created, constructor.Parameters.Length, pipeline) is { } other)
                 {
                     unifier = other;
                     matched = true;
@@ -126,11 +132,16 @@ internal static class ConstructorFolding
     /// only computes. So between two statements that do something else, each store of the constructor is
     /// looked for among the site's stores there, by the field it goes to. Null when that does not work out.
     /// </summary>
-    private static Unifier? Reordered(List<HStmt> statements, int length, List<HStmt> site, int start, HVar created, int parameters)
+    private static Unifier? Reordered(List<HStmt> statements, int length, List<HStmt> site, int start, HVar created, int parameters, MethodPipeline pipeline)
     {
         if (length < 2 || start + length > site.Count) return null;
-        static FieldDef? Filled(HStmt s, Func<HExpr, bool> isObject) =>
-            s is HAssign { Target: HField { Object: { } o } target, Value: var value } && !target.Field.IsStatic && isObject(o) && HirBuilder.IsPure(value) ? target.Field : null;
+        // What is stored only computes: plain values, and a struct written out from plain values by a
+        // constructor that does nothing but store them ("new Stats(4, 1, 2.5f)").
+        bool Plain(HExpr value) => HirBuilder.IsPure(value) ||
+            (!NoWrittenStructs && value is HNewObject { Type.IsValueType: true } made && made.Arguments.All(Plain) &&
+             StructFolding.OnlyStores(made.Constructor, made.Type, pipeline));
+        FieldDef? Filled(HStmt s, Func<HExpr, bool> isObject) =>
+            s is HAssign { Target: HField { Object: { } o } target, Value: var value } && !target.Field.IsStatic && isObject(o) && Plain(value) ? target.Field : null;
         bool This(HExpr e) => e is HArg { Index: < 0 };
         bool Created(HExpr e) => e is HLocal l && ReferenceEquals(l.Variable, created);
 
@@ -166,6 +177,320 @@ internal static class ConstructorFolding
         return unifier;
     }
 
+    private static readonly bool NoJoinTails = Environment.GetEnvironmentVariable("REWIND_NO_JOINED_CONSTRUCTORS") != null;
+    private static readonly bool NoWrittenStructs = Environment.GetEnvironmentVariable("REWIND_NO_REORDERED_STRUCTS") != null;
+
+    /// <summary>
+    /// Constructors whose last statements the compiler wrote once for several branches.
+    ///
+    /// "if (big) return new Dragon(name); return new Goblin(name);" with both constructors pasted in: they end
+    /// alike ("stats = new Stats(...)", with other numbers), and the compiler keeps one copy of that ending
+    /// after the branches meet, with merged values standing for each branch's own. Each branch then holds a
+    /// constructor without its end, and none of them folds. Copied back into every branch that leads there -
+    /// with that branch's values in place of the merged ones - the endings complete the constructors again.
+    /// Running the statements at the end of each branch is the same as running them once after the branches
+    /// meet; it is done only when every branch's constructor then folds, all of the copied statements with it.
+    /// </summary>
+    private static bool TryFoldAcrossJoin(HMethod method, HBlock block, int at, ProgramAnalysis program, MethodPipeline pipeline)
+    {
+        if (NoJoinTails || block.Statements.Count == 0 || block.Statements[^1] is not HJump { Target: var join }) return false;
+        if (ReferenceEquals(join, block) || join.Scope != block.Scope || join.Statements.Count < 2) return false;
+        if (method.Blocks.Count == 0 || ReferenceEquals(method.Blocks[0], join)) return false;
+        foreach (HTryRegion r in method.TryRegions.Values)
+            if (ReferenceEquals(r.Entry, join) || ReferenceEquals(r.HandlerEntry, join))
+                return false;
+        // Every way into the meeting point is a plain jump at the end of a branch.
+        var preds = new List<HBlock>();
+        foreach (HBlock b in method.Blocks)
+        {
+            if (b.Statements.Count == 0) continue;
+            switch (b.Statements[^1])
+            {
+                case HJump j when ReferenceEquals(j.Target, join):
+                    if (ReferenceEquals(b, join) || b.Scope != join.Scope) return false;
+                    preds.Add(b);
+                    break;
+                case HBranch br when ReferenceEquals(br.WhenTrue, join) || ReferenceEquals(br.WhenFalse, join):
+                    return false;
+                case HSwitch sw when ReferenceEquals(sw.Default, join) || sw.Targets.Any(t => ReferenceEquals(t, join)):
+                    return false;
+            }
+        }
+        if (preds.Count < 2) return false;
+
+        int most = Math.Min(8, join.Statements.Count - 1);
+        for (int n = 1; n <= most; n++)
+        {
+            // Only statements that do something to an object or call something: a merged value given to a
+            // local is the ending of no constructor.
+            if (join.Statements[n - 1] is not (HAssign { Target: not HLocal } or HEval)) break;
+            var folded = new List<(HBlock Block, List<HStmt> Statements, HashSet<HVar> Moved)>();
+            foreach (HBlock p in preds)
+            {
+                int allocation = ReferenceEquals(p, block) ? at : LastAllocation(p);
+                if (allocation < 0 || FoldWithEnding(p, allocation, join, n, program, pipeline) is not { } result) break;
+                folded.Add((p, result.Statements, result.Moved));
+            }
+            if (folded.Count != preds.Count) continue;
+            var moved = new HashSet<HVar>();
+            foreach ((_, _, HashSet<HVar> those) in folded) moved.UnionWith(those);
+            // Inside a try region the copies run before the merged values are given: a handler that reads
+            // one of those could tell the difference when a copy throws.
+            if (join.Scope >= 0 && method.Blocks.Any(b => (b.Scope & 1) == 1 && b.Statements.Any(s => moved.Any(v => Reads(s, v))))) return false;
+            foreach ((HBlock p, List<HStmt> statements, _) in folded)
+            {
+                p.Statements.Clear();
+                p.Statements.AddRange(statements);
+            }
+            join.Statements.RemoveRange(0, n);
+            // A merged value that only the moved statements read is given for nothing now.
+            foreach (HVar v in moved)
+            {
+                if (method.Blocks.Any(b => b.Statements.Any(s => Reads(s, v)))) continue;
+                foreach (HBlock b in method.Blocks)
+                    b.Statements.RemoveAll(s => s is HAssign { Target: HLocal l, Value: HConst or HLocal } && ReferenceEquals(l.Variable, v));
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private static int LastAllocation(HBlock block)
+    {
+        for (int i = block.Statements.Count - 1; i >= 0; i--)
+            if (block.Statements[i] is HAssign { Target: HLocal, Value: HTypeExpr { Op: HTypeOp.Allocate } })
+                return i;
+        return -1;
+    }
+
+    /// <summary>
+    /// The branch's statements with the first <paramref name="count"/> statements of the meeting point copied in
+    /// (each merged value replaced by what the branch gives it) and the constructor folded; null unless the fold
+    /// took every copied statement.
+    /// </summary>
+    private static (List<HStmt> Statements, HashSet<HVar> Moved)? FoldWithEnding(HBlock branch, int at, HBlock join, int count,
+        ProgramAnalysis program, MethodPipeline pipeline)
+    {
+        List<HStmt> s = branch.Statements;
+        int jump = s.Count - 1;
+        // The values the branch gives the merged variables, last thing before it jumps.
+        int moves = jump;
+        while (moves > at + 1 && s[moves - 1] is HAssign { Target: HLocal, Value: HConst or HLocal }) moves--;
+        var map = new Dictionary<HVar, HExpr>();
+        for (int i = moves; i < jump; i++)
+        {
+            var move = (HAssign)s[i];
+            HVar to = ((HLocal)move.Target).Variable;
+            // (One move reading what another gives: the order would matter.)
+            if (move.Value is HLocal from && map.ContainsKey(from.Variable)) return null;
+            if (map.ContainsKey(to)) return null;
+            map[to] = move.Value;
+        }
+        var copies = new List<HStmt>();
+        var sources = new HashSet<HVar>(map.Values.OfType<HLocal>().Select(l => l.Variable));
+        for (int k = 0; k < count; k++)
+        {
+            if (Copy(join.Statements[k], map) is not { } copy) return null;
+            // (A copy that could change a local a move reads - through its address - must stay after it.)
+            if (sources.Any(v => AddressTaken(copy, v))) return null;
+            copies.Add(copy);
+        }
+        // The copies go before the moves: they read none of what the moves give (that is replaced), and the
+        // moves read only locals and constants, which the copies do not change.
+        var candidate = new List<HStmt>(s.Count + count);
+        candidate.AddRange(s.Take(moves));
+        candidate.AddRange(copies);
+        candidate.AddRange(s.Skip(moves));
+        var trial = new HBlock { Id = branch.Id, Scope = branch.Scope, Statements = candidate };
+        if (candidate[at] is not HAssign { Target: HLocal target, Value: HTypeExpr { Op: HTypeOp.Allocate } allocation }) return null;
+        if (!TryFold(trial, at, target, allocation.Target, program, pipeline)) return null;
+        foreach (HStmt copy in copies)
+            if (trial.Statements.Contains(copy))
+                return null;
+        return (trial.Statements, [.. map.Keys]);
+    }
+
+    /// <summary>A statement copied with some locals replaced by values; null for anything not copied.</summary>
+    private static HStmt? Copy(HStmt statement, Dictionary<HVar, HExpr> map)
+    {
+        switch (statement)
+        {
+            case HAssign a when a.Target is not HLocal:
+                return Copy(a.Target, map) is { } target && Copy(a.Value, map) is { } value ? new HAssign(target, value) { Address = a.Address } : null;
+            case HEval e:
+                return Copy(e.Expression, map) is { } expression ? new HEval(expression) { Address = e.Address } : null;
+            default:
+                return null;
+        }
+    }
+
+    private static HExpr? Copy(HExpr? e, Dictionary<HVar, HExpr> map)
+    {
+        HExpr[]? All(HExpr[] items)
+        {
+            var copies = new HExpr[items.Length];
+            for (int i = 0; i < items.Length; i++)
+                if ((copies[i] = Copy(items[i], map)!) == null)
+                    return null;
+            return copies;
+        }
+        switch (e)
+        {
+            case null:
+                return null;
+            case HLocal l when map.TryGetValue(l.Variable, out HExpr? value):
+                return Copy(value, []);
+            case HLocal l:
+                return new HLocal(l.Variable) { Type = l.Type };
+            case HConst c:
+                return new HConst(c.Value, c.Type);
+            case HArg a:
+                return new HArg(a.Index) { Type = a.Type };
+            case HField f:
+            {
+                HExpr? owner = null;
+                if (f.Object != null && (owner = Copy(f.Object, map)) == null) return null;
+                return new HField { Object = owner, Field = f.Field, DeclaringType = f.DeclaringType, Type = f.Type };
+            }
+            case HElement el:
+                return Copy(el.Array, map) is { } array && Copy(el.Index, map) is { } index ? new HElement { Array = array, Index = index, Type = el.Type } : null;
+            case HArrayLength len:
+                return Copy(len.Array, map) is { } of ? new HArrayLength(of) { Type = len.Type } : null;
+            case HAddressOf addr:
+                return Copy(addr.Target, map) is { } place ? new HAddressOf(place) { Type = addr.Type } : null;
+            case HDeref d:
+                return Copy(d.Pointer, map) is { } pointer ? new HDeref(pointer) { Type = d.Type } : null;
+            case HUnary u:
+                return Copy(u.Operand, map) is { } operand ? new HUnary(u.Op, operand) { Type = u.Type } : null;
+            case HBinary b:
+                return Copy(b.Left, map) is { } left && Copy(b.Right, map) is { } right ? Folded(new HBinary(b.Op, left, right) { Type = b.Type }) : null;
+            case HCompare c:
+                return Copy(c.Left, map) is { } cl && Copy(c.Right, map) is { } cr ? new HCompare(c.Op, cl, cr) { Type = c.Type } : null;
+            case HConv c:
+                return Copy(c.Operand, map) is { } converted ? Folded(new HConv(c.Kind, converted) { Type = c.Type }) : null;
+            case HSelect s:
+                return Copy(s.Condition, map) is { } condition && Copy(s.WhenTrue, map) is { } yes && Copy(s.WhenFalse, map) is { } no
+                    ? new HSelect(condition, yes, no) { Type = s.Type } : null;
+            case HCall call:
+            {
+                HExpr? self = null;
+                if (call.This != null && (self = Copy(call.This, map)) == null) return null;
+                if (All(call.Arguments) is not { } arguments) return null;
+                var copy = new HCall
+                {
+                    Method = call.Method, DeclaringType = call.DeclaringType, MethodArguments = call.MethodArguments, This = self,
+                    Arguments = arguments, Virtual = call.Virtual, Constrained = call.Constrained, Type = call.Type,
+                };
+                copy.Alternatives.AddRange(call.Alternatives);
+                return copy;
+            }
+            case HNewObject n:
+                return All(n.Arguments) is { } given
+                    ? new HNewObject { Constructor = n.Constructor, DeclaringType = n.DeclaringType, Arguments = given, Type = n.Type } : null;
+            case HNewArray na:
+                return Copy(na.Length, map) is { } length ? new HNewArray(na.ElementType, length) { Type = na.Type } : null;
+            case HTypeExpr t:
+            {
+                HExpr? inner = null;
+                if (t.Operand != null && (inner = Copy(t.Operand, map)) == null) return null;
+                return new HTypeExpr(t.Op, t.Target, inner) { Type = t.Type };
+            }
+            case HMethodPointer p:
+                return new HMethodPointer { Method = p.Method, DeclaringType = p.DeclaringType, MethodArguments = p.MethodArguments, VirtualOn = p.VirtualOn, Type = p.Type };
+            case HMemberToken m:
+                return new HMemberToken { Method = m.Method, Field = m.Field, DeclaringType = m.DeclaringType, MethodArguments = m.MethodArguments, Type = m.Type };
+            default:
+                // (A cached delegate, an opaque operation: left where it is.)
+                return null;
+        }
+    }
+
+    /// <summary>Arithmetic on numbers written out, done (a merged value replaced by a branch's constant).</summary>
+    private static HExpr Folded(HExpr e)
+    {
+        static long? Whole(object? v) => v switch { int i => i, long l => l, _ => null };
+        switch (e)
+        {
+            case HConv { Operand: HConst { Value: var value } } c when Whole(value) is { } n:
+                return c.Kind switch
+                {
+                    HConvKind.I4 or HConvKind.U4 => new HConst(unchecked((int)n), c.Type),
+                    HConvKind.I8 => new HConst(n, c.Type),
+                    HConvKind.U8 => new HConst(value is int i ? (long)unchecked((uint)i) : n, c.Type),
+                    _ => e,
+                };
+            case HBinary { Left: HConst { Value: long a }, Right: HConst { Value: var right } } b when Whole(right) is { } r:
+                return b.Op switch
+                {
+                    HBinaryOp.ShrUn => new HConst((long)((ulong)a >> (int)(r & 63)), b.Type),
+                    HBinaryOp.Shr => new HConst(a >> (int)(r & 63), b.Type),
+                    HBinaryOp.Shl => new HConst(a << (int)(r & 63), b.Type),
+                    HBinaryOp.And => new HConst(a & r, b.Type),
+                    HBinaryOp.Or => new HConst(a | r, b.Type),
+                    _ => e,
+                };
+            case HBinary { Left: HConst { Value: int a }, Right: HConst { Value: int r } } b:
+                return b.Op switch
+                {
+                    HBinaryOp.ShrUn => new HConst((int)((uint)a >> (r & 31)), b.Type),
+                    HBinaryOp.Shr => new HConst(a >> (r & 31), b.Type),
+                    HBinaryOp.Shl => new HConst(a << (r & 31), b.Type),
+                    HBinaryOp.And => new HConst(a & r, b.Type),
+                    HBinaryOp.Or => new HConst(a | r, b.Type),
+                    _ => e,
+                };
+            default:
+                return e;
+        }
+    }
+
+    /// <summary>Whether the address of a variable (or of a part of it) is taken anywhere in a statement.</summary>
+    private static bool AddressTaken(HStmt statement, HVar variable)
+    {
+        bool found = false;
+        void Walk(HExpr? e)
+        {
+            if (found || e == null) return;
+            switch (e)
+            {
+                case HAddressOf a:
+                    HExpr root = a.Target;
+                    while (root is HField { Object: { } owner }) root = owner;
+                    if (root is HLocal l && ReferenceEquals(l.Variable, variable)) found = true;
+                    else Walk(a.Target);
+                    break;
+                case HField f: Walk(f.Object); break;
+                case HElement el: Walk(el.Array); Walk(el.Index); break;
+                case HArrayLength len: Walk(len.Array); break;
+                case HDeref d: Walk(d.Pointer); break;
+                case HUnary u: Walk(u.Operand); break;
+                case HBinary b: Walk(b.Left); Walk(b.Right); break;
+                case HCompare c: Walk(c.Left); Walk(c.Right); break;
+                case HConv c: Walk(c.Operand); break;
+                case HSelect s: Walk(s.Condition); Walk(s.WhenTrue); Walk(s.WhenFalse); break;
+                case HCall call: Walk(call.This); foreach (HExpr x in call.Arguments) Walk(x); break;
+                case HNewObject n: foreach (HExpr x in n.Arguments) Walk(x); break;
+                case HNewArray na: Walk(na.Length); break;
+                case HTypeExpr t: Walk(t.Operand); break;
+                case HCachedDelegate cd: Walk(cd.Creation); break;
+                case HOpaque o: foreach (HExpr x in o.Operands) Walk(x); break;
+            }
+        }
+        switch (statement)
+        {
+            case HAssign a: Walk(a.Target); Walk(a.Value); break;
+            case HEval e: Walk(e.Expression); break;
+        }
+        return found;
+    }
+
+    /// <summary>Whether a statement reads a variable (giving it a value as a whole is no read).</summary>
+    private static bool Reads(HStmt statement, HVar variable) => statement switch
+    {
+        HAssign { Target: HLocal } a => Mentions(a.Value, variable),
+        _ => Mentions(statement, variable),
+    };
+
     internal static bool Mentions(HStmt statement, HVar variable) => statement switch
     {
         HAssign a => Mentions(a.Target, variable) || Mentions(a.Value, variable),
@@ -196,6 +521,7 @@ internal static class ConstructorFolding
         HTypeExpr t => Mentions(t.Operand, variable),
         HSelect s => Mentions(s.Condition, variable) || Mentions(s.WhenTrue, variable) || Mentions(s.WhenFalse, variable),
         HOpaque o => o.Operands.Any(a => Mentions(a, variable)),
+        HCachedDelegate cd => Mentions(cd.Creation, variable),
         _ => false,
     };
 
@@ -214,8 +540,16 @@ internal static class ConstructorFolding
     };
 
     /// <summary>Matches a constructor's statements against the statements at a creation site.</summary>
-    private sealed class Unifier(HVar created, int parameters)
+    private sealed class Unifier(HVar? created, int parameters)
     {
+        /// <summary>The object the constructor runs on at the site: the new object's variable - or, where created is null, "this".</summary>
+        public bool IsCreated(HExpr e) => created == null ? e is HArg { Index: < 0 } : e is HLocal l && ReferenceEquals(l.Variable, created);
+
+        private bool MentionsCreated(HExpr e) => created == null ? MentionsThis(e) : Mentions(e, created);
+
+        /// <summary>The site's local variables that stand for temporaries of the constructor.</summary>
+        public IReadOnlyCollection<HVar> SiteLocals => _siteLocals;
+
         /// <summary>What the site has where the constructor has each parameter.</summary>
         public readonly HExpr?[] Arguments = new HExpr?[parameters];
         private readonly int[] _boundAt = new int[parameters];
@@ -413,6 +747,34 @@ internal static class ConstructorFolding
             }
         }
 
+        /// <summary>Whether an expression of the constructor (a test it makes) is the same as one at the site.</summary>
+        public bool Same(HExpr constructor, HExpr site, int index)
+        {
+            _statement = index;
+            return Expression(constructor, site);
+        }
+
+        /// <summary>
+        /// For a constructor compared along its branches: the values found for its parameters can be computed
+        /// before it runs - they use no temporary of its, nothing it assigns, and what they read from memory was
+        /// found before the first statement that could change memory.
+        /// </summary>
+        public bool ArgumentsHoldBefore(int firstEffect, IReadOnlyCollection<HVar> assigned)
+        {
+            for (int i = 0; i < Arguments.Length; i++)
+            {
+                if (Arguments[i] is not { } value) continue;
+                foreach (HVar inner in _siteLocals)
+                    if (Mentions(value, inner))
+                        return false;
+                foreach (HVar changed in assigned)
+                    if (Mentions(value, changed))
+                        return false;
+                if (ReadsMemory(value) && _boundAt[i] > firstEffect) return false;
+            }
+            return true;
+        }
+
         public bool Statement(HStmt constructor, HStmt site, int index)
         {
             _statement = index;
@@ -422,7 +784,7 @@ internal static class ConstructorFolding
                     if (c.Target is HLocal cl)
                     {
                         // A temporary of the constructor: the site has one of its own in the same role.
-                        if (s.Target is not HLocal sl || ReferenceEquals(sl.Variable, created)) return false;
+                        if (s.Target is not HLocal sl || (created != null && ReferenceEquals(sl.Variable, created))) return false;
                         if (_locals.TryGetValue(cl.Variable, out HVar? known)) { if (!ReferenceEquals(known, sl.Variable)) return false; }
                         else if (!_siteLocals.Add(sl.Variable)) return false;
                         else _locals[cl.Variable] = sl.Variable;
@@ -462,11 +824,11 @@ internal static class ConstructorFolding
             switch (constructor)
             {
                 case HArg { Index: < 0 }:
-                    return site is HLocal self && ReferenceEquals(self.Variable, created);
+                    return IsCreated(site);
                 case HArg a:
                     if (a.Index >= Arguments.Length) return false;
                     if (Arguments[a.Index] is { } bound) return HirCleanup.Same(bound, site);
-                    if (!HirBuilder.IsPure(site) || Mentions(site, created)) return false;
+                    if (!HirBuilder.IsPure(site) || MentionsCreated(site)) return false;
                     Arguments[a.Index] = site;
                     _boundAt[a.Index] = _statement;
                     return true;
@@ -534,9 +896,9 @@ internal static class ConstructorFolding
             {
                 bool inert = site[start + k] switch
                 {
-                    HAssign { Target: HField { Object: HLocal o }, Value: var value } => ReferenceEquals(o.Variable, created) && HirBuilder.IsPure(value),
-                    HEval { Expression: HCall { Method: { Name: ".ctor", Parameters.Length: 0 } m, This: HLocal o } } =>
-                        ReferenceEquals(o.Variable, created) && m.DeclaringType.BaseType == null,
+                    HAssign { Target: HField { Object: { } o }, Value: var value } => IsCreated(o) && HirBuilder.IsPure(value),
+                    HEval { Expression: HCall { Method: { Name: ".ctor", Parameters.Length: 0 } m, This: { } o } } =>
+                        IsCreated(o) && m.DeclaringType.BaseType == null,
                     _ => false,
                 };
                 if (!inert)

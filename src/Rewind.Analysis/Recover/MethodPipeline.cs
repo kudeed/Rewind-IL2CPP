@@ -378,13 +378,21 @@ public sealed class MethodPipeline
     }
 
     private readonly Dictionary<(MethodDef, string), HMethod?> _constructorBodies = [];
+    internal static readonly bool NoConstructorFlows = Environment.GetEnvironmentVariable("REWIND_NO_CONSTRUCTOR_FLOWS") != null;
     private readonly HashSet<MethodDef> _recovering = [];
 
     /// <summary>
     /// The recovered statements of a constructor, when they are complete and a plain run without branches:
     /// what a creation site is compared with to put an inlined constructor back.
     /// </summary>
-    internal HMethod? ConstructorBody(MethodDef constructor, TypeSig[] classArguments)
+    internal HMethod? ConstructorBody(MethodDef constructor, TypeSig[] classArguments) =>
+        ConstructorFlow(constructor, classArguments) is { Blocks: [{ Statements: [.., HReturn { Value: null }] }] } body ? body : null;
+
+    /// <summary>
+    /// The recovered statements of a constructor, when they are complete, branches and all: what a creation site
+    /// is compared with along every way through it (ConstructorFolding).
+    /// </summary>
+    internal HMethod? ConstructorFlow(MethodDef constructor, TypeSig[] classArguments)
     {
         string key = classArguments.Length == 0 ? "" : string.Join(",", classArguments.Select(a => a.Key));
         if (_constructorBodies.TryGetValue((constructor, key), out HMethod? known)) return known;
@@ -419,7 +427,9 @@ public sealed class MethodPipeline
             if (lifted != null)
             {
                 HMethod h = BuildCore(lifted);
-                if (h.Problems.Count == 0 && h.Blocks.Count == 1 && h.Blocks[0].Statements is [.., HReturn { Value: null }]) body = h;
+                if (h.Problems.Count == 0 && h.Blocks.Count != 0 && h.TryRegions.Count == 0 &&
+                    (h.Blocks.Count == 1 ? h.Blocks[0].Statements is [.., HReturn { Value: null }] : !NoConstructorFlows))
+                    body = h;
             }
         }
         catch (Exception)
