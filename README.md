@@ -116,7 +116,7 @@ source, the IL, the generated C++ and the debug symbols are all there to compare
 | Method addresses against debug symbols | 39,257 of 39,257 (Windows x64, v39), 34,680 of 34,680 (Android ARM64, v39), 10,229 of 10,229 (Android, v31.1) |
 | Rebuilt assemblies against the originals | identical type, field and method tokens and signatures; 43,141 of 43,141 overrides; 133,358 of 133,358 attributes |
 | Runtime function identification | no wrong identifications in 5 build configurations, including 2 the library wasn't built from |
-| Behavior of recovered code | 145 of 187 comparable test methods behave exactly like the original on up to 60 inputs each |
+| Behavior of recovered code | 176 of 187 comparable test methods behave exactly like the original on up to 60 inputs each |
 
 The behavior check is `rewind-lab diff-exec`. It loads the original assembly and the rebuilt one side by side,
 calls the same static methods with the same inputs, and compares the results, any exceptions and any changes
