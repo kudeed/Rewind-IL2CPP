@@ -18,6 +18,32 @@ internal static class SigLab
         return (context, new CodeIndex(context));
     }
 
+    /// <summary>
+    /// How close each library signature comes to the functions at the given addresses: the near-identical-code
+    /// stage's score (CodeIndex.Similarity of the sketches) and whether the instruction counts are close enough for
+    /// that stage to compare them at all. For finding out why a helper was not identified.
+    /// </summary>
+    public static int Near(string libraryPath, Il2CppModel target, string[] addresses)
+    {
+        HelperLibrary library = HelperLibrary.Load(libraryPath);
+        var (_, index) = Open(target);
+        foreach (string text in addresses)
+        {
+            ulong address = Convert.ToUInt64(text.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? text[2..] : text, 16);
+            if (index.Get(address) is not { } code) { Console.WriteLine($"=== 0x{address:X}: no code"); continue; }
+            Console.WriteLine($"=== 0x{address:X}: {code.Instructions} instructions{(code.IsThunk ? $", thunk to 0x{index.ThunkTarget(address):X}" : "")}");
+            foreach (var (entry, score) in library.Entries
+                         .Where(e => !e.IsThunk)
+                         .Select(e => (e, CodeIndex.Similarity(e.Sketch, code.Sketch)))
+                         .OrderByDescending(x => x.Item2).Take(8))
+            {
+                bool window = code.Instructions >= entry.Instructions * 3 / 4 && code.Instructions <= entry.Instructions * 4 / 3 + 1;
+                Console.WriteLine($"  {score:F3}  {entry.Info.Kind,-24} {entry.Instructions,5} ins {(window ? "" : "(outside the size window) ")}{entry.Info.Name}");
+            }
+        }
+        return 0;
+    }
+
     private static RuntimeHelpers FromSymbols(Il2CppModel model, string symbolsPath)
     {
         Dictionary<ulong, List<string>> symbols = CallStats.LoadSymbols(model.Image, symbolsPath);

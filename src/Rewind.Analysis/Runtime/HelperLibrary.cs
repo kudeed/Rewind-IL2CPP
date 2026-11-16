@@ -60,6 +60,13 @@ public sealed class HelperLibrary
     /// <summary>Similarity matching needs enough instructions to be meaningful, a high score and a clear winner.</summary>
     private const int MinimumSimilarInstructions = 12;
     private const double MinimumSimilarity = 0.70, MinimumMargin = 0.12;
+    /// <summary>
+    /// A large function whose best match leaves every other candidate far behind is that function even when a share
+    /// of its instructions differs, for example struct field offsets that moved between builds (Class::IsAssignableFrom
+    /// of a build scored 0.688 against its signature, and 0.17 against the next function).
+    /// </summary>
+    private const int LooseMinimumInstructions = 200;
+    private const double LooseSimilarity = 0.60, LooseMargin = 0.30;
 
     public static HelperLibrary Build(RuntimeHelpers named, CodeIndex index, NativeImage image, Func<ulong, bool> isManaged,
         string unity, string platform, string arch)
@@ -205,7 +212,9 @@ public sealed class HelperLibrary
                 }
                 else if (similarity > second) second = similarity;
             }
-            if (best >= MinimumSimilarity && best - second >= MinimumMargin)
+            bool clear = best >= MinimumSimilarity && best - second >= MinimumMargin;
+            bool dominant = entry.Instructions >= LooseMinimumInstructions && best >= LooseSimilarity && best - second >= LooseMargin;
+            if (clear || dominant)
             {
                 Claim(bestAddress, entry, MatchStage.Similar);
                 settledEntries.Add(entry);
