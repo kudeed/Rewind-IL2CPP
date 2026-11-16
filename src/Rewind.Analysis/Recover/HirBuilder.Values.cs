@@ -512,6 +512,8 @@ public sealed partial class HirBuilder
         if (s is not SVal v) return s; // references and other non-numeric meanings pass through unchanged
         HExpr e = v.Expr;
         int from = inner.Type.Bits(), to = n.Type.Bits();
+        // A float's bytes made wider are its bits made wider. Converting the float itself would turn 60f into 60.
+        if (ReferenceEquals(e.Type, _float) && from <= 32) e = FloatBits(e);
         // A constant made wider is a constant.
         if (to == 64 && from is 8 or 16 or 32 && e is HConst { Value: int or long } constant)
         {
@@ -650,6 +652,8 @@ public sealed partial class HirBuilder
                     return new SVal(new HField { Object = e, Field = fs.Field, DeclaringType = e.Type, Type = fs.Type });
             }
             if (known == 0 && inner.Type == VT.I64 && to == 32 && e.Type == null) return v; // untyped 32-bit value in a 64-bit register
+            // The low bytes of a float or double are part of its bits, not the number converted.
+            if (IsFloat(e.Type)) e = FloatBits(e);
             HConvKind kind = to switch { 8 => HConvKind.U1, 16 => HConvKind.U2, 32 => HConvKind.I4, _ => HConvKind.I8 };
             TypeSig type = to switch { 8 => _byte, 16 => _ushort, 32 => _int, _ => _long };
             if (to == 1) return new SVal(new HCompare(HCompareOp.Ne, new HBinary(HBinaryOp.And, e, new HConst(1, _int)) { Type = _int }, new HConst(0, _int)) { Type = _bool });
