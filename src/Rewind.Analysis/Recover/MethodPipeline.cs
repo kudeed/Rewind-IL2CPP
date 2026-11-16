@@ -302,6 +302,7 @@ public sealed class MethodPipeline
             _inlineFolding.Run(result);
         }
         AccessorFolding.Run(result, _program);
+        LibraryInternals.Run(result, _program);
         InitializerOrder.Run(result);
         UnsetLocals.Run(result);
         FlagMarkers(result);
