@@ -39,7 +39,7 @@ public sealed class DecompileResult
 {
     public int Methods, Recovered, Clean, WithGaps, NotEmitted, Crashed;
     /// <summary>Methods of generic types and generic methods: with a body their reference-type instantiations share, and how many of those were recovered completely.</summary>
-    public int GenericShared, GenericClean;
+    public int GenericShared, GenericClean, GenericWithGaps;
     public int Types, TypesWithErrors;
     public Dictionary<string, int> EmitFailures = [];
     public List<string> AssembliesWritten = [];
@@ -66,14 +66,16 @@ public static class Decompiler
             var bodies = new BodyEmitter(emitter, model) { RawAllocator = program.RawAllocator, TypeFromHandle = program.TypeFromHandle };
             var pipeline = new MethodPipeline(program);
             bool genericBodies = Environment.GetEnvironmentVariable("REWIND_NO_GENERIC_BODIES") == null;
+            bool genericGaps = Environment.GetEnvironmentVariable("REWIND_NO_GENERIC_GAPS") == null;
             foreach (MethodDef method in model.Methods)
             {
                 if (!selected.Contains(method.DeclaringType.Assembly)) continue;
                 if (!AssemblyEmitter.HasIlBody(method)) continue;
                 // A generic definition has no single compiled body; only its instantiations do. The one that its
                 // instantiations over reference types share does the same whatever those types are: recovered
-                // with the definition's own type parameters as the arguments, it is the definition's body. It is
-                // taken only where nothing in it is left open; otherwise the placeholder stays.
+                // with the definition's own type parameters as the arguments, it is the definition's body. Where
+                // parts of it are left open they are marked as in any other method (the placeholder said nothing
+                // of what the method does; what was recovered around a gap does).
                 if (method.DeclaringType.GenericParameters.Length != 0 || method.GenericParameters.Length != 0)
                 {
                     if (!genericBodies || SharedBody(model, program, method) is not { } open) continue;
@@ -84,11 +86,12 @@ public static class Decompiler
                         if (generic.Problems.Count != 0)
                         {
                             report.AppendLine($"generic, gaps\t{method.FullName}\t{string.Join(" | ", generic.Problems.Distinct().Take(6))}");
-                            continue;
+                            if (!genericGaps) continue;
                         }
                         string? refused = bodies.Emit(method, generic);
-                        if (refused == null) result.GenericClean++;
-                        else report.AppendLine($"generic, not emitted\t{method.FullName}\t{refused}");
+                        if (refused != null) report.AppendLine($"generic, not emitted\t{method.FullName}\t{refused}");
+                        else if (generic.Problems.Count == 0) result.GenericClean++;
+                        else result.GenericWithGaps++;
                     }
                     catch (Exception e)
                     {
@@ -125,7 +128,8 @@ public static class Decompiler
             options.Log($"method bodies: {result.Methods} with native code, {result.Clean} recovered completely, {result.WithGaps} with gaps marked in the output, " +
                         $"{result.NotEmitted + result.Crashed} left as stubs ({sw.ElapsedMilliseconds} ms)");
             if (result.GenericShared != 0)
-                options.Log($"generic definitions: {result.GenericShared} with a body shared by their reference-type instantiations, {result.GenericClean} of them recovered completely");
+                options.Log($"generic definitions: {result.GenericShared} with a body shared by their reference-type instantiations, {result.GenericClean} of them recovered completely, " +
+                            $"{result.GenericWithGaps} with gaps marked in the output");
         }
 
         sw.Restart();
@@ -265,6 +269,7 @@ public static class Decompiler
                 while (work.TryDequeue(out var item))
                 {
                     string text;
+                    bool failed = false;
                     try
                     {
                         text = decompiler.DecompileTypeAsString(item.Name);
