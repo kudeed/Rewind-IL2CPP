@@ -58,7 +58,7 @@ public static class HelperDiscovery
         DiscoveredHelpers? best = null;
         foreach (var (file, library, exact) in libraries.OrderByDescending(l => l.Exact))
         {
-            RuntimeHelpers helpers = library.Match(index, image, candidates, out HelperMatchReport report);
+            RuntimeHelpers helpers = library.Match(index, image, candidates, out HelperMatchReport report, context.FunctionStarts.Where(context.IsManaged));
             int kinds = helpers.ByAddress.Values.Select(i => i.Kind).Distinct().Count();
             log($"signatures {Path.GetFileName(file)} (Unity {library.Unity}): {kinds} kinds of support function identified at {helpers.ByAddress.Count} addresses");
             if (best == null || kinds > best.Kinds)

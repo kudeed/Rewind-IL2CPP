@@ -37,7 +37,8 @@ internal static class LiftLab
             context.DiscoverCallTargets();
             var index = new Rewind.Analysis.Runtime.CodeIndex(context);
             var library = Rewind.Analysis.Runtime.HelperLibrary.Load(symbolsPath);
-            var matched = library.Match(index, model.Image, context.FunctionStarts.Where(a => !context.IsManaged(a)), out var report);
+            var matched = library.Match(index, model.Image, context.FunctionStarts.Where(a => !context.IsManaged(a)), out var report,
+                context.FunctionStarts.Where(context.IsManaged));
             Console.WriteLine($"helpers from {Path.GetFileName(symbolsPath)}: {report}");
             var watch = Stopwatch.StartNew();
             var analysis = new ProgramAnalysis(model, matched, context);

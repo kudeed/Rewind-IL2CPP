@@ -91,7 +91,8 @@ internal static class SigLab
         Console.WriteLine($"library: {library.Entries.Count} signatures from Unity {library.Unity} {library.Platform}/{library.Arch}");
         var (context, index) = Open(target);
         var sw = Stopwatch.StartNew();
-        RuntimeHelpers matched = library.Match(index, target.Image, context.FunctionStarts.Where(a => !context.IsManaged(a)), out HelperMatchReport report);
+        RuntimeHelpers matched = library.Match(index, target.Image, context.FunctionStarts.Where(a => !context.IsManaged(a)), out HelperMatchReport report,
+            context.FunctionStarts.Where(context.IsManaged));
         Console.WriteLine($"{report} ({sw.ElapsedMilliseconds} ms)");
         // What matters is whether each kind of helper was found at all; a library holds several variants of each.
         var identifiedKinds = matched.ByAddress.Values.GroupBy(i => i.Kind).ToDictionary(g => g.Key, g => g.Count());
