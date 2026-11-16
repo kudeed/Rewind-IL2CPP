@@ -1675,7 +1675,10 @@ public sealed partial class HirBuilder
         switch (place)
         {
             case PLocation loc:
-                if (size == 8 && ReferenceEquals(loc.Type, _long) && IsFrameAddress(n.In[0], out int slotAt) && !_frameTypes.ContainsKey(slotAt) && !_rawCells.ContainsKey(slotAt))
+                // (Bytes read at other widths as well are loose bits - unless a struct of all eight is stored whole:
+                // its fields are what the narrower reads take.)
+                if (size == 8 && ReferenceEquals(loc.Type, _long) && IsFrameAddress(n.In[0], out int slotAt) && !_frameTypes.ContainsKey(slotAt) &&
+                    (!_rawCells.ContainsKey(slotAt) || (!NoStructVotes && Eval(valueNode) is SVal { Type: { } whole } && IsStructType(whole) && _p.Layouts.SizeOf(whole) is { Known: true, Size: 8 })))
                     VoteFrameType(slotAt, valueNode);
                 // A struct written through a pointer to something else of its size: for this write the pointer
                 // is a pointer to that struct ("*(NetworkBool*)(Ptr + 4) = value").
@@ -1891,6 +1894,8 @@ public sealed partial class HirBuilder
     /// An untyped 8-byte slot written with object references of one type (and nothing else but null) holds that
     /// type: the compiler keeps a reference local in memory (around a try region, for instance).
     /// </summary>
+    private static readonly bool NoStructVotes = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_SLOT_VOTES") != null;
+
     private void VoteFrameType(int offset, Node value)
     {
         if (value.IsConst && value.Imm == 0) return; // null fits any reference type
@@ -1900,7 +1905,9 @@ public sealed partial class HirBuilder
             SNewObject o => o.Type,
             _ => null,
         };
-        TypeSig vote = type != null && IsReference(type) && !Open(type) && Nameable(type) ? type : _long;
+        // (A struct of just those eight bytes stored whole - a call's Nullable<float>, say - holds the slot as well.)
+        bool wholeStruct = !NoStructVotes && type != null && IsStructType(type) && _p.Layouts.SizeOf(type) is { Known: true, Size: 8 };
+        TypeSig vote = type != null && (IsReference(type) || wholeStruct) && !Open(type) && Nameable(type) ? type : _long;
         if (!_frameVotes.TryGetValue(offset, out HashSet<TypeSig>? votes)) _frameVotes[offset] = votes = [];
         votes.Add(vote);
     }

@@ -187,23 +187,24 @@ public sealed partial class HirBuilder
                             else
                             {
                                 // Of the methods that share the code, only those this code could call say anything:
-                                // the first of them that takes a pointer there. Where many do (an empty function
-                                // serves thousands of methods), the first is a guess unless they all say the same;
-                                // which was called is then decided with the call, and the type with it.
+                                // the first of them that takes a pointer there, where few do. Where more do (an empty
+                                // function serves thousands of methods), the first is a guess unless they all say the
+                                // same; which was called is then decided with the call, and the type with it.
                                 var pointees = new List<TypeSig>();
                                 bool differ = false;
+                                int wanted = SharedPointeeLimit == int.MaxValue ? 1 : 64;
                                 void Add(TypeSig t)
                                 {
                                     if (pointees.Count != 0 && !ReferenceEquals(t, pointees[0]) && t.Key != pointees[0].Key) differ = true;
                                     pointees.Add(t);
                                 }
                                 foreach (MethodDef m in target.Methods)
-                                    if (pointees.Count < 64 && Reachable(m.DeclaringType.Assembly) && PointeeOf(_p.Abi.For(m, [], []), position) is { } t)
+                                    if (pointees.Count < wanted && Reachable(m.DeclaringType.Assembly) && PointeeOf(_p.Abi.For(m, [], []), position) is { } t)
                                         Add(t);
                                 foreach (MethodInst inst in target.Insts)
-                                    if (pointees.Count < 64 && Reachable(inst.Method.DeclaringType.Assembly) && PointeeOf(_p.Abi.For(inst), position) is { } t)
+                                    if (pointees.Count < wanted && Reachable(inst.Method.DeclaringType.Assembly) && PointeeOf(_p.Abi.For(inst), position) is { } t)
                                         Add(t);
-                                if (pointees.Count != 0 && (pointees.Count <= ManySharing || !differ)) type = pointees[0];
+                                if (pointees.Count != 0 && (pointees.Count <= SharedPointeeLimit || !differ)) type = pointees[0];
                             }
                         }
                     }
@@ -693,8 +694,8 @@ public sealed partial class HirBuilder
         return score;
     }
 
-    /// <summary>More methods than this sharing one piece of code (see InferFrameTypes): the first of them is a guess.</summary>
-    private static readonly int ManySharing = int.TryParse(Environment.GetEnvironmentVariable("REWIND_SHARED_POINTEE_LIMIT"), out int limit) ? limit : 2;
+    /// <summary>More methods than this taking a pointer where one piece of code they share is handed one (see InferFrameTypes): the first of them is a guess.</summary>
+    private static readonly int SharedPointeeLimit = int.TryParse(Environment.GetEnvironmentVariable("REWIND_SHARED_POINTEE_LIMIT"), out int limit) ? limit : 2;
     private static readonly bool NoReachableAssemblies = Environment.GetEnvironmentVariable("REWIND_NO_REACHABLE_ASSEMBLIES") != null;
 
     /// <summary>
