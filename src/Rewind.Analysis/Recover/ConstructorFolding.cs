@@ -34,7 +34,8 @@ internal static partial class ConstructorFolding
                 if (block.Statements[i] is not HAssign { Target: HLocal target, Value: HTypeExpr { Op: HTypeOp.Allocate } allocation }) continue;
                 string problem = $"the constructor of {allocation.Target.ShortName} was inlined and could not be folded back";
                 string note = $"the constructor of {allocation.Target.ShortName} was inlined here; the object is allocated raw and its statements follow";
-                if (TryFold(block, i, target, allocation.Target, program, pipeline) || TryFoldChain(method, block, i, target, allocation.Target, program, pipeline))
+                if (TryFold(block, i, target, allocation.Target, program, pipeline) || TryFoldChain(method, block, i, target, allocation.Target, program, pipeline) ||
+                    TryFoldAround(block, i, target, allocation.Target, program, pipeline))
                 {
                     if (again)
                     {
@@ -176,6 +177,94 @@ internal static partial class ConstructorFolding
             a = b;
         }
         return unifier;
+    }
+
+    private static readonly bool NoAround = Environment.GetEnvironmentVariable("REWIND_NO_CONSTRUCTOR_INTERLEAVING") != null;
+
+    /// <summary>
+    /// A constructor whose statements have the creating code's own stores in between: "new d__12(0) {
+    /// &lt;&gt;4__this = this }" with the compiler storing &lt;&gt;4__this before the constructor's last store. Both go
+    /// into an object nothing else can see yet, so the order is the compiler's choice. A store of the site is
+    /// passed over when it comes after the base constructor has run, goes into a field the constructor's
+    /// statements never name, and stores a constant, an argument or a plain local; it then follows "new".
+    /// </summary>
+    private static bool TryFoldAround(HBlock block, int at, HLocal target, TypeSig type, ProgramAnalysis program, MethodPipeline pipeline)
+    {
+        if (NoAround || type.Definition is not { IsValueType: false } definition) return false;
+        TypeSig[] classArguments = type is GenericInstSig g ? g.Arguments : [];
+        List<HStmt> site = block.Statements;
+        HVar created = target.Variable;
+        bool IsCreated(HExpr? e) => e is HLocal l && ReferenceEquals(l.Variable, created);
+        foreach (MethodDef constructor in definition.Methods)
+        {
+            if (constructor.Name != ".ctor" || constructor.IsStatic) continue;
+            if (pipeline.ConstructorBody(constructor, classArguments) is not { } body) continue;
+            List<HStmt> statements = body.Blocks[0].Statements;
+            int length = statements.Count - 1;
+            if (length < 2) continue;
+            // The fields the constructor's statements name, read or written.
+            var named = new HashSet<FieldDef>();
+            foreach (HStmt s in statements)
+                FinallyFolding.Visit(s, e => { if (e is HField f) named.Add(f.Field); });
+            int start = at + 1;
+            if (start >= site.Count) continue;
+            var picked = new List<int>();
+            bool passedBase = false, skipped = false;
+            for (int j = start; j < site.Count && picked.Count < length && j - start < length + 8; j++)
+            {
+                HStmt s = site[j];
+                if (passedBase && picked.Count > 0 && s is HAssign { Target: HField { Object: var o } field, Value: HConst or HArg or HLocal } foreign &&
+                    IsCreated(o) && !named.Contains(field.Field) && !field.Field.IsStatic &&
+                    !(foreign.Value is HLocal { Variable: var v } && (v.AddressTaken || ReferenceEquals(v, created))))
+                {
+                    skipped = true;
+                    continue;
+                }
+                if (s is not (HAssign or HEval)) break;
+                picked.Add(j);
+                if (s is HEval { Expression: HCall { Method.Name: ".ctor", This: var self } } && IsCreated(self)) passedBase = true;
+            }
+            if (!skipped || picked.Count != length) continue;
+            var gathered = picked.Select(k => site[k]).ToList();
+            // (A local stored by a passed-over store keeps its value: none of the constructor's statements give it one.)
+            var moved = new HashSet<HVar>();
+            for (int j = picked[0]; j < picked[^1]; j++)
+                if (!picked.Contains(j) && site[j] is HAssign { Value: HLocal { Variable: var kept } }) moved.Add(kept);
+            if (gathered.Any(s => s is HAssign { Target: HLocal { Variable: var given } } && moved.Contains(given))) continue;
+            var unifier = new Unifier(created, constructor.Parameters.Length) { Constructor = constructor, Quiet = c => QuietConstructor(c, pipeline) };
+            bool matched = true;
+            for (int k = 0; k < length && matched; k++) matched = unifier.Statement(statements[k], gathered[k], k);
+            if (!matched && Reordered(statements, length, gathered, 0, created, constructor.Parameters.Length, pipeline) is { } other)
+            {
+                unifier = other;
+                unifier.Quiet = c => QuietConstructor(c, pipeline);
+                matched = true;
+            }
+            if (!matched || !unifier.ArgumentsAreValid(gathered, 0, length)) continue;
+            var arguments = new HExpr[constructor.Parameters.Length];
+            for (int i = 0; i < arguments.Length; i++)
+            {
+                TypeSig parameter = constructor.Parameters[i].Type;
+                if (classArguments.Length != 0) parameter = program.Model.Sigs.Substitute(parameter, classArguments, []);
+                arguments[i] = unifier.Arguments[i] ?? (parameter.IsValueType || parameter is GenericParamSig
+                    ? new HTypeExpr(HTypeOp.Default, parameter, null) { Type = parameter }
+                    : new HConst(null, parameter));
+            }
+            var creation = new HAssign(target, new HNewObject
+            {
+                Constructor = constructor,
+                DeclaringType = type is GenericInstSig ? type : null,
+                Arguments = arguments,
+                Type = type,
+            })
+            { Address = site[at].Address };
+            int first = picked[0];
+            for (int k = picked.Count - 1; k >= 0; k--) site.RemoveAt(picked[k]);
+            site.Insert(first, creation);
+            site.RemoveAt(at);
+            return true;
+        }
+        return false;
     }
 
     private static readonly bool NoJoinTails = Environment.GetEnvironmentVariable("REWIND_NO_JOINED_CONSTRUCTORS") != null;
