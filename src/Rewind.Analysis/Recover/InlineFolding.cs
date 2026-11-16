@@ -1154,6 +1154,8 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                     foreach (Template template in candidates)
                     {
                         if (!template.Members.Contains(anchor) || !usable(template)) continue;
+                        // The call put back is named in this assembly's code: its class must be one that code can name.
+                        if (!AssemblyScope.Names(method.Method.DeclaringType.Assembly, template.Method.DeclaringType.Assembly)) continue;
                         if (Tracing(template.Method)) Console.Error.WriteLine($"[inline] {method.Method.Name}: trying {template.Method.Name}{(template.Flow != null ? " (with branches)" : "")} for {anchor} at L{block.Id}:{i}");
                         counts ??= Counts.Of(method);
                         _partly = false;
