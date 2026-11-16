@@ -1685,13 +1685,26 @@ public sealed partial class HirBuilder
     private static readonly bool NoRetypedWrites = Environment.GetEnvironmentVariable("REWIND_NO_RETYPED_WRITES") != null;
     private static readonly bool NoDeclaredFloats = Environment.GetEnvironmentVariable("REWIND_NO_DECLARED_FLOATS") != null;
 
+    private static readonly bool NoBoxLifetimes = Environment.GetEnvironmentVariable("REWIND_NO_BOX_LIFETIMES") != null;
+
     private void EmitStore(Node n)
     {
         // The header of a value boxed in place (its class, and the "not a real object" mark) is not a store
         // the program makes.
         if (_fakeBoxes.Count != 0 && IsFrameAddress(n.In[0], out int boxOffset) &&
             (_fakeBoxes.ContainsKey(boxOffset) || _fakeBoxes.ContainsKey(boxOffset - _ptr)))
-            return;
+        {
+            // (What is written there for the box: the class, and the mark - or, through the runtime's own
+            // constructor, nothing at all here.)
+            bool first = _fakeBoxes.ContainsKey(boxOffset);
+            Node written = n.In[1];
+            bool header = first ? written.Op == Op.SlotValue : written.IsConst && written.Imm == -1;
+            if (header || NoBoxLifetimes) return;
+            // Anything else stored in those bytes is the program's: the compiler keeps another local there
+            // while no box is ("key.message = message", then - later - the class of an enum boxed to be printed).
+            // Dropped, that local read as never set.
+            FrameConflicts.Add(first ? boxOffset : boxOffset - _ptr);
+        }
         if (_spillStores.Contains(n)) return; // a parked stack address (see PlanAddressSpills)
         if (_caughtStores.Contains(n)) return; // the catch object (see PlanCaughtSlots)
         Node valueNode = n.In[1];
@@ -1948,6 +1961,8 @@ public sealed partial class HirBuilder
         votes.Add(vote);
     }
 
+    private static readonly bool NoWidePairs = Environment.GetEnvironmentVariable("REWIND_NO_WIDE_PAIRS") != null;
+
     private Place FramePlace(int offset, int size)
     {
         // Prefer a typed object that covers this offset.
@@ -1958,6 +1973,12 @@ public sealed partial class HirBuilder
             if (offset >= start + Math.Max(1, typeSize)) continue;
             var local = new HLocal(FrameVar(start, type)) { Type = type };
             bool isStruct = type.Definition is { IsValueType: true, IsEnum: false } && type is not PrimitiveSig;
+            // Eight bytes moved where a variable of four is, with another of four right behind it: the two
+            // together (the x and y of a vector kept as separate numbers, copied in one go). Taken as the first
+            // alone, the second was never set.
+            if (!NoWidePairs && offset == start && !isStruct && size == 8 && typeSize == 4 &&
+                _frameTypes.TryGetValue(start + 4, out TypeSig? behind) && !IsStructType(behind) && _p.Layouts.SizeOf(behind) is { Known: true, Size: 4 })
+                return new PPair(local, new HLocal(FrameVar(start + 4, behind)) { Type = behind });
             if (offset == start && (!isStruct || size < 0 || size == typeSize)) return new PLocation(local, type);
             if (isStruct)
             {
