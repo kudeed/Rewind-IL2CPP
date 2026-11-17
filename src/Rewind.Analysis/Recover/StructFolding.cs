@@ -35,6 +35,7 @@ internal static class StructFolding
         // (After the folding: a store that repeats one before may still be part of a whole made anew.)
         if (!NoRepeatedStores && DropRepeatedStores(method, program)) any = true;
         if (!NoUnionCopies && UnionCopies(method, program, pipeline)) any = true;
+        if (!NoUnionCopies && !NoHeldCopies && HeldUnionCopies(method, program, pipeline)) any = true;
         if (ForwardWholeValues(method, pipeline)) any = true;
         if (any) HirCleanup.Run(method);
     }
@@ -1181,7 +1182,66 @@ internal static class StructFolding
         return any;
     }
 
-    private static HExpr? CopiedBytes(HNewObject made, ProgramAnalysis program, MethodPipeline pipeline)
+    private static readonly bool NoHeldCopies = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_HELD_COPIES") != null;
+
+    /// <summary>
+    /// The same copy with other things worked out in between: the bytes are read into registers where the source
+    /// names the struct ("t1 = s._data0; t2 = s._data1"), and the copy is put together where it is handed on
+    /// ("f(new S(t1, t2), ..)"). The struct is taken whole where its bytes were read - "c = s" - and the copy
+    /// used where it was made, so that it is still read when the source read it. The struct must not change
+    /// between the first of the reads and the last.
+    /// </summary>
+    private static bool HeldUnionCopies(HMethod method, ProgramAnalysis program, MethodPipeline pipeline)
+    {
+        bool any = false;
+        Usage usage = Usage.Of(method);
+        foreach (HBlock block in method.Blocks)
+        {
+            List<HStmt> statements = block.Statements;
+            for (int i = 0; i < statements.Count; i++)
+            {
+                var made = new List<HNewObject>();
+                FinallyFolding.Visit(statements[i], e =>
+                {
+                    if (e is HNewObject { Arguments.Length: > 0 } n && IsStruct(n.Type) && n.Arguments.Any(a => a is HLocal)) made.Add(n);
+                });
+                foreach (HNewObject candidate in made)
+                {
+                    var reads = new List<int>();
+                    int at = i;
+                    HExpr? Held(HVar temp)
+                    {
+                        if (!usage.IsTemp(temp)) return null;
+                        for (int k = at - 1; k >= 0; k--)
+                            if (statements[k] is HAssign { Target: HLocal { Variable: var set }, Value: var value } && ReferenceEquals(set, temp))
+                            {
+                                if (value is not HField) return null;
+                                reads.Add(k);
+                                return value;
+                            }
+                        return null;
+                    }
+                    if (CopiedBytes(candidate, program, pipeline, Held) is not { } source || reads.Count == 0) continue;
+                    // (Every part came through a variable: a part named in place is read later than the others.)
+                    if (reads.Distinct().Count() != candidate.Arguments.Length) continue;
+                    reads.Sort();
+                    if (!Movable(source, statements, reads[0], reads[^1], null)) continue;
+                    HVar copy = method.NewLocal(candidate.Type!, "s");
+                    var whole = new HLocal(copy) { Type = candidate.Type };
+                    statements[reads[0]] = new HAssign(new HLocal(copy) { Type = candidate.Type }, source);
+                    EnumeratorLoops.Rewrite(statements[i], e => ReferenceEquals(e, candidate) ? whole : null);
+                    for (int k = reads.Count - 1; k >= 1; k--) statements.RemoveAt(reads[k]);
+                    i -= reads.Count - 1;
+                    usage = Usage.Of(method);
+                    any = true;
+                    break;
+                }
+            }
+        }
+        return any;
+    }
+
+    private static HExpr? CopiedBytes(HNewObject made, ProgramAnalysis program, MethodPipeline pipeline, Func<HVar, HExpr?>? held = null)
     {
         TypeSig type = made.Type!;
         if (type.Definition is not { } definition || (definition.Flags & TypeDef.LayoutMask) != TypeDef.ExplicitLayout) return null;
@@ -1226,6 +1286,8 @@ internal static class StructFolding
         {
             // The argument: a field of the other struct, shifted down to the bytes wanted and cut to their width.
             HExpr argument = made.Arguments[parameter];
+            // (A part read into a variable earlier: see HeldUnionCopies.)
+            if (held != null && argument is HLocal { Variable: var kept } && held(kept) is { } read0) argument = read0;
             int width = size;
             while (argument is HConv { Kind: var kind } conv)
             {

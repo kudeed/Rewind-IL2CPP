@@ -154,6 +154,7 @@ public sealed partial class HirBuilder
     /// </summary>
     private void InferFrameTypes()
     {
+        Dictionary<int, TypeSig?>? parked = NoParkedStructs ? null : ParkedStructParameters();
         foreach (Block b in _fn.Blocks)
         {
             foreach (Node call in b.Nodes)
@@ -205,6 +206,11 @@ public sealed partial class HirBuilder
                                     if (pointees.Count < wanted && Reachable(inst.Method.DeclaringType.Assembly) && PointeeOf(_p.Abi.For(inst), position) is { } t)
                                         Add(t);
                                 if (pointees.Count != 0 && (pointees.Count <= SharedPointeeLimit || !differ)) type = pointees[0];
+                                // Methods of several structs share the code: the one whose struct was put there
+                                // is the one that is called.
+                                if (differ && parked != null && parked.TryGetValue(offset, out TypeSig? held) && held != null &&
+                                    pointees.Any(t => t.Key == held.Key))
+                                    type = held;
                             }
                         }
                     }
@@ -214,6 +220,31 @@ public sealed partial class HirBuilder
         }
         SpreadFrameTypes();
         DropCoveredFrameTypes();
+    }
+
+    private static readonly bool NoParkedStructs = Environment.GetEnvironmentVariable("REWIND_NO_PARKED_STRUCTS") != null;
+
+    /// <summary>
+    /// A struct that came in a register has no address: before one of its methods can be called on it, the code
+    /// stores it on the stack. Those bytes then hold that struct, whatever else the code that is called there
+    /// could be run on. Stack offset to the struct parameter stored there whole (null: more than one kind).
+    /// </summary>
+    private Dictionary<int, TypeSig?> ParkedStructParameters()
+    {
+        var found = new Dictionary<int, TypeSig?>();
+        foreach (Block b in _fn.Blocks)
+            foreach (Node store in b.Nodes)
+            {
+                if (store.Dead || store.Op != Op.Store || !IsFrameAddress(store.In[0], out int offset)) continue;
+                Node value = store.In[1];
+                int bytes = value.Type.Bytes();
+                while (value.Op == Op.Trunc) value = value.In[0];
+                if (!_sem.TryGetValue(value, out Sem? s) || s is not SVal { Expr: HArg { Type: { } type } } || !IsStructType(type) || Open(type) || !Nameable(type))
+                    continue;
+                if (_p.Layouts.SizeOf(type) is not { Known: true } size || size.Size != bytes) continue;
+                found[offset] = found.TryGetValue(offset, out TypeSig? other) && (other == null || other.Key != type.Key) ? null : type;
+            }
+        return found;
     }
 
     /// <summary>
