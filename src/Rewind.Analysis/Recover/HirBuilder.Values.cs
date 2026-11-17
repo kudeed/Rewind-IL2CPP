@@ -738,6 +738,13 @@ public sealed partial class HirBuilder
                 return new SVal(new HConst(BitConverter.Int32BitsToSingle(i), _float));
             case SVal { Expr: HConst c } when c.Value is long l && n.Type == VT.F64:
                 return new SVal(new HConst(BitConverter.Int64BitsToDouble(l), _double));
+            // A merged value no way in gave a type (each one a number: the bits of 1f here, of -1f there),
+            // read as a float: it is a float. Declared as a number all the same, it is noted for the next build
+            // to declare it a float (RefineFloatPhis); until then its bits are read as one.
+            case SVal { Expr: HLocal { Variable: var merged } } v when v.Type == null && !NoFloatPhiBits && _phiOfVar.TryGetValue(merged, out Node? phi):
+                _floatUses[phi] = (_floatUses.GetValueOrDefault(phi).Count + 1, target);
+                if (IsFloat(merged.Type)) return new SVal(new HLocal(merged) { Type = merged.Type });
+                return new SVal(ValueFromBits(new HLocal(merged) { Type = merged.Type }, target, n.Type == VT.F32 ? 4 : 8));
             case SVal v when v.Type == null:
                 // An untyped temporary whose only meaning so far is "bits": it is the float itself.
                 v.Expr.Type = target;
@@ -800,6 +807,7 @@ public sealed partial class HirBuilder
     private readonly record struct AddressParts(Node? Base, Sem? BaseSem, long Offset, Node? Index, long Scale);
 
     private static readonly bool NoChosenFields = Environment.GetEnvironmentVariable("REWIND_NO_CHOSEN_FIELDS") != null;
+    private static readonly bool NoFloatPhiBits = Environment.GetEnvironmentVariable("REWIND_NO_FLOAT_PHI_BITS") != null;
 
     /// <summary>
     /// "c ? o.b : o.a" of two fields side by side: the C++ compiler reads the field at a.Offset + a.Scale * c,
