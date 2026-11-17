@@ -32,6 +32,11 @@ public sealed class DecompileOptions
     /// code has exactly the shape the C# compiler gives such a class; the class itself is always what ran.
     /// </summary>
     public bool StateMachines;
+    /// <summary>
+    /// How many threads recover method bodies; zero for the default (REWIND_THREADS, else one per processor).
+    /// What comes out is the same for any number.
+    /// </summary>
+    public int Threads;
     public Action<string> Log = _ => { };
 }
 
@@ -64,67 +69,91 @@ public static class Decompiler
             sw.Restart();
             foreach (Rewind.Analysis.Runtime.PInvokeImport import in program.PInvokeDeclarations) emitter.SetImport(import);
             var bodies = new BodyEmitter(emitter, model) { RawAllocator = program.RawAllocator, TypeFromHandle = program.TypeFromHandle };
-            var pipeline = new MethodPipeline(program);
             bool genericBodies = Environment.GetEnvironmentVariable("REWIND_NO_GENERIC_BODIES") == null;
             bool genericGaps = Environment.GetEnvironmentVariable("REWIND_NO_GENERIC_GAPS") == null;
+            // What is to be recovered, in the order of the methods: a method's own code, or - for a generic
+            // definition, which has no single compiled body, only its instantiations have - the one that its
+            // instantiations over reference types share. That one does the same whatever those types are:
+            // recovered with the definition's own type parameters as the arguments, it is the definition's body.
+            // Where parts of it are left open they are marked as in any other method (the placeholder said
+            // nothing of what the method does; what was recovered around a gap does).
+            var work = new List<(MethodDef Method, MethodInst? Shared)>();
             foreach (MethodDef method in model.Methods)
             {
                 if (!selected.Contains(method.DeclaringType.Assembly)) continue;
                 if (!AssemblyEmitter.HasIlBody(method)) continue;
-                // A generic definition has no single compiled body; only its instantiations do. The one that its
-                // instantiations over reference types share does the same whatever those types are: recovered
-                // with the definition's own type parameters as the arguments, it is the definition's body. Where
-                // parts of it are left open they are marked as in any other method (the placeholder said nothing
-                // of what the method does; what was recovered around a gap does).
                 if (method.DeclaringType.GenericParameters.Length != 0 || method.GenericParameters.Length != 0)
                 {
-                    if (!genericBodies || SharedBody(model, program, method) is not { } open) continue;
-                    result.GenericShared++;
+                    if (genericBodies && SharedBody(model, program, method) is { } open) work.Add((method, open));
+                }
+                else if (method.Address != 0) work.Add((method, null));
+            }
+            // Recovered on several threads; written into the assemblies, counted and reported here, one after
+            // the other in the order of the methods, so that the output does not depend on the threads.
+            RecoveryThreads.Run(program, work.Count, options.Threads,
+                (pipeline, i) =>
+                {
                     try
                     {
-                        HMethod generic = pipeline.Recover(open);
-                        if (generic.Problems.Count != 0)
-                        {
-                            report.AppendLine($"generic, gaps\t{method.FullName}\t{string.Join(" | ", generic.Problems.Distinct().Take(6))}");
-                            if (!genericGaps) continue;
-                        }
-                        string? refused = bodies.Emit(method, generic);
-                        if (refused != null) report.AppendLine($"generic, not emitted\t{method.FullName}\t{refused}");
-                        else if (generic.Problems.Count == 0) result.GenericClean++;
-                        else result.GenericWithGaps++;
+                        return (Recovered: work[i].Shared is { } open ? pipeline.Recover(open) : pipeline.Recover(work[i].Method), Failure: (Exception?)null);
                     }
                     catch (Exception e)
                     {
-                        report.AppendLine($"generic, failed\t{method.FullName}\t{e.GetType().Name}: {e.Message}");
+                        return (Recovered: (HMethod?)null, Failure: e);
                     }
-                    continue;
-                }
-                if (method.Address == 0) continue;
-                result.Methods++;
-                try
+                },
+                (i, recovered) =>
                 {
-                    HMethod h = pipeline.Recover(method);
-                    result.Recovered++;
-                    string? why = bodies.Emit(method, h);
-                    if (why != null)
+                    MethodDef method = work[i].Method;
+                    if (work[i].Shared != null)
                     {
-                        result.NotEmitted++;
-                        result.EmitFailures[why] = result.EmitFailures.GetValueOrDefault(why) + 1;
-                        report.AppendLine($"not emitted\t{method.FullName}\t{why}");
+                        result.GenericShared++;
+                        try
+                        {
+                            if (recovered.Failure != null) throw recovered.Failure;
+                            HMethod generic = recovered.Recovered!;
+                            if (generic.Problems.Count != 0)
+                            {
+                                report.AppendLine($"generic, gaps\t{method.FullName}\t{string.Join(" | ", generic.Problems.Distinct().Take(6))}");
+                                if (!genericGaps) return;
+                            }
+                            string? refused = bodies.Emit(method, generic);
+                            if (refused != null) report.AppendLine($"generic, not emitted\t{method.FullName}\t{refused}");
+                            else if (generic.Problems.Count == 0) result.GenericClean++;
+                            else result.GenericWithGaps++;
+                        }
+                        catch (Exception e)
+                        {
+                            report.AppendLine($"generic, failed\t{method.FullName}\t{e.GetType().Name}: {e.Message}");
+                        }
+                        return;
                     }
-                    else if (h.Problems.Count == 0) result.Clean++;
-                    else
+                    result.Methods++;
+                    try
                     {
-                        result.WithGaps++;
-                        report.AppendLine($"gaps\t{method.FullName}\t{string.Join(" | ", h.Problems.Distinct().Take(6))}");
+                        if (recovered.Failure != null) throw recovered.Failure;
+                        HMethod h = recovered.Recovered!;
+                        result.Recovered++;
+                        string? why = bodies.Emit(method, h);
+                        if (why != null)
+                        {
+                            result.NotEmitted++;
+                            result.EmitFailures[why] = result.EmitFailures.GetValueOrDefault(why) + 1;
+                            report.AppendLine($"not emitted\t{method.FullName}\t{why}");
+                        }
+                        else if (h.Problems.Count == 0) result.Clean++;
+                        else
+                        {
+                            result.WithGaps++;
+                            report.AppendLine($"gaps\t{method.FullName}\t{string.Join(" | ", h.Problems.Distinct().Take(6))}");
+                        }
                     }
-                }
-                catch (Exception e)
-                {
-                    result.Crashed++;
-                    report.AppendLine($"failed\t{method.FullName}\t{e.GetType().Name}: {e.Message}");
-                }
-            }
+                    catch (Exception e)
+                    {
+                        result.Crashed++;
+                        report.AppendLine($"failed\t{method.FullName}\t{e.GetType().Name}: {e.Message}");
+                    }
+                });
             options.Log($"method bodies: {result.Methods} with native code, {result.Clean} recovered completely, {result.WithGaps} with gaps marked in the output, " +
                         $"{result.NotEmitted + result.Crashed} left as stubs ({sw.ElapsedMilliseconds} ms)");
             if (result.GenericShared != 0)

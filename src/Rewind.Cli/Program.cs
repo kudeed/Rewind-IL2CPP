@@ -34,6 +34,9 @@ internal static class Program
           --state-machines       decompile: write iterators and async methods as the classes the compiler made of
                                  them (no "yield return" or "await")
           --signatures <path>    decompile: signature file or folder for recognizing runtime functions
+          --threads <n>          decompile: recover method bodies on this many threads (default: one per processor,
+                                 or REWIND_THREADS). The output is the same for any number; 1 keeps the debugging
+                                 traces of one method together
           -v, --verbose          print progress details
         """;
 
@@ -42,6 +45,7 @@ internal static class Program
         public string Command = "";
         public string? Input, OutDir, Metadata, Binary, Abi, Unity, Signatures, CSharp;
         public bool StateMachines;
+        public int Threads;
         public List<string> Assemblies = [];
         public bool Verbose, NoSource;
     }
@@ -117,6 +121,13 @@ internal static class Program
                 case "--signatures": o.Signatures = Next(); break;
                 case "--csharp": o.CSharp = Next(); break;
                 case "--state-machines": o.StateMachines = true; break;
+                case "--threads":
+                    if (!int.TryParse(Next(), out o.Threads) || o.Threads < 1)
+                    {
+                        Console.Error.WriteLine("error: --threads takes a number of threads, 1 or more");
+                        return null;
+                    }
+                    break;
                 case "--assembly": if (Next() is { } name) o.Assemblies.Add(name); break;
                 case "--no-source": o.NoSource = true; break;
                 case "-v" or "--verbose": o.Verbose = true; break;
@@ -218,6 +229,7 @@ internal static class Program
         };
         if (o.CSharp != null) options.Language = ParseLanguage(o.CSharp);
         options.StateMachines = o.StateMachines;
+        options.Threads = o.Threads;
         if (o.Assemblies.Count != 0)
         {
             var wanted = new HashSet<string>(o.Assemblies.Select(a => a.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ? a[..^4] : a), StringComparer.OrdinalIgnoreCase);
