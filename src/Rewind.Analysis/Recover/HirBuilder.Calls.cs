@@ -702,6 +702,8 @@ public sealed partial class HirBuilder
                 // a value boxed in place as an object).
                 SFrame f when _fakeBoxes.ContainsKey(f.Offset) => _object,
                 SFrame f when _frameTypes.TryGetValue(f.Offset, out TypeSig? local) => local,
+                // Stack memory nothing has typed yet: the struct that was stored there whole.
+                SFrame f when p.Role == ParamRole.This && StoredStruct(f.Offset) is { } held => held,
                 _ => null,
             };
             if (actual == null) continue;
@@ -745,7 +747,47 @@ public sealed partial class HirBuilder
     /// </summary>
     private bool Reachable(AssemblyModel assembly) => NoReachableAssemblies || AssemblyScope.Reaches(_method.DeclaringType.Assembly, assembly);
 
+    private static readonly bool NoStoredStructs = Environment.GetEnvironmentVariable("REWIND_NO_STORED_STRUCTS") != null;
+    private Dictionary<int, List<Node>>? _frameStores;
+
+    /// <summary>
+    /// The struct type of what has been stored whole at a stack offset so far (a call's result, a field read
+    /// in one piece), when every such store agrees; null when there is none or they differ. A struct that
+    /// lives in a register is put on the stack before a method is called on it, and of the methods that share
+    /// the called code, the one of that struct is meant.
+    /// </summary>
+    private TypeSig? StoredStruct(int offset)
+    {
+        if (NoStoredStructs) return null;
+        if (_frameStores == null)
+        {
+            _frameStores = [];
+            foreach (Block b in _fn.Blocks)
+                foreach (Node store in b.Nodes)
+                {
+                    if (store.Dead || store.Op != Op.Store || !IsFrameAddress(store.In[0], out int at)) continue;
+                    if (!_frameStores.TryGetValue(at, out List<Node>? list)) _frameStores[at] = list = [];
+                    list.Add(store);
+                }
+        }
+        if (!_frameStores.TryGetValue(offset, out List<Node>? stores)) return null;
+        TypeSig? found = null;
+        foreach (Node store in stores)
+        {
+            Node value = store.In[1];
+            int bytes = value.Type.Bytes();
+            while (value.Op == Op.Trunc) value = value.In[0];
+            // (What has no meaning yet is stored later than the call being looked at.)
+            if (!_sem.TryGetValue(value, out Sem? s) || s is not SVal { Type: { } type } || !IsStructType(type) || Open(type) || !Nameable(type)) continue;
+            if (_p.Layouts.SizeOf(type) is not { Known: true } size || size.Size != bytes) continue;
+            if (found != null && found.Key != type.Key) return null;
+            found = type;
+        }
+        return found;
+    }
+
     private static readonly bool NoResultPlaces = Environment.GetEnvironmentVariable("REWIND_NO_RESULT_PLACES") != null;
+    private static readonly bool NoReturnedResults = Environment.GetEnvironmentVariable("REWIND_NO_RETURNED_RESULTS") != null;
     private static readonly bool NoNullDescriptors = Environment.GetEnvironmentVariable("REWIND_NO_NULL_DESCRIPTORS") != null;
     private static readonly bool NoFreshReceivers = Environment.GetEnvironmentVariable("REWIND_NO_FRESH_RECEIVERS") != null;
 
@@ -769,6 +811,10 @@ public sealed partial class HirBuilder
     {
         if (_resultPlaces.TryGetValue(call, out TypeSig? known)) return known;
         TypeSig? type = null;
+        // What a method hands back as it comes from a call is what that call gives: the result type of the
+        // method is the place.
+        TypeSig? returned = !NoReturnedResults && _abi.Return is ReturnKind.Integer or ReturnKind.StructInRegister && _abi.ReturnType is { IsVoid: false } r && !Open(r) ? r : null;
+        if (returned != null && call.Op == Op.TailCall) return _resultPlaces[call] = returned;
         if (call.Block != null && _position.ContainsKey(call) && Projections(call).TryGetValue(CallResult.IntReturn, out Node? result))
         {
             var holders = new List<Node> { result };
@@ -776,6 +822,16 @@ public sealed partial class HirBuilder
                 foreach (Node use in direct)
                     if (!use.Dead && use.Op == Op.Trunc)
                         holders.Add(use);
+            if (returned != null)
+                foreach (Node holder in holders)
+                {
+                    if (type != null || !_uses.TryGetValue(holder, out List<Node>? uses)) continue;
+                    int bytes = holder.Type.Bytes();
+                    if (!(IsReference(returned) || returned is PointerSig or ByRefSig ? bytes == 8 : _p.Layouts.SizeOf(returned) is { Known: true } size && size.Size == bytes)) continue;
+                    foreach (Node use in uses)
+                        if (!use.Dead && use.Op == Op.Return && use.In.Length != 0 && ReferenceEquals(use.In[0], holder) && ReferenceEquals(use.Block, call.Block))
+                            type = returned;
+                }
             foreach (Node holder in holders)
             {
                 if (type != null || !_uses.TryGetValue(holder, out List<Node>? uses)) continue;
