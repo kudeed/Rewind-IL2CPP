@@ -313,6 +313,29 @@ public sealed partial class HirBuilder
             PartsOf(Eval(n.In[0])) is { } together && MovedDown(together, (int)n.In[1].UImm / 8) is { } above)
             return above;
 
+        // A small struct held in a register, moved down until only its last field is left: that field. "c >> 24"
+        // of a Color32 is c.a (the fields before it are cut out of the register, see TruncSem; the last one needs
+        // no cutting).
+        if (!NoStructPieces && !NoStructTops && n.Op == Op.ShrU && n.In[1].IsConst && n.In[1].UImm is > 0 and < 64 && n.In[1].UImm % 8 == 0 && !n.In[0].IsConst &&
+            Eval(n.In[0]) is SVal { Expr: { } held } && IsStructType(held.Type) && _p.Layouts.Of(held.Type!) is { Known: true } heldLayout &&
+            heldLayout.Size == n.Type.Bytes() && (int)n.In[1].UImm / 8 is var from && from < heldLayout.Size &&
+            _p.Layouts.FieldExactly(held.Type!, from, heldLayout.Size - from) is { } top && !IsStructType(top.Type) && !IsReference(top.Type) && !IsFloat(top.Type))
+        {
+            HExpr field = new HField { Object = held, Field = top.Field, DeclaringType = held.Type, Type = top.Type };
+            // (What was moved down has zeros above it, whatever the field's sign.)
+            bool unsigned = top.Type is PrimitiveSig { Element: Il2CppTypeEnum.U1 or Il2CppTypeEnum.U2 or Il2CppTypeEnum.U4 or Il2CppTypeEnum.Boolean or Il2CppTypeEnum.Char };
+            if (!unsigned)
+                field = top.Size switch
+                {
+                    1 => new HConv(HConvKind.U1, field) { Type = _byte },
+                    2 => new HConv(HConvKind.U2, field) { Type = _ushort },
+                    4 => new HConv(HConvKind.U4, field) { Type = _uint },
+                    _ => field,
+                };
+            if (n.Type == VT.I64) field = new HConv(HConvKind.U8, field) { Type = _ulong };
+            return new SVal(field);
+        }
+
         bool isShift = n.Op is Op.Shl or Op.ShrU or Op.ShrS;
         HExpr left = IntValue(n.In[0]), right = isShift ? ShiftCount(n.In[1], n.Type.Bits()) : IntValue(n.In[1]);
         if (n.Op == Op.ShrU && n.Type == VT.I64 && right is HConst { Value: int down } && down is > 0 and < 64 && PartOfCombined(left, down, 64 - down) is { } upper)
@@ -1466,6 +1489,7 @@ public sealed partial class HirBuilder
 
     private static readonly bool NoFlaggedCasts = Environment.GetEnvironmentVariable("REWIND_NO_FLAGGED_CASTS") != null;
     private static readonly bool NoStructPieces = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_PIECES") != null;
+    private static readonly bool NoStructTops = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_TOPS") != null;
     private static readonly bool FlaggedTrace = Environment.GetEnvironmentVariable("REWIND_FLAGGED_TRACE") != null;
 
     /// <summary>
