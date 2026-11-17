@@ -368,6 +368,19 @@ public sealed class Normalizer(ProgramAnalysis program)
                         i += 2;
                         break;
                     }
+                    case HelperKind.MethodVirtualCallPointer:
+                    {
+                        // What later Unity versions do in place: read virtualMethodPointer, the second word of
+                        // the method's record.
+                        Node? method = IntArg(call, 0);
+                        if (method == null) { remove = false; break; }
+                        Node offset = _fn.NewNode(Op.Const, VT.I64, null);
+                        offset.Imm = program.Model.Image.PointerSize;
+                        Node address = NewNodeAt(b, i, Op.Add, VT.I64, call.Addr, method, offset);
+                        result = NewNodeAt(b, i + 1, Op.Load, VT.I64, call.Addr, address);
+                        i += 2;
+                        break;
+                    }
                     default:
                         remove = false;
                         break;

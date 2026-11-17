@@ -91,6 +91,11 @@ public enum HelperKind
     StoreLastError,
     /// <summary>modf(x, &amp;whole) / modff: returns the fraction of x and stores its whole part (IL2CPP's rounding uses it).</summary>
     Modf,
+    /// <summary>
+    /// il2cpp_codegen_get_virtual_call_method_pointer(method), Unity 2021: the code pointer a delegate to the method
+    /// calls. Later versions read it out of the method's record in place (virtualMethodPointer).
+    /// </summary>
+    MethodVirtualCallPointer,
 }
 
 public sealed record HelperInfo(HelperKind Kind, int IntArgs, bool NoReturn, bool ReturnsValue, string Name)
@@ -158,6 +163,7 @@ public sealed class RuntimeHelpers
         ("il2cpp_codegen_get_missing_method_exception", HelperKind.GetMissingMethodException, 1, false, true),
         ("GetInterfaceInvokeDataFromVTableSlowPath", HelperKind.InterfaceInvokeDataSlow, 3, false, true),
         ("il2cpp_codegen_get_generic_virtual_method_internal", HelperKind.GetGenericVirtualMethod, 2, false, true),
+        ("il2cpp_codegen_get_virtual_call_method_pointer", HelperKind.MethodVirtualCallPointer, 1, false, true),
         ("il2cpp_codegen_runtime_constrained_call", HelperKind.RuntimeConstrainedCall, 6, false, false),
         ("il2cpp_codegen_static_fields_for", HelperKind.StaticFieldsFor, 1, false, true),
         ("il2cpp_codegen_get_thread_static_data", HelperKind.ThreadStaticData, 1, false, true),
