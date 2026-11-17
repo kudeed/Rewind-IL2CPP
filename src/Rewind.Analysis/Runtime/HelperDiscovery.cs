@@ -1,4 +1,5 @@
 using Rewind.Binary;
+using Rewind.Metadata;
 using Rewind.Model;
 
 namespace Rewind.Analysis.Runtime;
@@ -23,6 +24,16 @@ public static class HelperDiscovery
                 if (seen.Add(Path.GetFileName(file)))
                     yield return file;
         }
+    }
+
+    /// <summary>
+    /// How far apart two Unity versions are: by release line first (2023.2 and 6000.0 are neighbours, Unity 6 being
+    /// what would have been 2023.3), then by patch number.
+    /// </summary>
+    internal static long Distance(UnityVersion a, UnityVersion b)
+    {
+        static long Line(UnityVersion v) => (v.Major >= 6000 ? 2024 + (v.Major - 6000) : v.Major) * 10L + Math.Min(v.Minor, 9);
+        return Math.Abs(Line(a) - Line(b)) * 1000 + Math.Abs(a.Build - b.Build);
     }
 
     public static DiscoveredHelpers Discover(Il2CppModel model, IEnumerable<string> signatureFiles, Action<string> log)
@@ -55,8 +66,12 @@ public static class HelperDiscovery
             libraries.Add((file, library, unity.Length != 0 && library.Unity == unity));
         }
 
+        // The library of the game's own version first, then the others from the nearest version to the farthest:
+        // of two libraries that recognize equally much, the one made from the closer runtime is taken.
+        long DistanceTo(HelperLibrary library) =>
+            model.UnityVersion is { } game && UnityVersion.TryParse(library.Unity, out UnityVersion made) ? Distance(game, made) : long.MaxValue;
         DiscoveredHelpers? best = null;
-        foreach (var (file, library, exact) in libraries.OrderByDescending(l => l.Exact))
+        foreach (var (file, library, exact) in libraries.OrderByDescending(l => l.Exact).ThenBy(l => DistanceTo(l.Library)))
         {
             RuntimeHelpers helpers = library.Match(index, image, candidates, out HelperMatchReport report, context.FunctionStarts.Where(context.IsManaged));
             int kinds = helpers.ByAddress.Values.Select(i => i.Kind).Distinct().Count();

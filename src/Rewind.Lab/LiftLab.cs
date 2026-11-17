@@ -175,6 +175,7 @@ internal static class LiftLab
         {
             Rewind.Analysis.Passes.StackSplitting.Trace = text => Console.WriteLine("  [split] " + text);
             Rewind.Analysis.Passes.ExceptionStacks.Trace = text => Console.WriteLine("  [stack] " + text);
+            Rewind.Analysis.Passes.LeaveTargets.Trace = text => Console.WriteLine("  [leave] " + text);
         }
         // Several methods at once: filters separated by '|'.
         string[] filters = filter.Split('|', StringSplitOptions.RemoveEmptyEntries);

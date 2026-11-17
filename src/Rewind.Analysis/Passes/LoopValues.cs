@@ -25,12 +25,14 @@ public static class LoopValues
         bool changed = false;
         for (int round = 0; round < 8; round++)
         {
-            bool step = MergeCongruentPhis(fn);
+            bool step = !NoSameValueMerges && FoldSameValueMerges(fn);
+            step |= MergeCongruentPhis(fn);
             step |= NarrowPhis(fn);
             step |= NarrowToObserved(fn, callObserves);
             if (step) DeadCode.Run(fn);
             step |= RewritePointerInduction(fn);
             step |= RewriteScaledOffsets(fn);
+            if (!NoDistances) step |= CancelDistances(fn);
             // Only once nothing else changes: what the others do first (two pointers found to be one) leaves
             // less to work out here. A counter of the loop's own is looked for everywhere before one is made.
             if (!step && !NoPairedPointers) step = RewritePairedPointers(fn, makeCounters: false) || (!NoMadeCounters && RewritePairedPointers(fn, makeCounters: true));
@@ -42,6 +44,86 @@ public static class LoopValues
     }
 
     // ---- shared helpers ----------------------------------------------------------------------------------------
+
+    private static readonly bool NoSameValueMerges = Environment.GetEnvironmentVariable("REWIND_NO_SAME_VALUE_MERGES") != null;
+    private static readonly bool NoDistances = Environment.GetEnvironmentVariable("REWIND_NO_DISTANCES") != null;
+
+    /// <summary>
+    /// Two arrays walked by one loop with a single pointer: the compiler keeps the address of the element of
+    /// one and how far the other array is from it ("b - a", worked out before the loop), and reaches the
+    /// other's element at "address + distance". What the distance takes off is in the address, so the sum is
+    /// the address with the other array in its place: the same element of that array.
+    /// </summary>
+    private static bool CancelDistances(Function fn)
+    {
+        bool changed = false;
+        var terms = new List<Node>();
+        void Flatten(Node n, int depth)
+        {
+            if (n.Op == Op.Add && n.In.Length == 2 && depth < 6) { Flatten(n.In[0], depth + 1); Flatten(n.In[1], depth + 1); }
+            else terms.Add(n);
+        }
+        foreach (Block block in fn.Blocks)
+            for (int k = 0; k < block.Nodes.Count; k++)
+            {
+                Node n = block.Nodes[k];
+                if (n.Dead || n.Op != Op.Add || n.Type != VT.I64 || n.In.Length != 2) continue;
+                for (int side = 0; side < 2; side++)
+                {
+                    Node distance = n.In[side], address = n.In[1 - side];
+                    if (distance.Op != Op.Sub || distance.In.Length != 2 || distance.Type != VT.I64) continue;
+                    terms.Clear();
+                    Flatten(address, 0);
+                    Node from = distance.In[1];
+                    int at = terms.FindIndex(t => ReferenceEquals(t, from) || Normalizer.SameValue(t, from));
+                    if (at < 0) continue;
+                    terms.RemoveAt(at);
+                    // The other array first, then what was added to the one it replaces, in the same order.
+                    var b = new IrBuilder(fn) { Current = block, InsertIndex = k, CurrentAddr = n.Addr };
+                    Node sum = distance.In[0];
+                    for (int t = 0; t + 1 < terms.Count; t++) sum = b.Add(sum, terms[t]);
+                    Node last = terms.Count != 0 ? terms[^1] : b.Const(VT.I64, 0);
+                    b.InsertIndex = -1;
+                    n.In = [sum, last];
+                    k = block.Nodes.IndexOf(n);
+                    changed = true;
+                    break;
+                }
+            }
+        return changed;
+    }
+
+    /// <summary>
+    /// A merged value that is one and the same value on every way in is that value. A loop with a "continue"
+    /// brings its counter to the place it is stepped at by two ways, unchanged on both: stepped from what is
+    /// merged there, it does not read as "counter + 1", and nothing here would know it for a counter.
+    /// </summary>
+    private static bool FoldSameValueMerges(Function fn)
+    {
+        var replace = new Dictionary<Node, Node>();
+        foreach (Block b in fn.Blocks)
+            foreach (Node phi in b.Phis)
+            {
+                if (phi.Dead || phi.In.Length == 0) continue;
+                Node? only = null;
+                bool same = true;
+                foreach (Node input in phi.In)
+                {
+                    if (ReferenceEquals(input, phi)) continue;
+                    if (only != null && !ReferenceEquals(only, input))
+                    {
+                        same = false;
+                        break;
+                    }
+                    only = input;
+                }
+                // (One that is itself being replaced waits for the next round.)
+                if (same && only != null && only.Type == phi.Type && !replace.ContainsKey(only)) replace[phi] = only;
+            }
+        if (replace.Count == 0) return false;
+        Replace(fn, replace);
+        return true;
+    }
 
     private static void Replace(Function fn, Dictionary<Node, Node> replace)
     {
@@ -685,8 +767,10 @@ public static class LoopValues
                     if (!Paired(pointer, counter, back, out long scale, out Node? startPointer, out Node? startCounter, out bool forward)) continue;
                     var b = new IrBuilder(fn) { Current = header, InsertIndex = 0, CurrentAddr = header.Start };
                     Node? address = null;
+                    // The pointer runs against the counter.
+                    if (scale < 0) address = Against(b, startPointer!, startCounter!, counter, -scale);
                     // The start is element [start of the counter] of something: the same element expression with the counter.
-                    if (StartTerms(startPointer!, startCounter!, scale, out List<Node>? rest, out Op? extension) &&
+                    else if (StartTerms(startPointer!, startCounter!, scale, out List<Node>? rest, out Op? extension) &&
                         (counter.Type == VT.I64 ? extension == null : extension != null))
                     {
                         Node index = extension is { } widen ? b.Raw(widen, VT.I64, counter) : counter;
@@ -733,6 +817,45 @@ public static class LoopValues
     }
 
     private static readonly bool NoMadeCounters = Environment.GetEnvironmentVariable("REWIND_NO_MADE_COUNTERS") != null;
+    private static readonly bool NoPointersAgainst = Environment.GetEnvironmentVariable("REWIND_NO_POINTERS_AGAINST") != null;
+
+    /// <summary>
+    /// A pointer that runs against its counter ("for (i = 0; i &lt; n; i++) use(a[n - 1 - i])": the counter goes
+    /// up, the pointer down the array). It starts at element [x] of something, "rest + scale * x", and is at
+    /// element [x - how far the counter got] at every step. Null when the start does not read like that.
+    /// </summary>
+    private static Node? Against(IrBuilder b, Node startPointer, Node startCounter, Node counter, long scale)
+    {
+        var terms = new List<Node>();
+        void Flatten(Node n, int depth)
+        {
+            if (n.Op == Op.Add && depth < 6) { Flatten(n.In[0], depth + 1); Flatten(n.In[1], depth + 1); }
+            else terms.Add(n);
+        }
+        Flatten(startPointer, 0);
+        for (int k = 0; k < terms.Count; k++)
+        {
+            Node t = terms[k];
+            Node? of = null;
+            if (t.Op == Op.Mul && t.In[1].IsConst && IrBuilder.SImm(t.In[1]) == scale) of = t.In[0];
+            else if (t.Op == Op.Shl && t.In[1].IsConst && t.In[1].UImm < 16 && 1L << (int)t.In[1].UImm == scale) of = t.In[0];
+            else if (scale == 1 && t.Op is Op.SExt or Op.ZExt) of = t;
+            if (of == null || of.Type != VT.I64) continue;
+            // How far the counter got, in the counter's own width.
+            Node moved = startCounter.IsConst && IrBuilder.SImm(startCounter) == 0 ? counter : b.Sub(counter, startCounter);
+            Node index;
+            // (An element worked out in the counter's width and widened then: the same with the counter in it.)
+            if (of.Op is Op.SExt or Op.ZExt && of.In[0].Type == counter.Type) index = b.Raw(of.Op, VT.I64, b.Sub(of.In[0], moved));
+            else index = b.Sub(of, counter.Type == VT.I64 ? moved : b.Raw(Op.ZExt, VT.I64, moved));
+            Node scaled = scale == 1 ? index : b.Mul(index, b.Const(VT.I64, scale));
+            Node? sum = null;
+            for (int r = 0; r < terms.Count; r++)
+                if (r != k)
+                    sum = sum == null ? terms[r] : b.Add(sum, terms[r]);
+            return sum == null ? scaled : b.Add(sum, scaled);
+        }
+        return null;
+    }
 
     /// <summary>
     /// A pointer that walks an array with no counter kept beside it at all - the compiler kept only what the
@@ -854,7 +977,8 @@ public static class LoopValues
             if (counter.Type == VT.I32) byCounter = (int)byCounter;
             if (byCounter == 0 || byPointer % byCounter != 0) return false;
             long ratio = byPointer / byCounter;
-            if (ratio is < 1 or > 4096 || (scale != 0 && ratio != scale)) return false;
+            // (Below zero: the pointer goes down the array as the counter goes up, or the other way round.)
+            if (ratio == 0 || ratio > 4096 || ratio < (NoPointersAgainst ? 1 : -4096) || (scale != 0 && ratio != scale)) return false;
             scale = ratio;
             if (byCounter < 0) forward = false;
             moves = true;

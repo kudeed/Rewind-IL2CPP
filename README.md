@@ -35,8 +35,8 @@ The command-line tool ends up in `src/Rewind.Cli/bin/Release/net10.0/rewind.dll`
 dotnet src/Rewind.Cli/bin/Release/net10.0/rewind.dll info path/to/game
 ```
 
-Run it from the repo folder so it finds the signature library in `signatures/`, or point at the library with
-`--signatures`.
+Run it from the repo folder so it finds the signature libraries in `signatures/`, or point at a library or a
+folder of them with `--signatures`.
 
 ## Using it
 
@@ -123,25 +123,80 @@ The behavior check is `rewind-lab diff-exec`. It loads the original assembly and
 calls the same static methods with the same inputs, and compares the results, any exceptions and any changes
 to the arguments.
 
+### Unity versions
+
+One test project was built for Windows x64 with six Unity versions, and each Release build was decompiled
+with the signature library for its version. A body counts as complete when all of it was recovered, with no
+gap marked.
+
+| Unity version | Metadata | Method addresses against debug symbols | Complete bodies, the project's own assembly | Complete bodies, whole game |
+| --- | --- | --- | --- | --- |
+| 2020.3.49f1 | v27.1 | 106,376 of 106,376 | 506 of 514 (98.4%) | 90,820 of 95,857 (94.7%) |
+| 2021.3.45f2 | v31 | 117,312 of 117,312 | 502 of 514 (97.7%) | 99,238 of 105,241 (94.3%) |
+| 2022.3.62f3 | v31.1 | 125,112 of 125,112 | 504 of 516 (97.7%) | 106,369 of 112,687 (94.4%) |
+| 6000.0.85f2 | v31.1 | 136,870 of 136,870 | 502 of 514 (97.7%) | 116,366 of 123,449 (94.3%) |
+| 6000.2.9f1 | v31.1 | 138,340 of 138,340 | 504 of 516 (97.7%) | 117,690 of 124,794 (94.3%) |
+| 6000.3.12f1 | v39 | 146,603 of 146,603 | 504 of 516 (97.7%) | 124,779 of 132,027 (94.5%) |
+
+The whole game includes Unity's and .NET's own class libraries, which is most of the code.
+
+The libraries for 2020.3 to 6000.2 were each built from the project's Release build, Master build and
+Release build without incremental garbage collection, and, from 2021.3 on, a Release build optimized for
+size. One more configuration of each version was kept out of its library and used to check it against the
+debug symbols (a Master build optimized for size; for 2020.3, a Master build without incremental garbage
+collection). The 6000.3.12f1 library is an earlier one, built from another project, so both of this
+project's builds were new to it. None of the six libraries made a wrong identification on a build it wasn't
+built from.
+
+Bodies in those held-out builds are a different matter: Master builds recover far fewer. 61.0% to 63.7% of
+the whole game is complete in the five Master builds optimized for size, and 75.7% in the 2020.3 one.
+
+The behavior check gives the same picture on every version. On 6000.3.12f1, 157 of the project's 179
+comparable methods behave exactly like the original, and the other versions are within three methods of
+that (156 to 160 of 178 or 179). The methods that differ are mostly the same ones on every version. Some
+return objects that are never equal between two runs (iterators, delegates) and some run into the time
+limit. The rest are real differences: exception handling, generic code, async methods and a few array and
+string methods.
+
+Without a library for its own version, a game is read with whichever other library recognizes most of its
+runtime. Taking each game's own library away left 68.9% of the 2020.3.49f1 game complete instead of 94.7%,
+91.0% instead of 94.3% for 2021.3.45f2 and 92.8% instead of 94.4% for 2022.3.62f3. For the three Unity 6
+versions it made no difference beyond one method.
+
 ## What it can't do yet
 
 - Method bodies are only recovered for x64 Windows builds. ARM64, which covers most Android games, gets
   complete types and signatures but placeholder bodies.
-- Generic methods, and methods of generic types, still get placeholder bodies.
-- `try`/`catch`/`finally` blocks aren't rebuilt yet. Methods that use them are flagged.
+- Generic methods, and methods of generic types, are recovered from the code their instantiations over
+  reference types share. A definition that is only compiled for value types still gets a placeholder body.
+  Where the shared code doesn't say which instantiation a call is to, the call is marked as a gap.
+- `try`/`catch`/`finally` blocks are rebuilt, but not always. When a value is kept in a register across a
+  caught exception, or the end of a `catch` can't be found, the method is flagged.
 - Structs copied in 8- or 16-byte pieces, and structs kept on the stack, often aren't resolved to their
   fields yet. In real games this is the most common kind of gap.
 - Inlined code mostly isn't folded back into a call. Simple field accessors and trivial constructors are, but
   other code that was inlined from another class uses that class's private members directly.
-- Only one signature library comes with Rewind: Unity 6000.3.12f1 on Windows x64, covering five build
-  configurations. Other Unity versions need a library you build yourself (see below). Without one, most
-  method bodies come out as gaps.
-- Metadata versions other than 39 and 31.1 are written from the format's history but haven't been tested.
-  Unity 6.5 and later (metadata v104 and up) isn't supported. Mach-O input hasn't been tested either.
+- Signature libraries come with Rewind for the six Unity versions in the table above, for Windows x64 only.
+  A game built with another version is read with whichever library recognizes most of its runtime, and
+  fewer bodies come out complete the further apart the versions are (the numbers are under the table). The
+  best result needs a library built for the game's exact version (see below).
+- A library used on another Unity version than its own can also get a function wrong. Each of the six
+  libraries was tried on the other five versions' test games: 29 of the 30 pairings had no wrong
+  identification, and one had a single wrong one (the 6000.3.12f1 library on the 2020.3.49f1 game).
+- Builds made with the Master compiler configuration come out far worse than Release builds. Of the
+  6000.2.9f1 test game's bodies, 62.3% are complete for a Master build, against 94.3% for a Release build
+  and 91.8% for a Release build optimized for size.
+- Code generated by Unity 2020.3 leaves a `finally` block by a number it keeps on the stack. In large
+  methods with several `try` blocks Rewind often can't follow that, and those methods are marked as gaps.
+- Metadata versions other than 27.1, 31, 31.1 and 39 are written from the format's history but haven't been
+  tested. Unity 6.5 and later (metadata v104 and up) isn't supported. Mach-O input hasn't been tested either.
 
 ## Supporting another Unity version
 
-Rewind needs a signature library for the Unity version a game was built with. To make one:
+Rewind works best with a signature library for the exact Unity version a game was built with. It comes with
+libraries for 2020.3.49f1, 2021.3.45f2, 2022.3.62f3, 6000.0.85f2, 6000.2.9f1 and 6000.3.12f1 (Windows x64).
+For any other version it tries every library it has, nearest version first, and uses the one that recognizes
+the most kinds of runtime function. To make a library for another version:
 
 1. Install that Unity version and build any project with IL2CPP for Windows x64. Keep the
    `<Game>_BackUpThisFolder_ButDontShipItWithYourGame` folder the build creates, because `GameAssembly.pdb`

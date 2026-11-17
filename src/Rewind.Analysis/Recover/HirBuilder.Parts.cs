@@ -101,6 +101,48 @@ public sealed partial class HirBuilder
     private MethodDef? BitConverterMethod(string name, TypeSig parameter) =>
         _m.FindType("System.BitConverter")?.Methods.FirstOrDefault(m => m.IsStatic && m.Name == name && m.Parameters.Length == 1 && ReferenceEquals(m.Parameters[0].Type, parameter));
 
+    private MethodDef? BitConverterReader(string name) =>
+        _m.FindType("System.BitConverter")?.Methods.FirstOrDefault(m => m.IsStatic && m.Name == name && m.Parameters.Length == 2 &&
+            m.Parameters[0].Type is SzArraySig bytes && ReferenceEquals(bytes.ElementType, _byte) && ReferenceEquals(m.Parameters[1].Type, _int));
+
+    /// <summary>
+    /// The bits of a float as an int: BitConverter.SingleToInt32Bits where the game's class library has it.
+    /// The one Unity 2020 ships does not; there the same is said through the float's bytes, which every class
+    /// library can: BitConverter.ToInt32(BitConverter.GetBytes(value), 0). Null when it has neither.
+    /// </summary>
+    private HExpr? SingleBits(HExpr value)
+    {
+        if (BitConverterMethod("SingleToInt32Bits", _float) is { } toBits) return new HCall { Method = toBits, Arguments = [value], Type = _int };
+        if (BitConverterMethod("GetBytes", _float) is { } bytes && BitConverterReader("ToInt32") is { } read)
+            return new HCall { Method = read, Arguments = [new HCall { Method = bytes, Arguments = [value], Type = bytes.ReturnType }, new HConst(0, _int)], Type = _int };
+        return null;
+    }
+
+    /// <summary>The float whose bits are the given int, the same two ways.</summary>
+    private HExpr? SingleFromBits(HExpr bits)
+    {
+        if (BitConverterMethod("Int32BitsToSingle", _int) is { } fromBits) return new HCall { Method = fromBits, Arguments = [bits], Type = _float };
+        if (BitConverterMethod("GetBytes", _int) is { } bytes && BitConverterReader("ToSingle") is { } read)
+            return new HCall { Method = read, Arguments = [new HCall { Method = bytes, Arguments = [bits], Type = bytes.ReturnType }, new HConst(0, _int)], Type = _float };
+        return null;
+    }
+
+    /// <summary>Matches what SingleBits and SingleFromBits build (whichever way): the value whose bits are read as the other type.</summary>
+    private static bool IsReinterpreted(HExpr e, string direct, string reader, out HExpr original)
+    {
+        original = e;
+        if (e is not HCall { This: null, Method: { DeclaringType: { Name: "BitConverter", Namespace: "System" } } method } call) return false;
+        if (method.Name == direct && call.Arguments.Length == 1)
+        {
+            original = call.Arguments[0];
+            return true;
+        }
+        if (method.Name != reader || call.Arguments.Length != 2 || call.Arguments[1] is not HConst { Value: 0 }) return false;
+        if (call.Arguments[0] is not HCall { This: null, Method: { Name: "GetBytes", DeclaringType: { Name: "BitConverter", Namespace: "System" } }, Arguments: [{ } inner] }) return false;
+        original = inner;
+        return true;
+    }
+
     /// <summary>The bit pattern of a scalar as an unsigned integer of 64 bits (its own width, zero-extended).</summary>
     private HExpr BitsOfValue(HExpr e, int size)
     {
@@ -108,8 +150,8 @@ public sealed partial class HirBuilder
         if (ReferenceEquals(t, _float))
         {
             if (e is HConst { Value: float f }) return new HConst((long)(uint)BitConverter.SingleToInt32Bits(f), _long);
-            if (BitConverterMethod("SingleToInt32Bits", _float) is { } toBits)
-                return new HConv(HConvKind.U8, new HConv(HConvKind.U4, new HCall { Method = toBits, Arguments = [e], Type = _int }) { Type = _uint }) { Type = _ulong };
+            if (SingleBits(e) is { } asInt)
+                return new HConv(HConvKind.U8, new HConv(HConvKind.U4, asInt) { Type = _uint }) { Type = _ulong };
             Problem("float reinterpreted as bits (no BitConverter in this build)");
             return new HOpaque("float_bits", e) { Type = _long };
         }
@@ -137,14 +179,11 @@ public sealed partial class HirBuilder
         if (ReferenceEquals(type, _float))
         {
             if (bits is HConst { Value: int or long } c) return new HConst(BitConverter.Int32BitsToSingle((int)Convert.ToInt64(c.Value)), _float);
-            if (BitConverterMethod("Int32BitsToSingle", _int) is { } fromBits)
             {
                 // The bits of a float, read as a float again, are that float.
                 HExpr narrow = Shortened(HConvKind.I4, _int, bits, 32);
-                if (narrow is HCall { This: null, Method: { Name: "SingleToInt32Bits", DeclaringType: { Name: "BitConverter", Namespace: "System" } }, Arguments: [{ } original] } &&
-                    ReferenceEquals(original.Type, _float))
-                    return original;
-                return new HCall { Method = fromBits, Arguments = [narrow], Type = _float };
+                if (IsReinterpreted(narrow, "SingleToInt32Bits", "ToInt32", out HExpr original) && ReferenceEquals(original.Type, _float)) return original;
+                if (SingleFromBits(narrow) is { } asFloat) return asFloat;
             }
             Problem("bits reinterpreted as float (no BitConverter in this build)");
             return new HOpaque("bits_to_float", bits) { Type = _float };

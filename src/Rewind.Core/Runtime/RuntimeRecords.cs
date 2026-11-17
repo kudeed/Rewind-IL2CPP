@@ -59,7 +59,10 @@ public enum RgctxKind { Invalid = 0, Type = 1, Class = 2, Method = 3, Array = 4,
 /// </summary>
 public readonly record struct RawRgctxEntry(RgctxKind Kind, int Index, uint EncodedMethod);
 
-/// <summary>One entry of a runtime generic context, resolved: a type (for Type, Class, Array) or a method.</summary>
+/// <summary>
+/// One entry of a runtime generic context, resolved: a type (for Type, Class, Array, and for Constrained the
+/// type the call is made on) or a method.
+/// </summary>
 public readonly record struct RgctxItem(RgctxKind Kind, Rewind.Model.TypeSig? Type, Rewind.Model.MethodInst? Method);
 
 public sealed class RawCodeGenModule

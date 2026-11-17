@@ -759,6 +759,8 @@ public sealed partial class HirBuilder
     private sealed record PInternal(string What) : Place;
     /// <summary>The class pointer kept in a method's runtime record.</summary>
     private sealed record PKlassOf(TypeSig Type) : Place;
+    /// <summary>The code pointer kept in a method's runtime record.</summary>
+    private sealed record PMethodCode(SMethod Method) : Place;
     /// <summary>The pointer to a runtime generic context (of a class or a method), and one entry of such a context.</summary>
     private sealed record PRgctx(SRgctx Context) : Place;
     private sealed record PRgctxItem(SRgctx Context, int Index) : Place;
@@ -1123,6 +1125,8 @@ public sealed partial class HirBuilder
         return place;
     }
 
+    private static readonly bool NoConstrainedDescriptors = Environment.GetEnvironmentVariable("REWIND_NO_CONSTRAINED_DESCRIPTORS") != null;
+
     /// <summary>What entry <paramref name="index"/> of a runtime generic context holds, for the context's type arguments.</summary>
     private Sem RgctxValue(SRgctx context, int index)
     {
@@ -1142,6 +1146,8 @@ public sealed partial class HirBuilder
                 return new SType(type);
             case Rewind.Runtime.RgctxKind.Array when Inflate(item.Type) is { } element:
                 return new SKlass(_m.Sigs.SzArray(element));
+            case Rewind.Runtime.RgctxKind.Constrained when !NoConstrainedDescriptors && Inflate(item.Type) is { } on:
+                return new SConstrained(on);
             case Rewind.Runtime.RgctxKind.Method when item.Method is { } open:
             {
                 var classArguments = new TypeSig[open.ClassArguments.Length];
@@ -1193,9 +1199,13 @@ public sealed partial class HirBuilder
                 return new PInternal("class data");
             case SMethod method when a.Index == null:
             {
-                // A method's runtime record: its class, and for an instantiated generic method its own context.
-                int klassAt = (_m.Version >= Rewind.Metadata.MetaVersion.V29_0 ? 4 : 3) * _ptr;
+                // A method's runtime record: its code (methodPointer, and from metadata 29 virtualMethodPointer, which
+                // is what il2cpp_codegen_get_method_pointer hands out there), its class, and for an instantiated
+                // generic method its own context.
+                bool twoPointers = _m.Version >= Rewind.Metadata.MetaVersion.V29_0;
+                int klassAt = (twoPointers ? 4 : 3) * _ptr;
                 TypeSig[] classArguments = method.Inst?.ClassArguments ?? [];
+                if (size == _ptr && (a.Offset == 0 || (twoPointers && a.Offset == _ptr))) return new PMethodCode(method);
                 if (a.Offset == klassAt)
                     return new PKlassOf(classArguments.Length != 0 ? _m.Sigs.GenericInst(method.Method.DeclaringType, classArguments) : method.Method.DeclaringType.Sig);
                 if (a.Offset == klassAt + 3 * _ptr && method.Inst is { MethodArguments.Length: > 0 } inst)
@@ -1591,6 +1601,8 @@ public sealed partial class HirBuilder
                 return SJunk.Instance;
             case PKlassOf of:
                 return new SKlass(of.Type);
+            case PMethodCode code:
+                return new SMethodCode(code.Method.Method, code.Method.Inst);
             case PRgctx table:
                 return table.Context;
             case PRgctxItem entry:
@@ -1920,7 +1932,7 @@ public sealed partial class HirBuilder
                     return new SRef(loc.Location, loc.Type);
                 case PUnboxed u when u.Offset == 0:
                     return new SUnboxed(u.Object);
-                case PArrayLength or PObjKlass or PInternal or PVTable or PStatics or PKlassOf or PRgctx or PRgctxItem:
+                case PArrayLength or PObjKlass or PInternal or PVTable or PStatics or PKlassOf or PMethodCode or PRgctx or PRgctxItem:
                     return SJunk.Instance;
             }
             if (a.BaseSem is SVal { Type: PrimitiveSig { Element: Il2CppTypeEnum.I or Il2CppTypeEnum.U } }) return BinarySem(n);

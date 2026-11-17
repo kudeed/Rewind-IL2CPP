@@ -610,13 +610,17 @@ public sealed partial class HirBuilder
             if (p.Role == ParamRole.MethodInfo)
             {
                 // Generic methods receive their own MethodInfo: an exact identification when present.
-                if (IntAt(call, p.Position) is { } mi && Eval(mi) is SMethod sm)
+                if (IntAt(call, p.Position) is not { } mi) continue;
+                if (Eval(mi) is SMethod sm)
                 {
                     if (inst != null && sm.Inst != null && ReferenceEquals(sm.Inst, inst)) score += 1000;
                     else if (inst == null && sm.Inst == null && ReferenceEquals(sm.Method, method)) score += 1000;
                     else if (ReferenceEquals(sm.Method, method)) score += 200;
                     else score -= 500;
                 }
+                // A call to a method of an instantiation always hands it that method's descriptor; a call that
+                // hands none (a null written out) is to a method that is no instantiation and shares the code.
+                else if (inst != null && !NoNullDescriptors && mi.IsConstValue(0)) score -= 60;
                 continue;
             }
             if (p.Pass == PassKind.Float || p.Type == null) continue;
@@ -711,6 +715,7 @@ public sealed partial class HirBuilder
     private bool Reachable(AssemblyModel assembly) => NoReachableAssemblies || AssemblyScope.Reaches(_method.DeclaringType.Assembly, assembly);
 
     private static readonly bool NoResultPlaces = Environment.GetEnvironmentVariable("REWIND_NO_RESULT_PLACES") != null;
+    private static readonly bool NoNullDescriptors = Environment.GetEnvironmentVariable("REWIND_NO_NULL_DESCRIPTORS") != null;
     private static readonly bool NoFreshReceivers = Environment.GetEnvironmentVariable("REWIND_NO_FRESH_RECEIVERS") != null;
 
     /// <summary>Whether <paramref name="type"/> is <paramref name="ancestor"/> or derives from it.</summary>
@@ -863,7 +868,7 @@ public sealed partial class HirBuilder
             }
             Problem($"call to code shared only by methods this assembly cannot reach ({best.DeclaringType.Name}.{best.Name})");
         }
-        BuildCall(call, best, bestInst?.ClassArguments ?? [], bestInst?.MethodArguments ?? [], isVirtual: false, tail, ties, skipFirst: false);
+        BuildCall(call, best, bestInst?.ClassArguments ?? [], bestInst?.MethodArguments ?? [], isVirtual: false, tail, ties, skipFirst: false, listed: bestInst != null);
     }
 
     private readonly Dictionary<ulong, bool?> _sumFunctions = [];
@@ -1093,11 +1098,26 @@ public sealed partial class HirBuilder
         return _constantFunctions[address] = value;
     }
 
-    /// <summary>Builds the call expression for a chosen method from the captured argument values.</summary>
+    private static readonly bool NoUnknownInstantiations = Environment.GetEnvironmentVariable("REWIND_NO_UNKNOWN_INSTANTIATIONS") != null;
+
+    /// <summary>Whether a type argument is, or is made of, "object": what the code shared by every instantiation over classes is listed under.</summary>
+    private bool NamesObject(TypeSig t) => t switch
+    {
+        GenericInstSig g => g.Arguments.Any(NamesObject),
+        SzArraySig a => NamesObject(a.ElementType),
+        _ => ReferenceEquals(t, _object),
+    };
+
+    /// <summary>
+    /// Builds the call expression for a chosen method from the captured argument values.
+    /// <paramref name="listed"/>: the type arguments are those the code at the call's address is listed under,
+    /// not ones that something else told.
+    /// </summary>
     private void BuildCall(Node call, MethodDef method, TypeSig[] classArgs, TypeSig[] methodArgs, bool isVirtual, bool tail,
-        List<MethodDef>? alternatives, bool skipFirst, Node? receiverOverride = null, int shift = 0)
+        List<MethodDef>? alternatives, bool skipFirst, Node? receiverOverride = null, int shift = 0, bool listed = false)
     {
         MethodAbi abi = _p.Abi.For(method, classArgs, methodArgs);
+        bool classTold = false, methodTold = false;
 
         // One compiled body serves every instantiation that differs only in reference types, so the callee's
         // address cannot say whether this is List<Creature>.Add or List<string>.Add. Two things can: the
@@ -1112,6 +1132,16 @@ public sealed partial class HirBuilder
                 classArgs = named.ClassArguments;
                 methodArgs = named.MethodArguments;
                 abi = _p.Abi.For(method, classArgs, methodArgs);
+                classTold = methodTold = true;
+            }
+            // A call through a constraint is handed the record of the method as the constrained type has it:
+            // the method is that type's, with that type's arguments.
+            else if (Peek(descriptor) is SConstrained { On: var on } && method.GenericParameters.Length == 0 &&
+                     DeclaringArguments(on, method.DeclaringType) is { } constrained && !constrained.Any(Open))
+            {
+                classArgs = constrained;
+                abi = _p.Abi.For(method, classArgs, methodArgs);
+                classTold = true;
             }
         }
         if (!method.IsStatic && method.DeclaringType.GenericParameters.Length != 0 && abi.This != null)
@@ -1131,8 +1161,14 @@ public sealed partial class HirBuilder
             {
                 classArgs = exact;
                 abi = _p.Abi.For(method, classArgs, methodArgs);
+                classTold = true;
             }
         }
+        // Neither said it: the code is listed under "object" because every instantiation over classes shares
+        // it, and which of them is called here is not known. Written as the one over object it would read as
+        // code that can be compiled and does something else (a List<Creature> is no List<object>).
+        if (listed && !NoUnknownInstantiations && ((!classTold && classArgs.Any(NamesObject)) || (!methodTold && methodArgs.Any(NamesObject))))
+            Problem($"which instantiation of {method.DeclaringType.Name}.{method.Name} is called was not recovered (its code is shared by every instantiation over classes)");
         ChosenCalls[call] = (method, abi, shift);
 
         HExpr? thisExpr = null;
@@ -1368,6 +1404,12 @@ public sealed partial class HirBuilder
             BuildCall(call, native.Method, [], [], isVirtual: false, tail, null, skipFirst: false);
             return;
         }
+        if (target is SMethodCode code)
+        {
+            // The code pointer of a method's own record, called with the method's arguments and the record itself.
+            BuildCall(call, code.Method, code.Inst?.ClassArguments ?? [], code.Inst?.MethodArguments ?? [], isVirtual: false, tail, null, skipFirst: false);
+            return;
+        }
         if (target is SPInvoke pinvoke)
         {
             if (TryBuildPInvokeCall(call, pinvoke.Method, tail)) return;
@@ -1568,9 +1610,11 @@ public sealed partial class HirBuilder
     private HExpr MathCall(string name, bool isDouble, params HExpr[] args)
     {
         TypeSig type = isDouble ? _double : _float;
-        MethodDef? Find(string typeName, TypeSig operand) => _m.FindType(typeName)?.Methods.FirstOrDefault(m =>
+        // (A class this code can name: Unity 2020's System.Numerics has a MathF of its own that nothing outside it sees.)
+        bool Usable(TypeDef owner) => (owner.Flags & TypeDef.VisibilityMask) == 1 || ReferenceEquals(owner.Assembly, _method.DeclaringType.Assembly);
+        MethodDef? Find(string typeName, TypeSig operand) => _m.FindType(typeName) is { } owner && Usable(owner) ? owner.Methods.FirstOrDefault(m =>
             m.IsStatic && m.Name == name && m.Parameters.Length == args.Length && ReferenceEquals(m.ReturnType, operand) &&
-            m.Parameters.All(p => ReferenceEquals(p.Type, operand)));
+            m.Parameters.All(p => ReferenceEquals(p.Type, operand)) && IsAccessible(m)) : null;
 
         MethodDef? method = isDouble ? Find("System.Math", _double) : Find("System.MathF", _float) ?? Find("System.Math", _float);
         if (method != null) return new HCall { Method = method, Arguments = args, Type = type };

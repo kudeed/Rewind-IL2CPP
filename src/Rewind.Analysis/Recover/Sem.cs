@@ -90,6 +90,17 @@ internal sealed class SMethod(MethodDef method, MethodInst? inst) : Sem
 }
 
 /// <summary>
+/// The code pointer read out of a method's runtime record. Unity 2021 calls from code shared between
+/// instantiations this way ("il2cpp_codegen_get_method_pointer(method)(arguments, method)"): calling it is
+/// calling the method.
+/// </summary>
+internal sealed class SMethodCode(MethodDef method, MethodInst? inst) : Sem
+{
+    public MethodDef Method = method;
+    public MethodInst? Inst = inst;
+}
+
+/// <summary>
 /// The runtime generic context of an instantiated generic class or method: the table of classes, types and
 /// methods its shared code needs, for these type arguments.
 /// </summary>
@@ -173,7 +184,17 @@ internal sealed class SHierarchyEntry(Node obj, TypeSig type) : Sem
 }
 
 /// <summary>A value with no managed meaning (undefined register contents, the hidden MethodInfo argument).</summary>
-internal sealed class SJunk : Sem
+internal class SJunk : Sem
 {
     public static readonly SJunk Instance = new();
+}
+
+/// <summary>
+/// What shared code hands a method it calls through a constraint ("constrained. T; callvirt Dispose", as a
+/// foreach over a struct enumerator ends): the runtime's record of that method as the type has it. No value
+/// of the program, but it says which type the call is made on.
+/// </summary>
+internal sealed class SConstrained(TypeSig on) : SJunk
+{
+    public TypeSig On = on;
 }

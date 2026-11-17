@@ -126,7 +126,17 @@ internal sealed class GuardedAccessorFolding(MethodPipeline pipeline)
                     Unhold(own);
                     if (own.Blocks.Count != 0 && Guarded(own.Blocks[0]) is { } again) guarded = again;
                 }
-                if (guarded.Statements is [HAssign { Target: HDeref } store, HReturn { Value: null }])
+                // What it stores may first be made in a variable ("flag = new NetworkBool(value); *place = flag"):
+                // the store of what was made.
+                HAssign? store = guarded.Statements switch
+                {
+                    [HAssign { Target: HDeref } direct, HReturn { Value: null }] => direct,
+                    [HAssign { Target: HLocal made, Value: var given }, HAssign { Target: HDeref place, Value: HLocal stored } through, HReturn { Value: null }]
+                        when !NoStoresThrough && ReferenceEquals(made.Variable, stored.Variable) && !Names(place, made.Variable) && !Names(given, made.Variable) =>
+                        new HAssign(place, given) { Address = through.Address },
+                    _ => null,
+                };
+                if (store != null)
                 {
                     a.Setter = setter;
                     a.Store = store;
@@ -313,6 +323,38 @@ internal sealed class GuardedAccessorFolding(MethodPipeline pipeline)
         bool found = false;
         Walk(e, x => { if (x is HField f && IsStorageField(f.Field)) found = true; });
         return found;
+    }
+
+    private static readonly bool NoStoresThrough = Environment.GetEnvironmentVariable("REWIND_NO_NETWORKED_STORES_THROUGH") != null;
+
+    private static bool Names(HExpr? e, HVar variable)
+    {
+        bool found = false;
+        Walk(e, x => { if (x is HLocal l && ReferenceEquals(l.Variable, variable)) found = true; });
+        return found;
+    }
+
+    /// <summary>How often a variable is read and how often it is assigned, in the whole method.</summary>
+    private static (int Reads, int Writes) Uses(HMethod method, HVar variable)
+    {
+        int reads = 0, writes = 0;
+        void Count(HExpr? e) => Walk(e, x => { if (x is HLocal l && ReferenceEquals(l.Variable, variable)) reads++; });
+        foreach (HBlock block in method.Blocks)
+            foreach (HStmt s in block.Statements)
+                switch (s)
+                {
+                    case HAssign { Target: HLocal l } a when ReferenceEquals(l.Variable, variable): writes++; Count(a.Value); break;
+                    case HAssign a: Count(a.Target); Count(a.Value); break;
+                    case HEval e: Count(e.Expression); break;
+                    case HReturn r: Count(r.Value); break;
+                    case HThrow t: Count(t.Exception); break;
+                    case HBranch b: Count(b.Condition); break;
+                    case HSwitch sw: Count(sw.Value); break;
+                }
+        foreach (HTryRegion region in method.TryRegions.Values)
+            if (ReferenceEquals(region.Exception, variable))
+                writes += 2;
+        return (reads, writes);
     }
 
     private static void Walk(HExpr? e, Action<HExpr> visit)
@@ -512,12 +554,28 @@ internal sealed class GuardedAccessorFolding(MethodPipeline pipeline)
                         if (a.Target is HDeref && TouchesStorage(a.Target))
                         {
                             HStmt? call = null;
+                            // What is stored may have been made in a variable just before, for this store alone
+                            // ("flag = new NetworkBool(true); *place = flag"): then that is what the setter was given.
+                            HExpr? made = null;
+                            if (!NoStoresThrough && a.Value is HLocal { Variable: var held } && i > 0 &&
+                                block.Statements[i - 1] is HAssign { Target: HLocal { Variable: var before }, Value: var given } && ReferenceEquals(before, held) &&
+                                !Names(given, held) && !Names(a.Target, held) && Uses(method, held) is (1, 1))
+                                made = given;
+                            bool through = false;
                             foreach (Accessor candidate in candidates)
                             {
                                 if (candidate.Store == null) continue;
                                 var match = new Match();
-                                if (!match.Unify(candidate.Store.Target, a.Target) || !match.Unify(candidate.Store.Value, a.Value) || match.Self == null || match.Argument == null ||
-                                    !Derives(ClassOf(match.Self), candidate.Property.DeclaringType)) continue;
+                                through = false;
+                                if (!match.Unify(candidate.Store.Target, a.Target)) continue;
+                                if (!match.Unify(candidate.Store.Value, a.Value))
+                                {
+                                    if (made == null) continue;
+                                    match = new Match();
+                                    if (!match.Unify(candidate.Store.Target, a.Target) || !match.Unify(candidate.Store.Value, made)) continue;
+                                    through = true;
+                                }
+                                if (match.Self == null || match.Argument == null || !Derives(ClassOf(match.Self), candidate.Property.DeclaringType)) continue;
                                 (method.PutBack ??= []).Add(candidate.Setter!);
                                 call = new HEval(new HCall
                                 {
@@ -530,6 +588,12 @@ internal sealed class GuardedAccessorFolding(MethodPipeline pipeline)
                             if (call != null)
                             {
                                 block.Statements[i] = call;
+                                if (through)
+                                {
+                                    // (The variable was made for the store that is now the call: it goes.)
+                                    block.Statements.RemoveAt(i - 1);
+                                    i--;
+                                }
                                 any = true;
                                 break;
                             }

@@ -740,7 +740,7 @@ public sealed class Il2CppModel
                             RawRgctxEntry e = module.Rgctxs[range.Start + i];
                             items[i] = e.Kind switch
                             {
-                                RgctxKind.Type or RgctxKind.Class or RgctxKind.Array => new RgctxItem(e.Kind, TypeAt(e.Index), null),
+                                RgctxKind.Type or RgctxKind.Class or RgctxKind.Array or RgctxKind.Constrained => new RgctxItem(e.Kind, TypeAt(e.Index), null),
                                 RgctxKind.Method => new RgctxItem(e.Kind, null, e.Index >= 0 && e.Index < MethodInsts.Length ? MethodInsts[e.Index] : null),
                                 _ => new RgctxItem(e.Kind, null, null),
                             };
