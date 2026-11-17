@@ -246,6 +246,17 @@ public sealed class ProgramAnalysis
         return instructions <= 12 && body.Blocks.Any(b => b.End == BlockEnd.Return);
     }
 
+    /// <summary>
+    /// A few instructions that are, byte for byte, the code of listed methods, in a game whose generated code
+    /// has an accessor function for every field (Unity 2020 and earlier): "mov eax, [rcx+8]; ret" is the getter
+    /// of every property kept eight bytes into its object, and of every field there as well - a static one too,
+    /// handed the class's static memory. Which of them a call means is not told by the code; what it does is.
+    /// So it is lifted in place like any other function of the headers, not called as one of the methods.
+    /// </summary>
+    private bool IsHeaderLeafCopy(ulong target) =>
+        Model.Version < Rewind.Metadata.MetaVersion.V29_0 && ExactCopies.Copies.ContainsKey(target) &&
+        !Model.MethodsByAddress.ContainsKey(target) && !Model.InstsByAddress.ContainsKey(target) && IsPlainLeaf(target);
+
     public bool ShouldInline(ulong target)
     {
         lock (_inlinable)
@@ -254,7 +265,7 @@ public sealed class ProgramAnalysis
             if (Environment.GetEnvironmentVariable("REWIND_NO_INLINE") == "1") return _inlinable[target] = false;
             bool result = ((Model.Image.SectionAt(target) is { Name: "il2cpp", IsExecutable: true } && SizeBound(target) <= 2048) || IsPlainLeaf(target)) &&
                           !Context.NoReturn.Contains(target) && Helpers.At(target) == null &&
-                          ExceptionInfo(target) == null && Resolve(target) is { IsManaged: false, Helper: null };
+                          ExceptionInfo(target) == null && (Resolve(target) is { IsManaged: false, Helper: null } || IsHeaderLeafCopy(target));
             return _inlinable[target] = result;
         }
     }
