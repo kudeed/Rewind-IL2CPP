@@ -1404,6 +1404,12 @@ public sealed partial class HirBuilder
             BuildCall(call, native.Method, [], [], isVirtual: false, tail, null, skipFirst: false);
             return;
         }
+        if (target is SMethodCode code)
+        {
+            // The code pointer of a method's own record, called with the method's arguments and the record itself.
+            BuildCall(call, code.Method, code.Inst?.ClassArguments ?? [], code.Inst?.MethodArguments ?? [], isVirtual: false, tail, null, skipFirst: false);
+            return;
+        }
         if (target is SPInvoke pinvoke)
         {
             if (TryBuildPInvokeCall(call, pinvoke.Method, tail)) return;
@@ -1604,9 +1610,11 @@ public sealed partial class HirBuilder
     private HExpr MathCall(string name, bool isDouble, params HExpr[] args)
     {
         TypeSig type = isDouble ? _double : _float;
-        MethodDef? Find(string typeName, TypeSig operand) => _m.FindType(typeName)?.Methods.FirstOrDefault(m =>
+        // (A class this code can name: Unity 2020's System.Numerics has a MathF of its own that nothing outside it sees.)
+        bool Usable(TypeDef owner) => (owner.Flags & TypeDef.VisibilityMask) == 1 || ReferenceEquals(owner.Assembly, _method.DeclaringType.Assembly);
+        MethodDef? Find(string typeName, TypeSig operand) => _m.FindType(typeName) is { } owner && Usable(owner) ? owner.Methods.FirstOrDefault(m =>
             m.IsStatic && m.Name == name && m.Parameters.Length == args.Length && ReferenceEquals(m.ReturnType, operand) &&
-            m.Parameters.All(p => ReferenceEquals(p.Type, operand)));
+            m.Parameters.All(p => ReferenceEquals(p.Type, operand)) && IsAccessible(m)) : null;
 
         MethodDef? method = isDouble ? Find("System.Math", _double) : Find("System.MathF", _float) ?? Find("System.Math", _float);
         if (method != null) return new HCall { Method = method, Arguments = args, Type = type };

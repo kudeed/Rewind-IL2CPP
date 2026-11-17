@@ -91,6 +91,11 @@ public enum HelperKind
     StoreLastError,
     /// <summary>modf(x, &amp;whole) / modff: returns the fraction of x and stores its whole part (IL2CPP's rounding uses it).</summary>
     Modf,
+    /// <summary>
+    /// il2cpp_codegen_get_virtual_call_method_pointer(method), Unity 2021: the code pointer a delegate to the method
+    /// calls. Later versions read it out of the method's record in place (virtualMethodPointer).
+    /// </summary>
+    MethodVirtualCallPointer,
 }
 
 public sealed record HelperInfo(HelperKind Kind, int IntArgs, bool NoReturn, bool ReturnsValue, string Name)
@@ -158,6 +163,7 @@ public sealed class RuntimeHelpers
         ("il2cpp_codegen_get_missing_method_exception", HelperKind.GetMissingMethodException, 1, false, true),
         ("GetInterfaceInvokeDataFromVTableSlowPath", HelperKind.InterfaceInvokeDataSlow, 3, false, true),
         ("il2cpp_codegen_get_generic_virtual_method_internal", HelperKind.GetGenericVirtualMethod, 2, false, true),
+        ("il2cpp_codegen_get_virtual_call_method_pointer", HelperKind.MethodVirtualCallPointer, 1, false, true),
         ("il2cpp_codegen_runtime_constrained_call", HelperKind.RuntimeConstrainedCall, 6, false, false),
         ("il2cpp_codegen_static_fields_for", HelperKind.StaticFieldsFor, 1, false, true),
         ("il2cpp_codegen_get_thread_static_data", HelperKind.ThreadStaticData, 1, false, true),
@@ -186,8 +192,10 @@ public sealed class RuntimeHelpers
             {
                 HelperInfo? info = Classify(name);
                 if (info == null) continue;
-                chosen = info;
-                break;
+                // The linker keeps one copy of functions with identical code. Where the two metadata initializers
+                // are one function (Unity 2020), it is the one whose result the code uses: the other returns nothing.
+                if (chosen == null || (chosen.Kind == HelperKind.MetadataInit && info.Kind == HelperKind.MetadataInitInline)) chosen = info;
+                if (chosen.Kind != HelperKind.MetadataInit) break;
             }
             if (chosen != null) helpers._byAddress[address] = chosen;
         }
@@ -269,6 +277,9 @@ public sealed class RuntimeHelpers
                 _ => new HelperInfo(HelperKind.MethodIsStatic, 1, false, true, name),
             };
         }
+        // UnBox(object): the null check and Unbox_internal in one, where the compiler kept it a function (Unity 2020).
+        // Its overload with a class to check against is something else.
+        if (name == "?UnBox@@YAPEAXPEAUIl2CppObject@@@Z") return new HelperInfo(HelperKind.Unbox, 1, false, true, name);
         if (core == "il2cpp_codegen_resolve") return new HelperInfo(HelperKind.ResolvePInvoke, 1, false, true, name);
         if (core is "IsInstClass" or "IsInstSealed") return new HelperInfo(HelperKind.IsInst, 2, false, true, name);
         if (core is "CastclassClass" or "CastclassSealed") return new HelperInfo(HelperKind.CastClass, 2, false, true, name);

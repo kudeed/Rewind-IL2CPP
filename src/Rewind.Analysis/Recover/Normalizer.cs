@@ -56,6 +56,7 @@ public sealed class Normalizer(ProgramAnalysis program)
             changed |= RemoveUnusedLookups();
             changed |= MergeInterfaceTailCalls();
             changed |= CollapseDelegateInits();
+            changed |= CollapseDelegateGuards();
             changed |= CollapsePInvokeTargets();
         }
         return _result;
@@ -179,6 +180,78 @@ public sealed class Normalizer(ProgramAnalysis program)
                     n.In[1] = method;
             MakeJump(s, join);
             join.Preds.Add(s);
+            for (int i = 0; i < _fn.Blocks.Count; i++) _fn.Blocks[i].Id = i;
+            DeadCode.Run(_fn);
+            _result.RegionsRemoved++;
+            changed = true;
+        }
+        return changed;
+    }
+
+    /// <summary>
+    /// Unity 2020's delegate constructor, pasted in place, is shorter: a guard, "if (target == null &amp;&amp;
+    /// !MethodIsStatic(method)) throw new ArgumentException(...)", and then the stores of the code pointer, the
+    /// method and the target. The guard is the runtime's check, as above, and goes; the code pointer read out of
+    /// the method's record becomes the method, as above (DelegateFolding makes "new D(target, method)" of it).
+    /// </summary>
+    private bool CollapseDelegateGuards()
+    {
+        bool changed = false;
+        foreach (Block guard in _fn.Blocks.ToList())
+        {
+            if (!_fn.Blocks.Contains(guard) || guard.Terminator is not { Op: Op.Branch } || guard.Succs.Count != 2) continue;
+            Node? test = guard.Nodes.LastOrDefault(n => !n.Dead && HelperOf(n) == HelperKind.MethodIsStatic);
+            if (test == null || IntArg(test, 0) is not { } method) continue;
+            method = Resolve(method);
+
+            // One way out only throws the ArgumentException; the other goes on to the stores.
+            bool OnlyThrows(Block b) =>
+                b.Preds.Count == 1 && b.Phis.Count == 0 && b.Terminator?.Op == Op.Unreachable &&
+                b.Nodes.Any(n => !n.Dead && HelperOf(n) == HelperKind.GetArgumentException) &&
+                b.Nodes.All(n => n.Dead || n.Op is Op.Proj or Op.Const or Op.Unreachable ||
+                                 (n.Op == Op.Call && HelperOf(n) is HelperKind.GetArgumentException or HelperKind.Throw));
+            Block? thrower = guard.Succs.FirstOrDefault(OnlyThrows);
+            if (thrower == null) continue;
+            Block next = ReferenceEquals(guard.Succs[0], thrower) ? guard.Succs[1] : guard.Succs[0];
+            if (ReferenceEquals(next, thrower) || ReferenceEquals(next, guard)) continue;
+
+            // The delegate: the object the method is stored into where the guard lets through.
+            bool OnObject(Node address, Node baseNode) => address.Op == Op.Add && address.In[1].IsConst && ReferenceEquals(Resolve(address.In[0]), baseNode);
+            Node? obj = null;
+            foreach (Node n in next.Nodes)
+                if (!n.Dead && n.Op == Op.Store && ReferenceEquals(Resolve(n.In[1]), method) && n.In[0] is { Op: Op.Add } a && a.In[1].IsConst)
+                    obj = Resolve(a.In[0]);
+            if (obj == null) continue;
+            // The test's answer decides the guard and nothing else.
+            var uses = DeadCode.Uses(_fn);
+            bool local = true;
+            var pending = new Stack<Node>();
+            pending.Push(test);
+            var seen = new HashSet<Node>();
+            while (pending.Count > 0 && local)
+            {
+                Node n = pending.Pop();
+                if (!seen.Add(n) || !uses.TryGetValue(n, out List<Node>? users)) continue;
+                foreach (Node user in users)
+                {
+                    if (ReferenceEquals(user, guard.Terminator)) continue;
+                    if (!ReferenceEquals(user.Block, guard) || user.Op is Op.Store or Op.Call or Op.Phi) { local = false; break; }
+                    pending.Push(user);
+                }
+            }
+            if (!local) continue;
+
+            foreach (Node n in thrower.Nodes) n.Dead = true;
+            thrower.Preds.Clear();
+            thrower.Succs.Clear();
+            _fn.Blocks.Remove(thrower);
+            test.Dead = true;
+            // (methodPointer is the first word of the record: read at the record's own address.)
+            foreach (Node n in next.Nodes)
+                if (!n.Dead && n.Op == Op.Store && OnObject(n.In[0], obj) && n.In[1] is { Op: Op.Load } read &&
+                    (ReferenceEquals(Resolve(read.In[0]), method) || OnObject(read.In[0], method)))
+                    n.In[1] = method;
+            MakeJump(guard, next);
             for (int i = 0; i < _fn.Blocks.Count; i++) _fn.Blocks[i].Id = i;
             DeadCode.Run(_fn);
             _result.RegionsRemoved++;
@@ -364,6 +437,19 @@ public sealed class Normalizer(ProgramAnalysis program)
                         Node offset = _fn.NewNode(Op.Const, VT.I64, null);
                         offset.Imm = program.Klass.StaticFields;
                         Node address = NewNodeAt(b, i, Op.Add, VT.I64, call.Addr, klass, offset);
+                        result = NewNodeAt(b, i + 1, Op.Load, VT.I64, call.Addr, address);
+                        i += 2;
+                        break;
+                    }
+                    case HelperKind.MethodVirtualCallPointer:
+                    {
+                        // What later Unity versions do in place: read virtualMethodPointer, the second word of
+                        // the method's record.
+                        Node? method = IntArg(call, 0);
+                        if (method == null) { remove = false; break; }
+                        Node offset = _fn.NewNode(Op.Const, VT.I64, null);
+                        offset.Imm = program.Model.Image.PointerSize;
+                        Node address = NewNodeAt(b, i, Op.Add, VT.I64, call.Addr, method, offset);
                         result = NewNodeAt(b, i + 1, Op.Load, VT.I64, call.Addr, address);
                         i += 2;
                         break;
