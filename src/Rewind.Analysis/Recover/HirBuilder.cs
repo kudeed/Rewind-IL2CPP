@@ -744,6 +744,9 @@ public sealed partial class HirBuilder
         // The same bits read as another type (BitsOfValue, ValueFromBits): a way of writing a value, not an action.
         HCall { This: null, Method: { Name: "SingleToInt32Bits" or "Int32BitsToSingle" or "DoubleToInt64Bits" or "Int64BitsToDouble", DeclaringType: { Name: "BitConverter", Namespace: "System" } } } c =>
             c.Arguments.All(IsPure),
+        // The same through the value's bytes, where the class library has no call for it (SingleBits, SingleFromBits).
+        HCall { This: null, Method: { Name: "ToInt32" or "ToSingle", DeclaringType: { Name: "BitConverter", Namespace: "System" } } } c
+            when IsReinterpreted(c, "", c.Method.Name, out HExpr original) => IsPure(original),
         _ => false,
     };
 
@@ -987,7 +990,7 @@ public sealed partial class HirBuilder
         if (ReferenceEquals(e.Type, _float))
         {
             if (e is HConst { Value: float f }) return new HConst(BitConverter.SingleToInt32Bits(f), _int);
-            if (BitConverterMethod("SingleToInt32Bits", _float) is { } toBits) return new HCall { Method = toBits, Arguments = [e], Type = _int };
+            if (SingleBits(e) is { } asInt) return asInt;
             Problem("float reinterpreted as bits (no BitConverter in this build)");
             return new HOpaque("float_bits", e) { Type = _int };
         }
