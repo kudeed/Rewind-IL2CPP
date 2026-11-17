@@ -32,6 +32,13 @@ public sealed partial class HirBuilder
         {
             Node? slot = Input(call, ArgSlotKind.Stack, position - Win64Abi.RegisterSlots);
             if (slot == null) return Missing(type);
+            // A float occupies the low half of its stack slot. What fills the rest - what the slot held before,
+            // or the widening of a value read as 32 bits - is not part of it and is not looked at.
+            if (!isDouble && !NoUnreadHalves)
+            {
+                if (slot.Op == Op.Concat) slot = slot.In[1];
+                else if (slot.Op is Op.ZExt or Op.SExt && slot.In[0].Type == VT.I32 && !_materialize.Contains(slot) && !_sem.ContainsKey(slot)) slot = slot.In[0];
+            }
             Sem s = Eval(slot);
             if (s is SPair pair) return AsFloat(pair.Low, type);           // a float occupies the low half of its stack slot
             if (s is SVal v) return AsFloat(v.Expr, type);
@@ -57,6 +64,9 @@ public sealed partial class HirBuilder
     {
         TypeSig? have = e.Type ?? (e as HLocal)?.Variable.Type;
         if (have == null || IsFloat(have)) return e;
+        // A float in a 64-bit slot is the bit pattern in the slot's low half, not a number to convert.
+        if (ReferenceEquals(type, _float) && (ReferenceEquals(have, _long) || ReferenceEquals(have, _ulong)) && e is not HConst && !NoUnreadHalves)
+            return ValueFromBits(new HConv(HConvKind.I4, e) { Type = _int }, _float, 4);
         return Coerce(e, type);
     }
 
@@ -162,7 +172,14 @@ public sealed partial class HirBuilder
                 if (call.Dead || call.Op is not (Op.Call or Op.TailCall) || call.Aux is not CallInfo info || info.Intrinsic != null) continue;
                 for (int i = 0; i < call.In.Length && i < info.Slots.Count; i++)
                 {
-                    if (!IsFrameAddress(call.In[i], out int offset)) continue;
+                    // (One call reached from several paths, each with a stack object of its own to hand over:
+                    // the address is merged, and each of the objects is what the call takes there.)
+                    List<int>? merged = null;
+                    if (!IsFrameAddress(call.In[i], out int offset))
+                    {
+                        if (NoMergedAddresses || !MergedAddresses || (merged = MergedFrameAddresses(call.In[i])) == null) continue;
+                        offset = merged[0];
+                    }
                     ArgSlot slot = info.Slots[i];
                     int position = slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + Win64Abi.RegisterSlots : -1;
                     if (position < 0) continue;
@@ -214,12 +231,69 @@ public sealed partial class HirBuilder
                             }
                         }
                     }
-                    if (type != null && !Open(type) && Nameable(type)) _frameTypes.TryAdd(offset, type);
+                    if (type == null || Open(type) || !Nameable(type)) continue;
+                    if (merged == null) _frameTypes.TryAdd(offset, type);
+                    else
+                    {
+                        foreach (int at in merged)
+                        {
+                            // (Known as something else already: the memory is used for two things, one after the other.)
+                            if (!_frameTypes.TryAdd(at, type) && _frameTypes[at].Key != type.Key) FrameConflicts.Add(at);
+                        }
+                        Node phi = call.In[i];
+                        _addressPhis[phi] = _addressPhis.TryGetValue(phi, out TypeSig? other) && (other == null || other.Key != type.Key) ? null : type;
+                    }
                 }
             }
         }
         SpreadFrameTypes();
         DropCoveredFrameTypes();
+    }
+
+    private static readonly bool NoMergedAddresses = Environment.GetEnvironmentVariable("REWIND_NO_MERGED_ADDRESSES") != null;
+    private static readonly bool MergedTrace = Environment.GetEnvironmentVariable("REWIND_MERGED_TRACE") != null;
+
+    /// <summary>
+    /// Merged values that are the address of one stack object or another, by the way they are reached, with
+    /// what those objects are (null: handed to calls that take different things). Such a value is a reference
+    /// variable: "ref T m = ref a" on one path, "ref b" on the other.
+    /// </summary>
+    private readonly Dictionary<Node, TypeSig?> _addressPhis = [];
+
+    /// <summary>The stack offsets a merged value is the address of, one per way in, when it is nothing else and they are not all one.</summary>
+    private List<int>? MergedFrameAddresses(Node n)
+    {
+        if (n.Op != Op.Phi || n.In.Length < 2 || n.In.Length > 8) return null;
+        var offsets = new List<int>(n.In.Length);
+        foreach (Node input in n.In)
+        {
+            if (!IsFrameAddress(input, out int at)) return null;
+            offsets.Add(at);
+        }
+        return offsets.Distinct().Count() > 1 ? offsets : null;
+    }
+
+    /// <summary>The type a merged stack address points to, when every object it may be the address of is known as that.</summary>
+    private TypeSig? MergedPointee(Node phi)
+    {
+        if (!_addressPhis.TryGetValue(phi, out TypeSig? pointee) || pointee == null) return null;
+        foreach (Node input in phi.In)
+            if (!IsFrameAddress(input, out int at) || MergedPlace(at, pointee) == null)
+            {
+                if (MergedTrace) Console.Error.WriteLine($"[merged] %{phi.Id}: no {pointee.ShortName} at {(IsFrameAddress(input, out int where) ? where : 0)} (known there: {(_frameTypes.TryGetValue(where, out TypeSig? t) ? t.ShortName : FrameObjectAt(where) is int e ? "inside " + _frameTypes[e].ShortName + " at " + e : "nothing")})");
+                return null;
+            }
+        return pointee;
+    }
+
+    /// <summary>The stack object of the given type at a stack offset: a local of that type, or a field of that type of a struct local.</summary>
+    private HExpr? MergedPlace(int at, TypeSig pointee)
+    {
+        if (_frameTypes.TryGetValue(at, out TypeSig? held) && held.Key == pointee.Key)
+            return FramePlace(at, -1) is PLocation whole && whole.Type.Key == pointee.Key ? whole.Location : null;
+        if (FrameObjectAt(at) is not int enclosing || !IsStructType(_frameTypes[enclosing])) return null;
+        if (_p.Layouts.SizeOf(pointee) is not { Known: true, Size: > 0 } size) return null;
+        return FramePlace(at, size.Size) is PLocation field && field.Type.Key == pointee.Key ? field.Location : null;
     }
 
     private static readonly bool NoParkedStructs = Environment.GetEnvironmentVariable("REWIND_NO_PARKED_STRUCTS") != null;
@@ -1578,9 +1652,13 @@ public sealed partial class HirBuilder
         else if (IsFloat(returnType)) kind = BitsOf(returnType) == 64 ? ReturnKind.Double : ReturnKind.Float;
         else if (IsPassedAsIs(returnType) || ReferenceEquals(returnType, _bool)) kind = ReturnKind.Integer;
         else return false;
+        // (What the call takes is the method's arguments, in their places, and nothing after them.)
+        if (!NoPInvokeChoices) ChosenCalls[call] = (method, _p.Abi.For(method, [], []), 0);
         FinishCall(call, new HCall { Method = method, Arguments = arguments, Type = returnType }, kind, returnType, tail);
         return true;
     }
+
+    private static readonly bool NoPInvokeChoices = Environment.GetEnvironmentVariable("REWIND_NO_PINVOKE_CHOICES") != null;
 
     /// <summary>Types the marshaler passes unchanged: numbers, chars, pointers, native ints, enums.</summary>
     private static bool IsPassedAsIs(TypeSig type) => type switch

@@ -49,6 +49,7 @@ internal static class AddressMerges
     {
         if (Disabled || method.Blocks.Count == 0) return false;
         bool merged = SamePlace(method);
+        if (!NoOneTemporary && OneTemporary(method)) merged = true;
         if (!NoChosenValues && ChosenValues(method)) merged = true;
         if (!NoSplitUses && SplitUses(method)) merged = true;
         return merged;
@@ -168,6 +169,114 @@ internal static class AddressMerges
     /// nothing touches the locals once their address is taken, choosing the value does the same: "v = a" here,
     /// "v = b" there, "x = v" after.
     /// </summary>
+    private static readonly bool NoOneTemporary = Environment.GetEnvironmentVariable("REWIND_NO_ONE_TEMPORARY") != null;
+
+    /// <summary>
+    /// Several paths that end the same way are given one ending by the compiler, and where that ending writes
+    /// a temporary ("up = t.up; x = up.x * k") each path keeps the temporary it had: the shared code gets its
+    /// address, "m = &amp;a" on one path, "m = &amp;b" on the next, and starts with "*m = t.up". A reference
+    /// variable set after it is declared cannot be written in C#, and there was only one temporary to begin
+    /// with. Where the locals whose addresses are taken are named nowhere else, each address is the last thing
+    /// taken before the paths meet, and the first thing done with the variable where they meet is to write the
+    /// whole value through it, the variable is that temporary: "m = t.up; x = m.x * k". (Nothing can tell which
+    /// local it was: none is read before that write, and none is named again.)
+    /// </summary>
+    private static bool OneTemporary(HMethod method)
+    {
+        var given = new Dictionary<HVar, List<(HBlock Block, HAssign Statement, HVar Place)>?>();
+        foreach (HBlock block in method.Blocks)
+            foreach (HStmt s in block.Statements)
+            {
+                if (s is not HAssign { Target: HLocal { Variable: var variable } } assignment || variable.Type is not ByRefSig reference) continue;
+                if (given.TryGetValue(variable, out var known) && known == null) continue;
+                if (assignment.Value is HAddressOf { Target: HLocal { Variable: var place } target } && target.Type != null &&
+                    reference.ElementType.Key == target.Type.Key && place.Type != null && place.Type.Key == target.Type.Key && !ReferenceEquals(place, variable))
+                {
+                    if (known == null) given[variable] = known = [];
+                    known.Add((block, assignment, place));
+                }
+                else given[variable] = null;
+            }
+        foreach (HTryRegion region in method.TryRegions.Values) given.Remove(region.Exception);
+        var chosen = new HashSet<HVar>();
+        foreach (var (variable, places) in given)
+            if (places is { Count: >= 2 } && !variable.AddressTaken)
+                chosen.Add(variable);
+        if (chosen.Count == 0) return false;
+
+        // Every mention of each variable, and how often it is read or written through.
+        var mentions = new Dictionary<HVar, int>();
+        var through = new Dictionary<HVar, int>();
+        var first = new Dictionary<(HVar, HBlock), int>();
+        foreach (HBlock block in method.Blocks)
+            for (int i = 0; i < block.Statements.Count; i++)
+            {
+                int at = i;
+                FinallyFolding.Visit(block.Statements[i], e =>
+                {
+                    switch (e)
+                    {
+                        case HLocal { Variable: var v }:
+                            mentions[v] = mentions.GetValueOrDefault(v) + 1;
+                            if (chosen.Contains(v)) first.TryAdd((v, block), at);
+                            break;
+                        case HDeref { Pointer: HLocal { Variable: var v } }:
+                            through[v] = through.GetValueOrDefault(v) + 1;
+                            break;
+                        case HField { Object: HLocal { Variable: { Type: ByRefSig } v } }:
+                            through[v] = through.GetValueOrDefault(v) + 1;
+                            break;
+                    }
+                });
+            }
+        chosen.RemoveWhere(v =>
+        {
+            var places = given[v]!;
+            // Used through, and in no other way; the locals named in the taking of their addresses, and nowhere else.
+            if (mentions.GetValueOrDefault(v) != through.GetValueOrDefault(v) + places.Count) return true;
+            foreach (var group in places.GroupBy(p => p.Place))
+                if (mentions.GetValueOrDefault(group.Key) != group.Count()) return true;
+            // Each address is the last thing taken before the paths meet...
+            HBlock? join = null;
+            foreach (var (block, statement, _) in places)
+            {
+                int taken = block.Statements.IndexOf(statement);
+                if (taken < 0 || block.Statements[^1] is not HJump { Target: var next }) return true;
+                // (What else is handed over on the way - other merged values - does not name the variable.)
+                for (int k = taken + 1; k < block.Statements.Count - 1; k++)
+                {
+                    bool names = false;
+                    FinallyFolding.Visit(block.Statements[k], e => names |= e is HLocal l && ReferenceEquals(l.Variable, v));
+                    if (names) return true;
+                }
+                if (join != null && !ReferenceEquals(join, next)) return true;
+                join = next;
+            }
+            // ... and where they meet, the first thing done with the variable is to write the whole value through it.
+            if (join == null || !first.TryGetValue((v, join), out int written)) return true;
+            if (join.Statements[written] is not HAssign { Target: HDeref { Pointer: HLocal { Variable: var target } }, Value: var value } ||
+                !ReferenceEquals(target, v) || Names(value, v)) return true;
+            return false;
+        });
+        if (chosen.Count == 0) return false;
+
+        foreach (HVar variable in chosen)
+        {
+            variable.Type = ((ByRefSig)variable.Type).ElementType;
+            foreach (var (block, assignment, _) in given[variable]!) block.Statements.Remove(assignment);
+        }
+        HExpr? Map(HExpr e)
+        {
+            if (e is HDeref { Pointer: HLocal { Variable: var read } } && chosen.Contains(read)) return new HLocal(read) { Type = read.Type };
+            if (e is HLocal { Variable: var named } local && chosen.Contains(named)) local.Type = named.Type;
+            return null;
+        }
+        foreach (HBlock block in method.Blocks)
+            foreach (HStmt s in block.Statements)
+                EnumeratorLoops.Rewrite(s, Map);
+        return true;
+    }
+
     private static bool ChosenValues(HMethod method)
     {
         // What each reference variable is given: addresses of places, and nothing else.

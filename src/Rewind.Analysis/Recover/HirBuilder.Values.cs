@@ -1192,11 +1192,20 @@ public sealed partial class HirBuilder
         }
     }
 
+    private static readonly bool NoAddressConflicts = Environment.GetEnvironmentVariable("REWIND_NO_ADDRESS_CONFLICTS") != null;
+
     private Place ResolveParts(AddressParts a, int size)
     {
         if (a.Base == null)
         {
             if (a.Index == null) return new PUnknown($"absolute address 0x{a.Offset:X}");
+            // What was read from the stack is used as an address, and what the stack is known to hold there is
+            // no reference (two floats, a number of no known type): the compiler kept two variables in the
+            // slot, one after the other, and this one is read as the other. Their lifetimes are told apart for
+            // the next build (see StackSplitting).
+            if (a.Scale == 1 && a.Index.Op == Op.Load && a.Index.Type == VT.I64 && !NoAddressConflicts &&
+                IsFrameAddress(a.Index.In[0], out int reused))
+                FrameConflicts.Add(FrameObjectAt(reused) ?? reused);
             return new PUnknown("address without a typed base");
         }
 
@@ -1697,6 +1706,9 @@ public sealed partial class HirBuilder
     {
         // Skip widening that only filled a register: the store or call narrows again.
         int bits = BitsOf(target);
+        // What takes 32 bits or fewer of a slot made of two halves takes the low half; the high half - what the
+        // slot held before, as a rule - is not looked at.
+        if (n.Op == Op.Concat && !NoUnreadHalves && (bits is 8 or 16 or 32 || (bits == 0 && FitsHalf(target)))) n = n.In[1];
         Node source = Narrowed(n, bits);
         while (source.Op is Op.ZExt or Op.SExt && bits != 0 && source.In[0].Type.Bits() >= bits && source.In[0].Type != VT.I1)
             source = source.In[0];
@@ -1718,6 +1730,11 @@ public sealed partial class HirBuilder
     }
 
     private static readonly bool NoLowHalves = Environment.GetEnvironmentVariable("REWIND_NO_LOW_HALVES") != null;
+    private static readonly bool NoUnreadHalves = Environment.GetEnvironmentVariable("REWIND_NO_UNREAD_HALVES") != null;
+
+    /// <summary>A struct of four bytes or fewer: in a 64-bit slot it is in the low half.</summary>
+    private bool FitsHalf(TypeSig type) =>
+        type.Definition is { IsValueType: true } && _p.Layouts.Of(type) is { Known: true, Size: 1 or 2 or 4 };
     private static readonly bool NoRetypedWrites = Environment.GetEnvironmentVariable("REWIND_NO_RETYPED_WRITES") != null;
     private static readonly bool NoDeclaredFloats = Environment.GetEnvironmentVariable("REWIND_NO_DECLARED_FLOATS") != null;
 
@@ -1855,6 +1872,7 @@ public sealed partial class HirBuilder
     /// </summary>
     private HExpr StructFromBits(Node n, TypeSig structType)
     {
+        if (n.Op == Op.Concat && !NoUnreadHalves && FitsHalf(structType)) n = n.In[1];
         Sem s = Eval(n);
         if (s is SVal v && v.Type != null && ReferenceEquals(v.Type, structType)) return v.Expr;
         if (s is SRef r && ReferenceEquals(r.Type, structType)) return r.Location;

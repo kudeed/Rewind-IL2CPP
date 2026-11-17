@@ -146,6 +146,15 @@ public sealed partial class HirBuilder
     /// <summary>Stack offsets whose memory looked like two different things (for StackSplitting).</summary>
     public HashSet<int> FrameConflicts { get; } = [];
 
+    /// <summary>
+    /// Whether a merged value that is the address of one stack object or another becomes a reference variable
+    /// (see DeclarePhis). Turned off for a build again where such a variable could not be written in C#.
+    /// </summary>
+    public bool MergedAddresses { get; init; } = true;
+
+    /// <summary>The reference variables made that way.</summary>
+    public HashSet<HVar> MergedAddressVariables { get; } = [];
+
     /// <summary>Merged objects used as a class their values do not share (for ClassMerges.SplitAt).</summary>
     public HashSet<Node> MergedObjects { get; } = [];
 
@@ -356,6 +365,40 @@ public sealed partial class HirBuilder
     /// <summary>The values each merged value is given, one per way in.</summary>
     private readonly Dictionary<Node, List<Node>> _phiInputs = [];
 
+    /// <summary>Merged values declared as reference variables: the address of one stack object or another (see DeclarePhis).</summary>
+    private readonly HashSet<Node> _mergedAddresses = [];
+
+    /// <summary>Values given a temporary while only looked at, with the assignment that gives it (see Materialize).</summary>
+    private readonly Dictionary<Node, (HBlock Block, HAssign Assign)> _lookedAt = [];
+    private static readonly bool NoHeldTemps = Environment.GetEnvironmentVariable("REWIND_NO_HELD_TEMPS") != null;
+    private static readonly bool NoParamHalves = Environment.GetEnvironmentVariable("REWIND_NO_PARAM_HALVES") != null;
+
+    /// <summary>Is something still held for the value: it was looked at and has not been used since?</summary>
+    private bool Held(Node n) => _heldProblems.ContainsKey(n) || _heldUnder.ContainsKey(n) || _heldPhiReads.ContainsKey(n);
+
+    /// <summary>A computed value (no read of memory, no call) whose only users are merged values.</summary>
+    private bool OnlyMerged(Node n)
+    {
+        if (NoHeldTemps || n.IsEffect || n.Op is Op.Load or Op.Proj or Op.Phi or Op.Call or Op.TailCall) return false;
+        if (!_uses.TryGetValue(n, out List<Node>? users) || users.Count == 0) return false;
+        // (Or the top half of two halves joined: read when the joined value is, and not when only its bottom
+        // half is taken.)
+        foreach (Node user in users)
+            if (user.Op != Op.Phi && !(user.Op == Op.Concat && ReferenceEquals(user.In[0], n) && !ReferenceEquals(user.In[1], n))) return false;
+        return true;
+    }
+
+    /// <summary>Arithmetic on variables and numbers only: nothing is read from memory and nothing can fail.</summary>
+    private static bool Plain(HExpr e) => e switch
+    {
+        HConst or HLocal or HArg or HOpaque => true,
+        HUnary u => Plain(u.Operand),
+        HBinary b => IsPure(b) && Plain(b.Left) && Plain(b.Right),
+        HCompare c => Plain(c.Left) && Plain(c.Right),
+        HConv c => c.Kind < HConvKind.OvfI1 && Plain(c.Operand),
+        _ => false,
+    };
+
     private void Release(Node n)
     {
         if (_heldProblems.Remove(n, out List<string>? held))
@@ -373,23 +416,80 @@ public sealed partial class HirBuilder
     /// </summary>
     private void SettlePhis()
     {
-        var work = new Queue<Node>(_phiRead);
         var settled = new HashSet<Node>();
-        while (work.Count > 0)
+        void Settle()
         {
-            Node phi = work.Dequeue();
-            if (!settled.Add(phi) || !_phiInputs.TryGetValue(phi, out List<Node>? inputs)) continue;
-            foreach (Node input in inputs)
+            var work = new Queue<Node>(_phiRead.Where(read => !settled.Contains(read)));
+            while (work.Count > 0)
             {
-                if (input.Op == Op.Phi) _phiRead.Add(input);
-                Release(input);
+                Node phi = work.Dequeue();
+                if (!settled.Add(phi) || !_phiInputs.TryGetValue(phi, out List<Node>? inputs)) continue;
+                foreach (Node input in inputs)
+                {
+                    if (input.Op == Op.Phi) _phiRead.Add(input);
+                    Release(input);
+                }
+                foreach (Node read in _phiRead)
+                    if (!settled.Contains(read)) work.Enqueue(read);
             }
-            foreach (Node read in _phiRead)
-                if (!settled.Contains(read)) work.Enqueue(read);
+        }
+        Settle();
+        // Values given a temporary while only looked at (Materialize): one no merged value that is read takes
+        // is no part of the program, and its assignment goes - unless computing it does something a program
+        // would notice, where it stays and whatever could not be said about it counts after all.
+        while (_lookedAt.Count > 0)
+        {
+            bool released = false;
+            foreach (var (n, (_, assign)) in _lookedAt.ToList())
+            {
+                if (!Held(n)) _lookedAt.Remove(n);
+                else if (!Plain(assign.Value))
+                {
+                    Release(n);
+                    _lookedAt.Remove(n);
+                    released = true;
+                }
+            }
+            if (!released) break;
+            Settle();
         }
         var unread = new HashSet<HVar>();
-        foreach (var (phi, variable) in _phiVar)
-            if (!_phiRead.Contains(phi)) unread.Add(variable);
+        void FindUnread()
+        {
+            unread.Clear();
+            foreach (var (phi, variable) in _phiVar)
+                if (!_phiRead.Contains(phi)) unread.Add(variable);
+        }
+        FindUnread();
+        // (To be sure of it: a temporary that a statement which stays still names stays as well, and what was
+        // held for it counts.)
+        while (_lookedAt.Count > 0)
+        {
+            var temps = new Dictionary<HVar, Node>();
+            foreach (var (n, (_, assign)) in _lookedAt)
+                if (assign.Target is HLocal { Variable: var temp }) temps[temp] = n;
+            var named = new HashSet<Node>();
+            foreach (HBlock block in _h.Blocks)
+                foreach (HStmt s in block.Statements)
+                {
+                    if (s is HAssign { Target: HLocal { Variable: var target } } &&
+                        (unread.Contains(target) || (temps.TryGetValue(target, out Node? own) && ReferenceEquals(_lookedAt[own].Assign, s)))) continue;
+                    FinallyFolding.Visit(s, e =>
+                    {
+                        if (e is HLocal l && temps.TryGetValue(l.Variable, out Node? of)) named.Add(of);
+                    });
+                }
+            if (named.Count == 0) break;
+            foreach (Node n in named)
+            {
+                Release(n);
+                _lookedAt.Remove(n);
+            }
+            Settle();
+            FindUnread();
+        }
+        foreach (var (_, (block, assign)) in _lookedAt) block.Statements.Remove(assign);
+        _lookedAt.Clear();
         if (unread.Count == 0) return;
         foreach (HBlock block in _h.Blocks)
             block.Statements.RemoveAll(s => s is HAssign { Target: HLocal { Variable: var target } } && unread.Contains(target));
@@ -408,7 +508,7 @@ public sealed partial class HirBuilder
         if (ProblemTrace != null && text.Contains(ProblemTrace, StringComparison.Ordinal))
         {
             Console.Error.WriteLine("[problem] " + text);
-            foreach (string frame in Environment.StackTrace.Split((char)10).Skip(2).Take(9)) Console.Error.WriteLine("    " + frame.Trim());
+            foreach (string frame in Environment.StackTrace.Split((char)10).Skip(2).Take(18)) Console.Error.WriteLine("    " + frame.Trim());
         }
     }
 
@@ -555,6 +655,14 @@ public sealed partial class HirBuilder
                     {
                         // A struct read in pieces: each piece is the field at that place.
                         _sem[slot] = FieldPlace(((SVal)sem).Expr, p.Type!, part, size) is PLocation field ? new SVal(field.Location) : SJunk.Instance;
+                        continue;
+                    }
+                    // An eight-byte argument (a reference, a long, a double) whose slot the code also reaches four
+                    // bytes at a time: each cell holds a half of it, and the two joined again are the argument.
+                    if (!byValueStruct && !NoParamHalves && size == 4 && part is 0 or 4 && sem is SVal { Expr: var whole8 } &&
+                        p.Type is { } wide && (IsReference(wide) || wide is PointerSig || BitsOf(wide) == 64))
+                    {
+                        _sem[slot] = new SHalf(whole8, part == 4, null);
                         continue;
                     }
                     if (part == 0) _sem[slot] = sem;
@@ -783,7 +891,9 @@ public sealed partial class HirBuilder
                 return h.Part;
             case SHalf h:
             {
-                // Half of a 64-bit quantity used on its own: a genuine bit-level operation.
+                // Half of a 64-bit quantity used on its own: a genuine bit-level operation. (Half of a
+                // reference is no number C# could make of it.)
+                if (IsReference(h.Whole.Type)) Problem("half of a reference used on its own");
                 HExpr bits = IsFloat(h.Whole.Type) ? FloatBits(h.Whole) : h.Whole;
                 if (h.High) bits = new HBinary(HBinaryOp.Shr, bits, new HConst(32, _int)) { Type = _long };
                 return new HConv(HConvKind.I4, bits) { Type = _int };
@@ -821,6 +931,18 @@ public sealed partial class HirBuilder
             if (_refPhis.TryGetValue(phi, out Node? bound) && _sem.TryGetValue(bound, out Sem? boundSem))
             {
                 _sem[phi] = boundSem;
+                continue;
+            }
+            // The address of one stack object or another, by the way in: a reference variable.
+            if (MergedPointee(phi) is { } pointee)
+            {
+                TypeSig reference = _m.Sigs.ByRef(pointee);
+                HVar merged = _h.NewLocal(reference, "m");
+                _phiVar[phi] = merged;
+                _phiOfVar[merged] = phi;
+                _mergedAddresses.Add(phi);
+                MergedAddressVariables.Add(merged);
+                _sem[phi] = new SVal(new HLocal(merged) { Type = reference });
                 continue;
             }
             // Type from the first input that already has a meaning; refined when inputs are assigned.
@@ -861,6 +983,13 @@ public sealed partial class HirBuilder
             if (ZeroOnEdge(from, to, input))
             {
                 copies.Add(new HAssign(new HLocal(variable) { Type = variable.Type }, Coerce(new HConst(0L, _long), variable.Type)));
+                continue;
+            }
+            // A reference variable (see DeclarePhis): on this way in it refers to this stack object.
+            if (_mergedAddresses.Contains(phi) && variable.Type is ByRefSig { ElementType: var element } && IsFrameAddress(input, out int objectAt) &&
+                MergedPlace(objectAt, element) is { } referred)
+            {
+                copies.Add(new HAssign(new HLocal(variable) { Type = variable.Type }, new HAddressOf(referred) { Type = variable.Type }));
                 continue;
             }
             // What a way in gives the merged value is only looked at here: it is read for real when the merged
@@ -1166,7 +1295,29 @@ public sealed partial class HirBuilder
     private void Materialize(Node n)
     {
         if (_sem.ContainsKey(n)) return;
-        Sem s = Compute(n);
+        // A value only merged values take is only looked at here, as what a way in gives a merged value is
+        // (PhiCopies): an outgoing-argument slot keeps what the last call was handed, the slot is "merged" where
+        // paths meet, and nothing may ever read it. What cannot be said about it counts when it is read.
+        bool looked = OnlyMerged(n);
+        Sem s;
+        if (looked)
+        {
+            Node? outer = _computing, subject = _peekSubject;
+            _peeking++;
+            _computing = n;
+            _peekSubject = n;
+            try
+            {
+                s = Compute(n);
+            }
+            finally
+            {
+                _computing = outer;
+                _peekSubject = subject;
+                _peeking--;
+            }
+        }
+        else s = Compute(n);
         switch (s)
         {
             case SVal v when v.Expr is not (HConst or HLocal or HArg):
@@ -1174,7 +1325,9 @@ public sealed partial class HirBuilder
                 HVar t = Temp(v.Type, n.Type);
                 if (_uses.TryGetValue(n, out List<Node>? users) && users.Count == 1) _singleUseTemps.Add(t);
                 if (v.Expr is HField) _fieldTemps[t] = (HField)v.Expr;
-                Emit(new HAssign(new HLocal(t) { Type = t.Type }, v.Expr), n.Addr);
+                var assign = new HAssign(new HLocal(t) { Type = t.Type }, v.Expr);
+                Emit(assign, n.Addr);
+                if (looked && Held(n)) _lookedAt[n] = (_cur, assign);
                 _sem[n] = new SVal(new HLocal(t) { Type = t.Type });
                 break;
             }
@@ -1210,6 +1363,13 @@ public sealed partial class HirBuilder
                 }
             }
             if (_peeking == 0 && (_heldProblems.Count != 0 || _heldUnder.Count != 0 || _heldPhiReads.Count != 0)) Release(n);
+            // Looked at as part of computing another value: what is held for it goes with that value.
+            else if (_peeking > 0 && _computing != null && !ReferenceEquals(_computing, n) && !NoHeldTemps &&
+                     (_heldProblems.Count != 0 || _heldUnder.Count != 0 || _heldPhiReads.Count != 0) && Held(n))
+            {
+                if (!_heldUnder.TryGetValue(_computing, out List<Node>? parts)) _heldUnder[_computing] = parts = [];
+                if (!parts.Contains(n)) parts.Add(n);
+            }
             return s;
         }
         // A value that (through a defect upstream) depends on itself would recurse forever; fail cleanly instead.

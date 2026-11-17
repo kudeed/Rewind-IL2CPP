@@ -837,6 +837,8 @@ public sealed class MethodPipeline
     }
 
     private static readonly bool NoLoopValuesAgain = Environment.GetEnvironmentVariable("REWIND_NO_LOOP_VALUES_AGAIN") != null;
+    private static readonly bool NoAssumedReach = Environment.GetEnvironmentVariable("REWIND_NO_ASSUMED_REACH") != null;
+    private static readonly bool NoUntakenInputs = Environment.GetEnvironmentVariable("REWIND_NO_UNTAKEN_INPUTS") != null;
 
     private HMethod BuildCoreOf(LiftedMethod lifted)
     {
@@ -853,26 +855,56 @@ public sealed class MethodPipeline
         // (Separating one pair of lifetimes can show the next - a temporary that serves as the result of one
         // call and then of another - so this repeats a few times.)
         Function fn = lifted.Function;
+        // A call nothing is known about, handed the address of a stack object: it is taken to reach that
+        // object as far as its other uses show it to extend, not everything above it - an unknown call would
+        // otherwise make one object of the whole frame, and what keeps the call unknown may be the very slot
+        // that needs separating (a delegate kept where a struct was). Checked against the last build (below).
+        var assumed = new List<(Node Call, int Input, int Reach)>();
         for (int round = 0; round < 3 && builder.FrameConflicts.Count != 0; round++)
         {
             ParkedAddresses.Canonicalize(fn);
             Dictionary<int, int> boxes = InPlaceBoxes(fn);
             HirBuilder current = builder;
-            if (StackSplitting.Run(fn, current.FrameConflicts, (call, input) => EscapeExtent(call, input, fn, boxes, current),
-                    (call, input) => WritesOnly(call, input, current), ReadsOnly, WritesAndNothingElse, current.ReachThrough) <= 0)
+            int Extent(Node call, int input)
+            {
+                int extent = EscapeExtent(call, input, fn, boxes, current);
+                if (extent > 0 || extent == StackPromotion.NotTaken || NoAssumedReach || call.Aux is not CallInfo { Indirect: true } ||
+                    current.ChosenCalls.ContainsKey(call)) return extent;
+                if (!fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0) || StackOffset(sp0, call.In[input]) is not int at) return extent;
+                int reach = current.ReachThrough(at);
+                if (reach <= 0) return extent;
+                assumed.Add((call, input, reach));
+                return reach;
+            }
+            if (StackSplitting.Run(fn, current.FrameConflicts, Extent,
+                    (call, input) => WritesOnly(call, input, current), ReadsOnly, WritesAndNothingElse, current.ReachThrough,
+                    (call, input) => TakesLowHalf(current, call, input)) <= 0)
                 break;
             Dictionary<int, int> after = InPlaceBoxes(fn);
             ParkedAddresses.Canonicalize(fn);
-            lifted.Frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, after, current), StackArguments(lifted.Abi));
+            lifted.Frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, after, current), StackArguments(lifted.Abi),
+                (call, input) => TakesLowHalf(current, call, input));
             DeadCode.Run(fn);
             _normalizer.Cleanup(fn);
             // A loop variable that was kept in the memory just separated is a merged value only now.
             if (!NoLoopValuesAgain && LoopValues.Run(fn, ArgumentBits)) _normalizer.Cleanup(fn);
             (builder, result) = BuildRounds(lifted);
         }
+        // What the merged addresses could not be written as in C#: build without them.
         FieldOwners.Run(result, _program.Model);
         ConstantTyping.Run(result, _program);
         AddressMerges.Run(result);
+        if (builder.MergedAddressVariables.Count != 0 && !NoMergedFallback && StillReferences(result, builder.MergedAddressVariables))
+        {
+            (builder, result) = BuildRounds(lifted, mergedAddresses: false);
+            FieldOwners.Run(result, _program.Model);
+            ConstantTyping.Run(result, _program);
+            AddressMerges.Run(result);
+        }
+        // A call taken to reach no more than one object that turns out to take more - or that is still not
+        // known, so that nothing says what it takes: the lifetimes were told apart on a footing that does not hold.
+        if (assumed.Count != 0 && !AssumedReachHolds(assumed, fn, builder) && result.Problems.Count < 64)
+            result.Problems.Add("a stack object handed to a call may be larger than it was taken to be");
         FusionWeaving.Run(result);
         FinallyFolding.Run(result, _program);
         WrapperFolding.Retype(result, _program);
@@ -889,15 +921,53 @@ public sealed class MethodPipeline
         return result;
     }
 
-    private (HirBuilder Builder, HMethod Result) BuildRounds(LiftedMethod lifted)
+    private static readonly bool NoMergedFallback = Environment.GetEnvironmentVariable("REWIND_NO_MERGED_FALLBACK") != null;
+    private static readonly bool AssumedTrace = Environment.GetEnvironmentVariable("REWIND_ASSUMED_TRACE") != null;
+
+    /// <summary>A reference variable made of a merged address that is still one, and given a place more than once.</summary>
+    private static bool StillReferences(HMethod method, HashSet<HVar> made)
     {
-        var builder = new HirBuilder(_program, lifted, null, _program.FrameHints?.Invoke(lifted.Function.Address));
+        var assigned = new Dictionary<HVar, int>();
+        foreach (HBlock block in method.Blocks)
+            foreach (HStmt s in block.Statements)
+                if (s is HAssign { Target: HLocal { Variable: var v } } && made.Contains(v) && v.Type is ByRefSig)
+                    assigned[v] = assigned.GetValueOrDefault(v) + 1;
+        return assigned.Values.Any(n => n > 1);
+    }
+
+    /// <summary>Every call taken to reach a known stack object reaches no more than that, by the method it was found to call.</summary>
+    private bool AssumedReachHolds(List<(Node Call, int Input, int Reach)> assumed, Function fn, HirBuilder built)
+    {
+        Dictionary<int, int> boxes = InPlaceBoxes(fn);
+        foreach (var (call, input, reach) in assumed)
+        {
+            if (call.Dead) continue;
+            if (!Chosen(built, call, input, out _, out _, out AbiParam? taken))
+            {
+                if (AssumedTrace) Console.Error.WriteLine($"[assumed] not known: {Function.Describe(call)}");
+                return false;
+            }
+            if (taken == null) continue; // the method takes nothing there
+            int real = EscapeExtent(call, input, fn, boxes, built);
+            if (real == StackPromotion.NotTaken) continue;
+            if (real <= 0 || real > reach)
+            {
+                if (AssumedTrace) Console.Error.WriteLine($"[assumed] reaches {real}, taken as {reach}: {Function.Describe(call)}");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private (HirBuilder Builder, HMethod Result) BuildRounds(LiftedMethod lifted, bool mergedAddresses = true)
+    {
+        var builder = new HirBuilder(_program, lifted, null, _program.FrameHints?.Invoke(lifted.Function.Address)) { MergedAddresses = mergedAddresses };
         HMethod result = builder.Build();
         // Types of merged values and of stack objects are discovered while building; when any was, build
         // again knowing them.
         for (int round = 0; round < 4 && (builder.PhiTypesRefined || builder.FrameTypesRefined); round++)
         {
-            builder = new HirBuilder(_program, lifted, builder.PhiTypes, builder.RefinedFrameTypes);
+            builder = new HirBuilder(_program, lifted, builder.PhiTypes, builder.RefinedFrameTypes) { MergedAddresses = mergedAddresses };
             result = builder.Build();
         }
         // Each build may learn types the next one starts from. Still learning after the last one means this
@@ -1221,9 +1291,78 @@ public sealed class MethodPipeline
         return true;
     }
 
+    private static int Position(ArgSlot slot) => slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + 4 : -1;
+
+    /// <summary>The call takes a value of four bytes or fewer in that input (an int, a float, a small struct): the bottom half of the slot.</summary>
+    private bool TakesLowHalf(HirBuilder built, Node call, int inputIndex)
+    {
+        if (!Chosen(built, call, inputIndex, out _, out _, out AbiParam? p) || p == null) return false;
+        if (p.Role != ParamRole.Argument || p.Pass == PassKind.Indirect || p.Type is null or ByRefSig or PointerSig) return false;
+        var (size, _, known) = _program.Layouts.SizeOf(p.Type);
+        return known && size is >= 1 and <= 4 && p.Type.IsValueType;
+    }
+
+    private long _delegateCode = -2, _delegateMethod = -2;
+
+    /// <summary>
+    /// The argument position of the method a call hands over last, where the call has the shape of a delegate's
+    /// invocation - "d.invoke_impl(d.method_code, arguments.., d.method)": the code is read from an object and
+    /// the method from the same object. That holds whatever is known of the object. -1 when the call is not that.
+    /// </summary>
+    private int DelegateShapeLast(Node call, CallInfo info)
+    {
+        if (_delegateCode == -2)
+        {
+            TypeDef? type = _program.Model.FindType("System.Delegate");
+            _delegateCode = type?.Fields.FirstOrDefault(f => !f.IsStatic && f.Name == "invoke_impl")?.Offset ?? -1;
+            _delegateMethod = type?.Fields.FirstOrDefault(f => !f.IsStatic && f.Name == "method")?.Offset ?? -1;
+        }
+        if (_delegateCode <= 0 || _delegateMethod <= 0) return -1;
+        static Node? ReadOf(Node n, long offset) =>
+            n.Op == Op.Load && n.In[0] is { Op: Op.Add } address && address.In[1].IsConst && IrBuilder.SImm(address.In[1]) == offset ? address.In[0] : null;
+        Node? from = null;
+        for (int i = 0; i < info.Slots.Count && i < call.In.Length; i++)
+            if (info.Slots[i].Kind == ArgSlotKind.Target) from = ReadOf(call.In[i], _delegateCode);
+        if (from == null) return -1;
+        int last = -1;
+        for (int i = 0; i < info.Slots.Count && i < call.In.Length; i++)
+            if (Position(info.Slots[i]) is >= 0 and var position && ReferenceEquals(ReadOf(call.In[i], _delegateMethod), from))
+                last = Math.Max(last, position);
+        return last;
+    }
+
     private int EscapeExtent(Node call, int inputIndex, Function fn, Dictionary<int, int> boxes, HirBuilder built)
     {
-        if (!Chosen(built, call, inputIndex, out _, out MethodAbi abi, out AbiParam? p) || p == null) return EscapeExtent(call, inputIndex, fn, boxes);
+        if (!Chosen(built, call, inputIndex, out _, out MethodAbi abi, out AbiParam? p))
+        {
+            // A call that was not resolved but has the shape of a delegate's invocation takes nothing after
+            // the method it hands over last.
+            if (!NoUntakenInputs && call.Aux is CallInfo { Indirect: true } unresolved && inputIndex < unresolved.Slots.Count &&
+                !built.ChosenCalls.ContainsKey(call) && DelegateShapeLast(call, unresolved) is >= 0 and var lastTaken &&
+                Position(unresolved.Slots[inputIndex]) > lastTaken)
+                return StackPromotion.NotTaken;
+            return EscapeExtent(call, inputIndex, fn, boxes);
+        }
+        if (p == null)
+        {
+            // Past the last thing the method takes: what the register or the stack slot held before the call
+            // (the address handed to an earlier one, say), no argument of this one. The call reaches nothing
+            // through it.
+            if (!NoUntakenInputs && built.ChosenCalls.TryGetValue(call, out var chosen) && call.Aux is CallInfo info && inputIndex < info.Slots.Count)
+            {
+                ArgSlot slot = info.Slots[inputIndex];
+                int position = slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + 4 : -1;
+                int last = -1;
+                foreach (AbiParam taken in chosen.Abi.Params)
+                    if (chosen.Shift == 0 || taken.Role != ParamRole.MethodInfo)
+                        last = Math.Max(last, taken.Position + chosen.Shift);
+                if (last >= 0 && position > last) return StackPromotion.NotTaken;
+            }
+            return EscapeExtent(call, inputIndex, fn, boxes);
+        }
+        // (The helper that calls a method by its slot finds the method itself: its caller hands over none.)
+        if (p.Role == ParamRole.MethodInfo && !NoUntakenInputs && built.ChosenCalls.TryGetValue(call, out var through) && through.Shift > 0)
+            return StackPromotion.NotTaken;
         int size = -1;
         if (p.Role == ParamRole.ReturnBuffer) size = abi.ReturnSize;
         else if (p.Pass == PassKind.Indirect) size = p.Size;
