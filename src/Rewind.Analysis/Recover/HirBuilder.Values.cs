@@ -496,6 +496,15 @@ public sealed partial class HirBuilder
             _ => HCompareOp.LeUn,
         };
         if (TypeTestCompare(n) is { } typeTest) return typeTest;
+        // "x as T" of a struct T against zero, before the operands become numbers: taken as a number, a T that is
+        // one number became that number - its field read out of the box, which is null where x is no T.
+        if (n.Op is Op.CmpEq or Op.CmpNe && !NoBoxedTests)
+        {
+            Node x = n.In[0], y = n.In[1];
+            if (x.IsConstValue(0)) (x, y) = (y, x);
+            if (y.IsConstValue(0) && Eval(x) is SVal { Expr: HTypeExpr { Op: HTypeOp.IsInst, Target: var tested } boxTest } && !IsReference(tested))
+                return new SVal(new HCompare(op, boxTest, new HConst(null, _object)) { Type = _bool });
+        }
         bool signedCompare = n.Op is Op.CmpLtS or Op.CmpLeS;
         // Equal or not is the same question either way: asked the way the values are held ("x != -1" of an sbyte).
         if (n.Op is Op.CmpEq or Op.CmpNe && !NoHeldSigned) signedCompare = HeldSigned(n.In[0]) || HeldSigned(n.In[1]);
@@ -1595,6 +1604,7 @@ public sealed partial class HirBuilder
         return new SVal(new HTypeExpr(HTypeOp.IsInst, type, Value(obj)) { Type = type });
     }
 
+    private static readonly bool NoBoxedTests = Environment.GetEnvironmentVariable("REWIND_NO_BOXED_TESTS") != null;
     private static readonly bool NoFlaggedCasts = Environment.GetEnvironmentVariable("REWIND_NO_FLAGGED_CASTS") != null;
     private static readonly bool NoStructPieces = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_PIECES") != null;
     private static readonly bool NoStructTops = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_TOPS") != null;

@@ -159,6 +159,9 @@ public sealed partial class HirBuilder
     /// <summary>Stack slots of a bool that are given or handed on as another number (a subset of FrameConflicts).</summary>
     public HashSet<int> BoolSlotConflicts { get; } = [];
 
+    /// <summary>Slots of a number that held another kind of value for a while: a bool's, or a struct in a number's (a subset of FrameConflicts).</summary>
+    public HashSet<int> ScalarSlotConflicts { get; } = [];
+
     /// <summary>
     /// Whether a merged value that is the address of one stack object or another becomes a reference variable
     /// (see DeclarePhis). Turned off for a build again where such a variable could not be written in C#.
@@ -241,11 +244,34 @@ public sealed partial class HirBuilder
                 {
                     FrameConflicts.Add(where);
                     BoolSlotConflicts.Add(where);
+                    ScalarSlotConflicts.Add(where);
                     continue;
                 }
                 if (held is HConst) continue;
                 if ((IsSmallNumber(place.Type) && IsReference(held.Type)) || (IsReference(place.Type) && IsSmallNumber(held.Type))) FrameConflicts.Add(where);
             }
+        // A struct kept in a number's slot (a struct that is one number, where an int was before): stored there,
+        // or boxed from there as the struct. C# converts neither way; the slot held two variables.
+        if (!NoStructSlots)
+            foreach (HBlock block in _h.Blocks)
+                foreach (HStmt s in block.Statements)
+                {
+                    if (s is HAssign { Target: HLocal { Variable: var v } place, Value: var held } && offsetOf.TryGetValue(v, out int at) &&
+                        IsNumber(place.Type) && IsStruct(held.Type))
+                    {
+                        FrameConflicts.Add(at);
+                        ScalarSlotConflicts.Add(at);
+                    }
+                    FinallyFolding.Visit(s, e =>
+                    {
+                        if (e is HTypeExpr { Op: HTypeOp.Box, Target: var boxed, Operand: HLocal { Variable: var bv } from } && IsStruct(boxed) &&
+                            IsNumber(from.Type) && offsetOf.TryGetValue(bv, out int boxedAt))
+                        {
+                            FrameConflicts.Add(boxedAt);
+                            ScalarSlotConflicts.Add(boxedAt);
+                        }
+                    });
+                }
         if (NoBoolConflicts) return;
         // A bool slot handed where another number is taken (an enum, a char): the slot held a bool for one
         // variable and that number for another. Read through the bool, the number would come out as 0 or 1.
@@ -260,6 +286,7 @@ public sealed partial class HirBuilder
                         {
                             FrameConflicts.Add(at);
                             BoolSlotConflicts.Add(at);
+                            ScalarSlotConflicts.Add(at);
                         }
                 });
     }
@@ -283,6 +310,7 @@ public sealed partial class HirBuilder
     private static readonly bool NoScalarConflicts = Environment.GetEnvironmentVariable("REWIND_NO_SCALAR_CONFLICTS") != null;
     private const string LostRegisterUsed = "a value kept in a callee-saved register is used after a caught exception";
     private static readonly bool NoLazyLostRegisters = Environment.GetEnvironmentVariable("REWIND_NO_LAZY_LOST_REGISTERS") != null;
+    private static readonly bool NoStructSlots = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_SLOTS") != null;
     private static readonly bool NoBoolConflicts = Environment.GetEnvironmentVariable("REWIND_NO_BOOL_CONFLICTS") != null;
 
     private void CheckFrameVariables()

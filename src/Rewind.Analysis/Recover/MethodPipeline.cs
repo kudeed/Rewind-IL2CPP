@@ -913,7 +913,7 @@ public sealed class MethodPipeline
             }
             if (StackSplitting.Run(fn, current.FrameConflicts, Extent,
                     (call, input) => WritesOnly(call, input, current), ReadsOnly, WritesAndNothingElse, current.ReachThrough,
-                    (call, input) => TakesLowHalf(current, call, input)) <= 0)
+                    (call, input) => TakesLowHalf(current, call, input), current.ScalarSlotConflicts) <= 0)
                 break;
             Dictionary<int, int> after = InPlaceBoxes(fn);
             ParkedAddresses.Canonicalize(fn);
