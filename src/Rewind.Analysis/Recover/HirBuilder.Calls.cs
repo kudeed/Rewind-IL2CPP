@@ -1367,6 +1367,12 @@ public sealed partial class HirBuilder
             BuildCall(call, native.Method, [], [], isVirtual: false, tail, null, skipFirst: false);
             return;
         }
+        if (target is SMethodCode code)
+        {
+            // The code pointer of a method's own record, called with the method's arguments and the record itself.
+            BuildCall(call, code.Method, code.Inst?.ClassArguments ?? [], code.Inst?.MethodArguments ?? [], isVirtual: false, tail, null, skipFirst: false);
+            return;
+        }
         if (target is SPInvoke pinvoke)
         {
             if (TryBuildPInvokeCall(call, pinvoke.Method, tail)) return;
