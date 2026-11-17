@@ -579,11 +579,38 @@ public sealed class ProgramAnalysis
                 CallTarget beyond = Resolve(onward);
                 if (beyond.IsManaged || beyond.Helper != null) return beyond;
             }
+            if (!target.IsManaged && !NoNamedMath && MathByName(address) is { } math) target.Helper = math;
         }
         return target;
     }
 
     private static readonly bool NoThunkCalls = Environment.GetEnvironmentVariable("REWIND_NO_THUNK_CALLS") != null;
+    private static readonly bool NoNamedMath = Environment.GetEnvironmentVariable("REWIND_NO_NAMED_MATH") != null;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, HelperInfo?> _namedMath = new();
+
+    /// <summary>
+    /// A C runtime math function the signature library does not know: it reports a domain error under its own
+    /// name ("asinf"), itself or in the variant for the processor that it jumps to first. Names shorter than four
+    /// letters ("log", "exp") are left alone: other text could be them.
+    /// </summary>
+    private HelperInfo? MathByName(ulong address) => _namedMath.GetOrAdd(address, start =>
+    {
+        FunctionCode? code = Code.Get(start);
+        if (code == null) return null;
+        var places = new List<FunctionCode> { code };
+        if (code.Instructions <= 8)
+            foreach (ulong variant in code.Callees)
+                if (Code.Get(variant) is { } v)
+                    places.Add(v);
+        foreach (FunctionCode place in places)
+        {
+            if (place.Instructions > 400) continue;
+            foreach (string text in place.Names)
+                if (text.Length >= 4 && RuntimeHelpers.Classify(text) is { Kind: HelperKind.MathFunction } helper)
+                    return helper;
+        }
+        return null;
+    });
 
     private static CallShape ShapeFrom(MethodAbi abi)
     {

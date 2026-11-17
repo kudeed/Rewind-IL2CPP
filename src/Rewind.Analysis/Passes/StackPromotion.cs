@@ -20,6 +20,9 @@ public sealed class FrameObject
 public static class StackPromotion
 {
     public const int StackParamVarBase = 0x10000;
+    /// <summary>What the "how far does this call reach" question answers for an input the call does not take at all.</summary>
+    public const int NotTaken = int.MinValue;
+    private static readonly bool KeepTopHalves = Environment.GetEnvironmentVariable("REWIND_NO_TOP_HALVES") != null;
     private static readonly bool NoEntryArguments = Environment.GetEnvironmentVariable("REWIND_NO_ENTRY_ARGUMENTS") != null;
 
     private readonly record struct Access(Node User, int Offset, int Size, bool IsStore);
@@ -138,7 +141,7 @@ public static class StackPromotion
     /// <param name="stackArguments">
     /// The arguments the method is handed on the stack: offset from the entry stack pointer -> size in bytes.
     /// </param>
-    public static List<FrameObject> Run(Function fn, Func<Node, int, int>? escapeExtent = null, IReadOnlyDictionary<int, int>? stackArguments = null)
+    public static List<FrameObject> Run(Function fn, Func<Node, int, int>? escapeExtent = null, IReadOnlyDictionary<int, int>? stackArguments = null, Func<Node, int, bool>? lowHalfOnly = null)
     {
         var frameObjects = new List<FrameObject>();
         if (!fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0)) return frameObjects;
@@ -167,6 +170,7 @@ public static class StackPromotion
         // 1. Collect direct accesses and escapes.
         var accesses = new List<Access>();
         var escapes = new List<(int Offset, int Extent)>();
+        Dictionary<Node, List<(Node User, int Input)>>? uses = null;
         // Try regions: a slot written in protected code and read where an exception leads keeps living in
         // memory, so the handler and the code after it see the value of the moment the exception was raised.
         var afterException = new HashSet<Block>();
@@ -195,9 +199,17 @@ public static class StackPromotion
         {
             bool isProtected = afterException.Count != 0 && fn.IsProtected(b), seesException = afterException.Contains(b);
             foreach (Node n in b.Phis)
+            {
+                if (n.Dead) continue;
+                // A merged address that is only handed to calls reaches what those calls reach, from each of
+                // the objects it may be the address of.
+                int reached = -1;
+                if (n.In.All(input => IsStackAddress(input, out _)) && StackSplitting.MergedArgument(n, fn, escapeExtent, ref uses) is { } handed)
+                    foreach (var (_, _, extent) in handed) reached = Math.Max(reached, extent);
                 foreach (Node input in n.In)
                     if (IsStackAddress(input, out int o))
-                        escapes.Add((o, -1));
+                        escapes.Add((o, reached));
+            }
             foreach (Node n in b.Nodes)
             {
                 if (n.Dead) continue;
@@ -209,8 +221,14 @@ public static class StackPromotion
                     if (n.Op == Op.Load && i == 0) accesses.Add(new Access(n, offset, n.Type.Bytes(), false));
                     else if (n.Op == Op.Store && i == 0) accesses.Add(new Access(n, offset, n.In[1].Type.Bytes(), true));
                     else if (n.Op == Op.Add && i == 0 && n.In[1].IsConst) { } // another canonical stack address
-                    else if (n.Op is Op.Call or Op.TailCall) escapes.Add((offset, escapeExtent?.Invoke(n, i) ?? -1));
+                    else if (n.Op is Op.Call or Op.TailCall)
+                    {
+                        // (An input the call does not take - what the slot held before - is no use of the address.)
+                        int extent = escapeExtent?.Invoke(n, i) ?? -1;
+                        if (extent != NotTaken) escapes.Add((offset, extent));
+                    }
                     else if (n.Op == Op.Return) { } // returning the frame pointer value itself is meaningless
+                    else if (!KeepTopHalves && StackSplitting.TopHalfEndsNowhere(n, i, fn, escapeExtent, lowHalfOnly, ref uses)) { }
                     else escapes.Add((offset, -1));
                 }
             }

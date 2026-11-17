@@ -576,6 +576,16 @@ public sealed class Normalizer(ProgramAnalysis program)
                     changed = true;
                     continue;
                 }
+                // The same where the bottom half was narrowed further in: "trunc(a) + c" beside the top of "a + c".
+                if (n.Op == Op.Concat && !IrBuilder.NoSumHalves && Resolve(n.In[0]) is { Op: Op.Trunc } top &&
+                    top.In[0] is { Op: Op.ShrU } moved && moved.In[1].IsConstValue(32) &&
+                    IrBuilder.IsLowHalf(n.In[1], moved.In[0], Resolve))
+                {
+                    _replace[n] = Resolve(moved.In[0]);
+                    n.Dead = true;
+                    changed = true;
+                    continue;
+                }
                 if (n.Op != Op.Trunc) continue;
                 Node operand = Resolve(n.In[0]);
                 if (operand.Op is not (Op.Or or Op.And or Op.Const)) continue;

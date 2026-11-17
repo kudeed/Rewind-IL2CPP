@@ -4,6 +4,8 @@ using System.Reflection.Metadata;
 using System.Text;
 using ICSharpCode.Decompiler;
 using ICSharpCode.Decompiler.CSharp;
+using ICSharpCode.Decompiler.CSharp.OutputVisitor;
+using ICSharpCode.Decompiler.CSharp.Syntax;
 using ICSharpCode.Decompiler.Metadata;
 using ICSharpCode.Decompiler.TypeSystem;
 using Rewind.Analysis;
@@ -230,7 +232,7 @@ public static class Decompiler
         return s.Length > 120 ? s[..120] : s.Length == 0 ? "_" : s;
     }
 
-    private static CSharpDecompiler NewDecompiler(string assemblyPath, string assemblyDirectory, LanguageVersion language, bool stateMachines)
+    private static CSharpDecompiler NewDecompiler(string assemblyPath, string assemblyDirectory, LanguageVersion language, bool stateMachines, bool iteratorsOnly = false)
     {
         var module = new PEFile(assemblyPath);
         var resolver = new UniversalAssemblyResolver(assemblyPath, false, module.Metadata.DetectTargetFrameworkId());
@@ -244,7 +246,7 @@ public static class Decompiler
         if (stateMachines)
         {
             settings.YieldReturn = false;
-            settings.AsyncAwait = false;
+            if (!iteratorsOnly) settings.AsyncAwait = false;
         }
         return new CSharpDecompiler(module, resolver, settings);
     }
@@ -277,7 +279,7 @@ public static class Decompiler
             return;
         }
 
-        int errors = 0;
+        int errors = 0, iteratorsKept = 0;
         var work = new ConcurrentQueue<(string File, FullTypeName Name)>(types);
         int workers = Math.Max(1, Math.Min(Environment.ProcessorCount, 1 + types.Count / 64));
         var threads = new List<Thread>();
@@ -286,6 +288,9 @@ public static class Decompiler
             var thread = new Thread(() =>
             {
                 CSharpDecompiler decompiler;
+                CSharpDecompiler? machines = null;
+                // (What DecompileTypeAsString writes with: the formatting of these settings, which NewDecompiler keeps.)
+                CSharpFormattingOptions format = new DecompilerSettings(options.Language).CSharpFormattingOptions;
                 try
                 {
                     decompiler = NewDecompiler(assemblyPath, assemblyDirectory, options.Language, options.StateMachines);
@@ -301,7 +306,18 @@ public static class Decompiler
                     bool failed = false;
                     try
                     {
-                        text = decompiler.DecompileTypeAsString(item.Name);
+                        SyntaxTree tree = decompiler.DecompileType(item.Name);
+                        // An iterator whose rebuilt "yield return"s could never advance: the type is written with its
+                        // state machines as classes instead (see IteratorCheck).
+                        if (!options.StateMachines && !NoIteratorCheck && IteratorCheck.HasStuckIterator(tree))
+                        {
+                            machines ??= NewDecompiler(assemblyPath, assemblyDirectory, options.Language, stateMachines: true, iteratorsOnly: true);
+                            tree = machines.DecompileType(item.Name);
+                            Interlocked.Increment(ref iteratorsKept);
+                        }
+                        var writer = new StringWriter();
+                        tree.AcceptVisitor(new CSharpOutputVisitor(writer, format));
+                        text = writer.ToString();
                     }
                     catch (Exception e)
                     {
@@ -319,12 +335,16 @@ public static class Decompiler
             threads.Add(thread);
         }
         foreach (Thread t in threads) t.Join();
+        if (iteratorsKept != 0)
+            log($"note:     {iteratorsKept} types written with their iterators as state machine classes: the C# decompiler's \"yield return\" for them could not advance");
         lock (result)
         {
             result.Types += types.Count;
             result.TypesWithErrors += errors;
         }
     }
+
+    private static readonly bool NoIteratorCheck = Environment.GetEnvironmentVariable("REWIND_NO_ITERATOR_CHECK") != null;
 
     private const string FailedMember = "// ILSpy could not decompile this member";
 

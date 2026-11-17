@@ -14,6 +14,48 @@ from those two files and gives you .NET assemblies with real method bodies, plus
 Plenty of tools can recover the types and method signatures. Rewind's goal is to recover what the methods
 actually do as well.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/screenshot-dark.png">
+    <img alt="The Rewind desktop app" src="assets/screenshot-light.png" width="90%">
+  </picture>
+</p>
+
+## Download
+
+On Windows, get the installer from [Releases](https://github.com/ratman-bit/Rewind-IL2CPP-Decompiler/releases):
+
+| Installer | Built from |
+| --- | --- |
+| `Rewind-main-Setup.exe`, in the newest release named `Rewind <version>` | the `main` branch: only work that passed the full test pass |
+| `Rewind-experimental-Setup.exe`, in the newest release named `Rewind <version>-experimental` | the `experimental` branch: every change first, tested or not |
+
+Once `main` has a release, the one marked "Latest" is always `main`'s newest.
+
+It installs two things for your Windows account, with no administrator rights or .NET install needed:
+
+- **the desktop app**, with a Start menu and desktop shortcut;
+- **the `rewind` command**, put on your PATH so it works in any terminal you open afterwards.
+
+The app keeps both up to date. It looks for a new build when it starts and every few hours, downloads it in the
+background and installs it the next time it starts. In Settings you can switch which branch you update from
+(switching installs that branch's newest build, even when it's older than yours) or turn automatic updates off.
+Each release also has a `Portable.zip` that runs without installing, but doesn't update itself.
+
+The installers aren't code-signed, so Windows SmartScreen may ask you to confirm the first time.
+
+## The desktop app
+
+The app is a window over the `rewind` command: it runs the same `rewind.exe` and shows what it prints, so it gives
+exactly the output the command does. You choose the game (or drop it onto the window), choose between decompile,
+`dump.cs` and info, and set every option the command has. The app shows the command line it will run, so you can
+copy it into a terminal. While Rewind works, the app shows how far it got; afterwards it shows how many method
+bodies were recovered and gives you buttons for the output, the C# source and the recovery report. If a game isn't
+standard IL2CPP, it says so.
+
+It's built after Material 3 Expressive: its colors are made from one color you pick (or Windows' accent color)
+with the same algorithm Android uses, in light, dark or following Windows.
+
 ## Before you start
 
 Rewind only reads standard IL2CPP builds. If a game's metadata is encrypted or modified, or the game is
@@ -37,6 +79,23 @@ dotnet src/Rewind.Cli/bin/Release/net10.0/rewind.dll info path/to/game
 
 Run it from the repo folder so it finds the signature libraries in `signatures/`, or point at a library or a
 folder of them with `--signatures`.
+
+The desktop app (Windows only) builds to `src/Rewind.Gui/bin/Release/net10.0-windows/Rewind.Gui.exe`. Run from
+there, it uses the command-line tool built in the same clone; you can point it at another `rewind.exe` in
+Settings.
+
+To build the installer yourself, install Velopack's packaging tool once and run the script:
+
+```
+dotnet tool install -g vpk --version 1.2.161
+powershell -ExecutionPolicy Bypass -File installer/pack.ps1
+```
+
+It publishes both programs for Windows x64 into one folder and packs it into `artifacts/installer/`. The
+`main` or `experimental` channel follows the branch you're on, and the version is `installer/version.txt` followed
+by the number of commits (for example `0.1.80`, or `0.1.80-experimental`). You don't need to do this to get a
+release: the workflow in `.github/workflows/release.yml` runs the same script on every push to `main` and
+`experimental`, and publishes the result as a GitHub release.
 
 ## Using it
 
@@ -224,9 +283,12 @@ more games built with that version Rewind recognizes exactly.
 | `src/Rewind.Analysis` | the lifter, IR, cleanup passes, recovery to typed operations and signature matching |
 | `src/Rewind.Output` | assembly rebuilding, IL emission, C# output and `dump.cs` |
 | `src/Rewind.Cli` | the `rewind` command |
+| `src/Rewind.Gui` | the desktop app (WPF): Material 3 Expressive controls, the updater, and Google Sans and Google Sans Code |
 | `src/Rewind.Lab` | `rewind-lab`, commands for measuring things during development (`hir-stats`, `diff-exec`, `sig-apply` and more) |
+| `installer/` | `pack.ps1`, which builds the installer, and the version number |
+| `.github/workflows/` | the release workflow |
 | `signatures/` | signature libraries |
-| `assets/` | the logo and banner, in light and dark versions (SVG and PNG), and the app icon |
+| `assets/` | the logo and banner, in light and dark versions (SVG and PNG), the app icon and the screenshots |
 
 The test games and their ground truth are kept separately and aren't included.
 
@@ -235,3 +297,6 @@ The test games and their ground truth are kept separately and aren't included.
 Rewind is licensed under the [Apache License 2.0](LICENSE). You're free to use it, fork it and change it. If
 you share it or a modified version, keep the [NOTICE](NOTICE) file so the original project gets credit, and
 mark the files you changed.
+
+The libraries and fonts Rewind is built with keep their own licenses; they're listed in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

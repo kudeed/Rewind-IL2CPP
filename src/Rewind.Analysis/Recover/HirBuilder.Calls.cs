@@ -32,6 +32,13 @@ public sealed partial class HirBuilder
         {
             Node? slot = Input(call, ArgSlotKind.Stack, position - Win64Abi.RegisterSlots);
             if (slot == null) return Missing(type);
+            // A float occupies the low half of its stack slot. What fills the rest - what the slot held before,
+            // or the widening of a value read as 32 bits - is not part of it and is not looked at.
+            if (!isDouble && !NoUnreadHalves)
+            {
+                if (slot.Op == Op.Concat) slot = slot.In[1];
+                else if (slot.Op is Op.ZExt or Op.SExt && slot.In[0].Type == VT.I32 && !_materialize.Contains(slot) && !_sem.ContainsKey(slot)) slot = slot.In[0];
+            }
             Sem s = Eval(slot);
             if (s is SPair pair) return AsFloat(pair.Low, type);           // a float occupies the low half of its stack slot
             if (s is SVal v) return AsFloat(v.Expr, type);
@@ -57,6 +64,9 @@ public sealed partial class HirBuilder
     {
         TypeSig? have = e.Type ?? (e as HLocal)?.Variable.Type;
         if (have == null || IsFloat(have)) return e;
+        // A float in a 64-bit slot is the bit pattern in the slot's low half, not a number to convert.
+        if (ReferenceEquals(type, _float) && (ReferenceEquals(have, _long) || ReferenceEquals(have, _ulong)) && e is not HConst && !NoUnreadHalves)
+            return ValueFromBits(new HConv(HConvKind.I4, e) { Type = _int }, _float, 4);
         return Coerce(e, type);
     }
 
@@ -154,6 +164,7 @@ public sealed partial class HirBuilder
     /// </summary>
     private void InferFrameTypes()
     {
+        Dictionary<int, TypeSig?>? parked = NoParkedStructs ? null : ParkedStructParameters();
         foreach (Block b in _fn.Blocks)
         {
             foreach (Node call in b.Nodes)
@@ -161,7 +172,22 @@ public sealed partial class HirBuilder
                 if (call.Dead || call.Op is not (Op.Call or Op.TailCall) || call.Aux is not CallInfo info || info.Intrinsic != null) continue;
                 for (int i = 0; i < call.In.Length && i < info.Slots.Count; i++)
                 {
-                    if (!IsFrameAddress(call.In[i], out int offset)) continue;
+                    // (One call reached from several paths, each with a stack object of its own to hand over:
+                    // the address is merged, and each of the objects is what the call takes there.)
+                    List<int>? merged = null;
+                    bool mixed = false;
+                    if (!IsFrameAddress(call.In[i], out int offset))
+                    {
+                        if (NoMergedAddresses || !MergedAddresses) continue;
+                        if ((merged = MergedFrameAddresses(call.In[i])) == null)
+                        {
+                            // (Stack memory on some ways in, something else on others, a field say, or the same
+                            // stack memory on every way: the stack memory is what the call takes there all the same.)
+                            if (NoMixedMerges || (merged = FrameAddressesAmong(call.In[i])) == null) continue;
+                            mixed = true;
+                        }
+                        offset = merged[0];
+                    }
                     ArgSlot slot = info.Slots[i];
                     int position = slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + Win64Abi.RegisterSlots : -1;
                     if (position < 0) continue;
@@ -205,15 +231,124 @@ public sealed partial class HirBuilder
                                     if (pointees.Count < wanted && Reachable(inst.Method.DeclaringType.Assembly) && PointeeOf(_p.Abi.For(inst), position) is { } t)
                                         Add(t);
                                 if (pointees.Count != 0 && (pointees.Count <= SharedPointeeLimit || !differ)) type = pointees[0];
+                                // Methods of several structs share the code: the one whose struct was put there
+                                // is the one that is called.
+                                if (differ && parked != null && parked.TryGetValue(offset, out TypeSig? held) && held != null &&
+                                    pointees.Any(t => t.Key == held.Key))
+                                    type = held;
                             }
                         }
                     }
-                    if (type != null && !Open(type) && Nameable(type)) _frameTypes.TryAdd(offset, type);
+                    if (type == null || Open(type) || !Nameable(type)) continue;
+                    if (merged == null)
+                    {
+                        // (One call takes a struct there, another a different struct: the memory holds one object,
+                        // then another - a Vector3 for one call, a Quaternion for the next. Each its own lifetime.)
+                        _frameTypes.TryAdd(offset, type);
+                    }
+                    else
+                    {
+                        foreach (int at in merged)
+                        {
+                            // (Known as something else already: the memory is used for two things, one after the other.)
+                            if (!_frameTypes.TryAdd(at, type) && _frameTypes[at].Key != type.Key) FrameConflicts.Add(at);
+                        }
+                        if (mixed) continue;
+                        Node phi = call.In[i];
+                        _addressPhis[phi] = _addressPhis.TryGetValue(phi, out TypeSig? other) && (other == null || other.Key != type.Key) ? null : type;
+                    }
                 }
             }
         }
         SpreadFrameTypes();
         DropCoveredFrameTypes();
+    }
+
+    private static readonly bool NoMergedAddresses = Environment.GetEnvironmentVariable("REWIND_NO_MERGED_ADDRESSES") != null;
+    private static readonly bool MergedTrace = Environment.GetEnvironmentVariable("REWIND_MERGED_TRACE") != null;
+
+    /// <summary>
+    /// Merged values that are the address of one stack object or another, by the way they are reached, with
+    /// what those objects are (null: handed to calls that take different things). Such a value is a reference
+    /// variable: "ref T m = ref a" on one path, "ref b" on the other.
+    /// </summary>
+    private readonly Dictionary<Node, TypeSig?> _addressPhis = [];
+
+    /// <summary>The stack offsets a merged value is the address of, one per way in, when it is nothing else and they are not all one.</summary>
+    private List<int>? MergedFrameAddresses(Node n)
+    {
+        if (n.Op != Op.Phi || n.In.Length < 2 || n.In.Length > 8) return null;
+        var offsets = new List<int>(n.In.Length);
+        foreach (Node input in n.In)
+        {
+            if (!IsFrameAddress(input, out int at)) return null;
+            offsets.Add(at);
+        }
+        return offsets.Distinct().Count() > 1 ? offsets : null;
+    }
+
+    private static readonly bool NoMixedMerges = Environment.GetEnvironmentVariable("REWIND_NO_MIXED_MERGES") != null;
+
+    /// <summary>
+    /// The stack offsets among a merged value's ways in, when some of them are stack addresses and the others
+    /// something else (a field's address), or when they are all the same stack address.
+    /// </summary>
+    private List<int>? FrameAddressesAmong(Node n)
+    {
+        if (n.Op != Op.Phi || n.In.Length < 2 || n.In.Length > 8) return null;
+        var offsets = new List<int>(n.In.Length);
+        foreach (Node input in n.In)
+            if (IsFrameAddress(input, out int at) && !offsets.Contains(at))
+                offsets.Add(at);
+        return offsets.Count != 0 ? offsets : null;
+    }
+
+    /// <summary>The type a merged stack address points to, when every object it may be the address of is known as that.</summary>
+    private TypeSig? MergedPointee(Node phi)
+    {
+        if (!_addressPhis.TryGetValue(phi, out TypeSig? pointee) || pointee == null) return null;
+        foreach (Node input in phi.In)
+            if (!IsFrameAddress(input, out int at) || MergedPlace(at, pointee) == null)
+            {
+                if (MergedTrace) Console.Error.WriteLine($"[merged] %{phi.Id}: no {pointee.ShortName} at {(IsFrameAddress(input, out int where) ? where : 0)} (known there: {(_frameTypes.TryGetValue(where, out TypeSig? t) ? t.ShortName : FrameObjectAt(where) is int e ? "inside " + _frameTypes[e].ShortName + " at " + e : "nothing")})");
+                return null;
+            }
+        return pointee;
+    }
+
+    /// <summary>The stack object of the given type at a stack offset: a local of that type, or a field of that type of a struct local.</summary>
+    private HExpr? MergedPlace(int at, TypeSig pointee)
+    {
+        if (_frameTypes.TryGetValue(at, out TypeSig? held) && held.Key == pointee.Key)
+            return FramePlace(at, -1) is PLocation whole && whole.Type.Key == pointee.Key ? whole.Location : null;
+        if (FrameObjectAt(at) is not int enclosing || !IsStructType(_frameTypes[enclosing])) return null;
+        if (_p.Layouts.SizeOf(pointee) is not { Known: true, Size: > 0 } size) return null;
+        return FramePlace(at, size.Size) is PLocation field && field.Type.Key == pointee.Key ? field.Location : null;
+    }
+
+    private static readonly bool NoParkedStructs = Environment.GetEnvironmentVariable("REWIND_NO_PARKED_STRUCTS") != null;
+
+    /// <summary>
+    /// A struct that came in a register has no address: before one of its methods can be called on it, the code
+    /// stores it on the stack. Those bytes then hold that struct, whatever else the code that is called there
+    /// could be run on. Stack offset to the struct parameter stored there whole (null: more than one kind).
+    /// </summary>
+    private Dictionary<int, TypeSig?> ParkedStructParameters()
+    {
+        var found = new Dictionary<int, TypeSig?>();
+        foreach (Block b in _fn.Blocks)
+            foreach (Node store in b.Nodes)
+            {
+                if (store.Dead || store.Op != Op.Store || !IsFrameAddress(store.In[0], out int offset)) continue;
+                Node value = store.In[1];
+                int bytes = value.Type.Bytes();
+                while (value.Op == Op.Trunc) value = value.In[0];
+                if (!_sem.TryGetValue(value, out Sem? s) || s is not SVal { Expr: HArg { Type: { } type } } || !IsStructType(type) || Open(type) || !Nameable(type))
+                    continue;
+                if (_p.Layouts.SizeOf(type) is not { Known: true } size || size.Size != bytes) continue;
+                found[offset] = found.TryGetValue(offset, out TypeSig? other) && (other == null || other.Key != type.Key) ? null : type;
+            }
+        return found;
     }
 
     /// <summary>
@@ -671,6 +806,8 @@ public sealed partial class HirBuilder
                 // a value boxed in place as an object).
                 SFrame f when _fakeBoxes.ContainsKey(f.Offset) => _object,
                 SFrame f when _frameTypes.TryGetValue(f.Offset, out TypeSig? local) => local,
+                // Stack memory nothing has typed yet: the struct that was stored there whole.
+                SFrame f when p.Role == ParamRole.This && StoredStruct(f.Offset) is { } held => held,
                 _ => null,
             };
             if (actual == null) continue;
@@ -714,7 +851,47 @@ public sealed partial class HirBuilder
     /// </summary>
     private bool Reachable(AssemblyModel assembly) => NoReachableAssemblies || AssemblyScope.Reaches(_method.DeclaringType.Assembly, assembly);
 
+    private static readonly bool NoStoredStructs = Environment.GetEnvironmentVariable("REWIND_NO_STORED_STRUCTS") != null;
+    private Dictionary<int, List<Node>>? _frameStores;
+
+    /// <summary>
+    /// The struct type of what has been stored whole at a stack offset so far (a call's result, a field read
+    /// in one piece), when every such store agrees; null when there is none or they differ. A struct that
+    /// lives in a register is put on the stack before a method is called on it, and of the methods that share
+    /// the called code, the one of that struct is meant.
+    /// </summary>
+    private TypeSig? StoredStruct(int offset)
+    {
+        if (NoStoredStructs) return null;
+        if (_frameStores == null)
+        {
+            _frameStores = [];
+            foreach (Block b in _fn.Blocks)
+                foreach (Node store in b.Nodes)
+                {
+                    if (store.Dead || store.Op != Op.Store || !IsFrameAddress(store.In[0], out int at)) continue;
+                    if (!_frameStores.TryGetValue(at, out List<Node>? list)) _frameStores[at] = list = [];
+                    list.Add(store);
+                }
+        }
+        if (!_frameStores.TryGetValue(offset, out List<Node>? stores)) return null;
+        TypeSig? found = null;
+        foreach (Node store in stores)
+        {
+            Node value = store.In[1];
+            int bytes = value.Type.Bytes();
+            while (value.Op == Op.Trunc) value = value.In[0];
+            // (What has no meaning yet is stored later than the call being looked at.)
+            if (!_sem.TryGetValue(value, out Sem? s) || s is not SVal { Type: { } type } || !IsStructType(type) || Open(type) || !Nameable(type)) continue;
+            if (_p.Layouts.SizeOf(type) is not { Known: true } size || size.Size != bytes) continue;
+            if (found != null && found.Key != type.Key) return null;
+            found = type;
+        }
+        return found;
+    }
+
     private static readonly bool NoResultPlaces = Environment.GetEnvironmentVariable("REWIND_NO_RESULT_PLACES") != null;
+    private static readonly bool NoReturnedResults = Environment.GetEnvironmentVariable("REWIND_NO_RETURNED_RESULTS") != null;
     private static readonly bool NoNullDescriptors = Environment.GetEnvironmentVariable("REWIND_NO_NULL_DESCRIPTORS") != null;
     private static readonly bool NoFreshReceivers = Environment.GetEnvironmentVariable("REWIND_NO_FRESH_RECEIVERS") != null;
 
@@ -738,6 +915,10 @@ public sealed partial class HirBuilder
     {
         if (_resultPlaces.TryGetValue(call, out TypeSig? known)) return known;
         TypeSig? type = null;
+        // What a method hands back as it comes from a call is what that call gives: the result type of the
+        // method is the place.
+        TypeSig? returned = !NoReturnedResults && _abi.Return is ReturnKind.Integer or ReturnKind.StructInRegister && _abi.ReturnType is { IsVoid: false } r && !Open(r) ? r : null;
+        if (returned != null && call.Op == Op.TailCall) return _resultPlaces[call] = returned;
         if (call.Block != null && _position.ContainsKey(call) && Projections(call).TryGetValue(CallResult.IntReturn, out Node? result))
         {
             var holders = new List<Node> { result };
@@ -745,6 +926,16 @@ public sealed partial class HirBuilder
                 foreach (Node use in direct)
                     if (!use.Dead && use.Op == Op.Trunc)
                         holders.Add(use);
+            if (returned != null)
+                foreach (Node holder in holders)
+                {
+                    if (type != null || !_uses.TryGetValue(holder, out List<Node>? uses)) continue;
+                    int bytes = holder.Type.Bytes();
+                    if (!(IsReference(returned) || returned is PointerSig or ByRefSig ? bytes == 8 : _p.Layouts.SizeOf(returned) is { Known: true } size && size.Size == bytes)) continue;
+                    foreach (Node use in uses)
+                        if (!use.Dead && use.Op == Op.Return && use.In.Length != 0 && ReferenceEquals(use.In[0], holder) && ReferenceEquals(use.Block, call.Block))
+                            type = returned;
+                }
             foreach (Node holder in holders)
             {
                 if (type != null || !_uses.TryGetValue(holder, out List<Node>? uses)) continue;
@@ -1173,6 +1364,7 @@ public sealed partial class HirBuilder
 
         HExpr? thisExpr = null;
         var args = new HExpr[method.Parameters.Length];
+        MethodDef? stringConstructor = null;
         HExpr? returnLocation = null;
 
         foreach (AbiParam p in abi.Params)
@@ -1201,6 +1393,17 @@ public sealed partial class HirBuilder
                             Problem($"struct receiver location not recovered on {method.DeclaringType.Name}.{method.Name}");
                             thisExpr = Value(node);
                         }
+                    }
+                    else if (!NoNullReceivers && node.IsConstValue(0))
+                    {
+                        // A string constructor: IL2CPP makes each one a method "CreateString" with the same
+                        // arguments, called with no object - the string is what it returns.
+                        if (StringConstructorOf(method) is { } made) stringConstructor = made;
+                        // An instance method handed zero for its object: the code it shares never reads the
+                        // object, and the C++ compiler, seeing that, did not keep which one it was. "null" here
+                        // would throw where the program does not; what it was called on is not known.
+                        else Problem(UnkeptReceiver);
+                        thisExpr = new HConst(null, p.Type);
                     }
                     else
                     {
@@ -1311,6 +1514,12 @@ public sealed partial class HirBuilder
             virtualCall = !baseCall;
         }
 
+        if (stringConstructor != null && abi.Return == ReturnKind.Integer)
+        {
+            FinishCall(call, new HNewObject { Constructor = stringConstructor, Arguments = args, Type = _string }, abi.Return, _string, tail);
+            return;
+        }
+
         var expr = new HCall
         {
             Method = method,
@@ -1368,6 +1577,66 @@ public sealed partial class HirBuilder
     }
 
     /// <summary>
+    /// The method each way into a merged code pointer picks, when every way in takes a virtual method's code from
+    /// the object's class (or an interface's), and the methods take the same arguments and return the same type.
+    /// </summary>
+    private MethodDef[]? MergedVirtualTargets(Node phi)
+    {
+        if (phi.In.Length < 2 || phi.In.Length > 16) return null;
+        var ways = new MethodDef[phi.In.Length];
+        for (int i = 0; i < phi.In.Length; i++)
+        {
+            MethodDef? method = null;
+            Sem s = Peek(phi.In[i]);
+            if (s is SVTable { MethodInfo: false, Interface: { } iface } it)
+                method = iface.Definition?.Methods.FirstOrDefault(m => m.HasSlot && m.Slot == it.Slot);
+            else if (s is SVTable { MethodInfo: false } vt)
+            {
+                TypeSig? receiverType = Peek(vt.Object) is SVal { Type: { } t } ? t : null;
+                if (_castTypes.TryGetValue(vt.Object, out List<TypeSig>? casts) && casts.Count == 1) receiverType = casts[0];
+                if (receiverType != null) method = FindVirtual(Declared(receiverType), vt.Slot);
+            }
+            if (method == null || method.IsStatic || method.GenericParameters.Length != 0 || method.DeclaringType.GenericParameters.Length != 0) return null;
+            ways[i] = method;
+        }
+        MethodDef first = ways[0];
+        foreach (MethodDef m in ways)
+            if (m.Parameters.Length != first.Parameters.Length || m.ReturnType.Key != first.ReturnType.Key ||
+                m.Parameters.Zip(first.Parameters).Any(p => p.First.Type.Key != p.Second.Type.Key))
+                return null;
+        return ways;
+    }
+
+    /// <summary>
+    /// The call of a merged code pointer whose ways in each picked a virtual method: a branch (or a switch) on the
+    /// number of the method, each arm calling its method with the call's arguments, all meeting again after it.
+    /// </summary>
+    private void EmitDispatch(Node call, HVar which, MethodDef[] methods, bool tail)
+    {
+        // The number is read here: the copies into it stay (see SettlePhis).
+        _phiRead.Add(call.In[0]);
+        int scope = _cur.Scope;
+        HBlock NewBlock()
+        {
+            var block = new HBlock { Id = _h.Blocks.Count, Scope = scope };
+            _h.Blocks.Add(block);
+            return block;
+        }
+        HBlock[] arms = methods.Select(_ => NewBlock()).ToArray();
+        HBlock? join = tail ? null : NewBlock();
+        var chosen = new HLocal(which) { Type = _int };
+        if (arms.Length == 2) Emit(new HBranch(new HCompare(HCompareOp.Eq, chosen, new HConst(0, _int)) { Type = _bool }, arms[0], arms[1]), call.Addr);
+        else Emit(new HSwitch(chosen, arms[..^1], arms[^1]), call.Addr);
+        for (int j = 0; j < arms.Length; j++)
+        {
+            _cur = arms[j];
+            BuildCall(call, methods[j], [], [], isVirtual: true, tail, null, skipFirst: false);
+            if (join != null) Emit(new HJump(join), call.Addr);
+        }
+        if (join != null) _cur = join;
+    }
+
+    /// <summary>
     /// "ldvirtftn": a virtual slot of an object's class read as a value - what a delegate made from a virtual
     /// method ("new Action(this.OnChanged)") is constructed with.
     /// </summary>
@@ -1396,6 +1665,30 @@ public sealed partial class HirBuilder
     private void EmitIndirectCall(Node call, bool tail)
     {
         Node targetNode = call.In[0];
+        // The code of one virtual method or another, by the way in, then called: the compiler merged the calls
+        // of "if (dying) HandleDie(); else HandleRevive();" into one.
+        if (!NoMergedDispatch && targetNode.Op == Op.Phi)
+        {
+            if (_dispatch.TryGetValue(targetNode, out var known))
+            {
+                EmitDispatch(call, known.Which, known.Distinct, tail);
+                return;
+            }
+            if (MergedVirtualTargets(targetNode) is { } ways)
+            {
+                if (ways.Distinct().Count() == 1)
+                {
+                    BuildCall(call, ways[0], [], [], isVirtual: true, tail, null, skipFirst: false);
+                    return;
+                }
+                // (The calls return nothing that is used: one result made of several calls' is not built yet.)
+                if (!Projections(call).Values.Any(IsUsed))
+                {
+                    DispatchPhis[targetNode] = ways;
+                    DispatchRefined = true;
+                }
+            }
+        }
         Sem target = Eval(targetNode);
 
         if (target is SNativeCode native)
@@ -1491,8 +1784,29 @@ public sealed partial class HirBuilder
         else if (IsFloat(returnType)) kind = BitsOf(returnType) == 64 ? ReturnKind.Double : ReturnKind.Float;
         else if (IsPassedAsIs(returnType) || ReferenceEquals(returnType, _bool)) kind = ReturnKind.Integer;
         else return false;
+        // (What the call takes is the method's arguments, in their places, and nothing after them.)
+        if (!NoPInvokeChoices) ChosenCalls[call] = (method, _p.Abi.For(method, [], []), 0);
         FinishCall(call, new HCall { Method = method, Arguments = arguments, Type = returnType }, kind, returnType, tail);
         return true;
+    }
+
+    private static readonly bool NoPInvokeChoices = Environment.GetEnvironmentVariable("REWIND_NO_PINVOKE_CHOICES") != null;
+    private static readonly bool NoNullReceivers = Environment.GetEnvironmentVariable("REWIND_NO_NULL_RECEIVERS") != null;
+    internal const string UnkeptReceiver = "an instance method called on an object the code did not keep";
+
+    /// <summary>The string constructor a "CreateString" method of System.String stands for: the one that takes the same arguments.</summary>
+    private MethodDef? StringConstructorOf(MethodDef method)
+    {
+        if (method.Name != "CreateString" || _string.Definition is not { } type || !ReferenceEquals(method.DeclaringType, type)) return null;
+        foreach (MethodDef candidate in type.Methods)
+        {
+            if (candidate.Name != ".ctor" || candidate.IsStatic || candidate.Parameters.Length != method.Parameters.Length) continue;
+            bool same = true;
+            for (int i = 0; i < candidate.Parameters.Length && same; i++)
+                same = candidate.Parameters[i].Type.Key == method.Parameters[i].Type.Key;
+            if (same) return candidate;
+        }
+        return null;
     }
 
     /// <summary>Types the marshaler passes unchanged: numbers, chars, pointers, native ints, enums.</summary>

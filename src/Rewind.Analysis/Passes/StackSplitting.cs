@@ -24,8 +24,101 @@ public static class StackSplitting
     private const int ReturnSlot = 8;
 
     private static readonly bool BelowOnly = Environment.GetEnvironmentVariable("REWIND_NO_CALLER_SLOTS") != null;
+    private static readonly bool KeepTopHalves = Environment.GetEnvironmentVariable("REWIND_NO_TOP_HALVES") != null;
 
     private static bool Owned(int offset) => offset < 0 || (offset >= ReturnSlot && !BelowOnly);
+
+    /// <summary>
+    /// A stack address goes into a stack slot the compiler also writes 32 bits at a time (an outgoing argument:
+    /// an address for one call, an int for the next); as values, the slot is two cells, and the address is cut
+    /// in two - "address >> 32" here, "trunc(rsp) + c" (no stack address any more) for the bottom. Where paths
+    /// meet the cells are merged, and every later call is handed the two halves joined as what the slot
+    /// "holds". True when that is all that happens to the top half: followed through narrowing, merging and
+    /// joining, every use is an input of a call that does not take it - or takes the bottom half of the slot
+    /// only (an int, a float), where it is the top half of the joined value. The address then went nowhere,
+    /// and is not kept in a value after all.
+    /// </summary>
+    internal static bool TopHalfEndsNowhere(Node user, int input, Function fn, Func<Node, int, int>? escapeExtent,
+        Func<Node, int, bool>? lowHalfOnly, ref Dictionary<Node, List<(Node User, int Input)>>? uses)
+    {
+        if (user.Op != Op.ShrU || input != 0 || !user.In[1].IsConstValue(32) || escapeExtent == null) return false;
+        uses ??= UsesOf(fn);
+        // What is followed: the half itself (32 bits; the shift before it is narrowed counts as that), and
+        // 64-bit values that have it as their top half.
+        var seen = new HashSet<Node> { user };
+        var work = new Stack<(Node Value, bool Joined)>();
+        work.Push((user, false));
+        while (work.Count > 0)
+        {
+            var (value, joined) = work.Pop();
+            if (!uses.TryGetValue(value, out var users)) continue;
+            foreach (var (by, at) in users)
+            {
+                bool next;
+                if (by.Op is Op.Call or Op.TailCall)
+                {
+                    if (escapeExtent(by, at) == StackPromotion.NotTaken) continue;
+                    if (joined && lowHalfOnly != null && lowHalfOnly(by, at)) continue;
+                    return false;
+                }
+                else if (by.Op == Op.Phi) next = joined;
+                else if (by.Op == Op.Trunc && ReferenceEquals(value, user)) next = false; // the shifted address, narrowed: the half
+                else if (by.Op == Op.Trunc && joined && by.Type.Bits() <= 32) continue;  // the bottom half of a joined value: not this
+                else if (by.Op == Op.Concat && !joined && at == 0 && !ReferenceEquals(value, user)) next = true;
+                else return false;
+                if (seen.Count > 512) return false;
+                if (seen.Add(by)) work.Push((by, next));
+            }
+        }
+        return true;
+    }
+
+    private static Dictionary<Node, List<(Node User, int Input)>> UsesOf(Function fn)
+    {
+        var found = new Dictionary<Node, List<(Node User, int Input)>>();
+        void Note(Node n)
+        {
+            for (int i = 0; i < n.In.Length; i++)
+            {
+                if (!found.TryGetValue(n.In[i], out var list)) found[n.In[i]] = list = [];
+                list.Add((n, i));
+            }
+        }
+        foreach (Block b in fn.Blocks)
+        {
+            foreach (Node phi in b.Phis)
+                if (!phi.Dead) Note(phi);
+            foreach (Node n in b.Nodes)
+                if (!n.Dead) Note(n);
+        }
+        return found;
+    }
+
+    private static readonly bool NoMergedArguments = Environment.GetEnvironmentVariable("REWIND_NO_MERGED_ARGUMENTS") != null;
+
+    /// <summary>
+    /// One call reached from several paths, each with a stack object of its own to hand over: the address the
+    /// call takes is merged from theirs. Where that is all the merged address is for - every use is an input of
+    /// a call that reaches a known number of bytes through it - the calls that take it; null otherwise. The
+    /// address is then kept in no value that could be used elsewhere: each call reads or writes one of the
+    /// objects, and which one is the only thing not known.
+    /// </summary>
+    internal static List<(Node Call, int Input, int Extent)>? MergedArgument(Node phi, Function fn, Func<Node, int, int>? escapeExtent,
+        ref Dictionary<Node, List<(Node User, int Input)>>? uses)
+    {
+        if (NoMergedArguments || escapeExtent == null || phi.Op != Op.Phi) return null;
+        uses ??= UsesOf(fn);
+        if (!uses.TryGetValue(phi, out var users) || users.Count == 0 || users.Count > 8) return null;
+        var calls = new List<(Node Call, int Input, int Extent)>();
+        foreach (var (by, at) in users)
+        {
+            if (by.Op != Op.Call || by.Block == null) return null;
+            int extent = escapeExtent(by, at);
+            if (extent <= 0) return null;
+            calls.Add((by, at, extent));
+        }
+        return calls;
+    }
 
     /// <summary>When set, told what was decided for each object (for debugging).</summary>
     public static Action<string>? Trace;
@@ -38,12 +131,26 @@ public static class StackSplitting
         public int Start = start, End = end;
         public bool Uses = uses, Defines = defines;
         public int Id;
+        /// <summary>
+        /// For a way into a merged address (User: the merged value, Input: the way in): the call the merged
+        /// address is handed to. The access happens there, and only when that way was taken - so what it writes
+        /// adds to what the object may hold and replaces nothing.
+        /// </summary>
+        public Node? At;
+        public Node Where => At ?? User;
+        /// <summary>
+        /// Set where the access can be told to one way in: the block that way comes from. The call stands in the
+        /// block the ways meet in with nothing written to the object before it, and that block leads nowhere
+        /// else - so what the call finds in the object is what was there at the end of that block, and what it
+        /// writes is written on that way only. The access is then counted there, like any other.
+        /// </summary>
+        public Block? Path;
     }
 
     /// <summary>Splits the stack objects covering <paramref name="offsets"/>; returns how many lifetimes moved.</summary>
     /// <param name="removable">True for a call that does nothing but write the memory behind that input (a fill, the destination of a copy).</param>
     public static int Run(Function fn, IEnumerable<int> offsets, Func<Node, int, int>? escapeExtent = null, Func<Node, int, bool>? writesOnly = null,
-        Func<Node, int, bool>? readsOnly = null, Func<Node, int, bool>? removable = null, Func<int, int>? reach = null)
+        Func<Node, int, bool>? readsOnly = null, Func<Node, int, bool>? removable = null, Func<int, int>? reach = null, Func<Node, int, bool>? lowHalfOnly = null)
     {
         Trace?.Invoke($"function 0x{fn.Address:X}");
         // An address kept in a value (stored, merged) can be used from anywhere, but only to get at the object it
@@ -67,6 +174,7 @@ public static class StackSplitting
         // Every use of a stack address of the function's own memory.
         var all = new List<Access>();
         var escaped = new List<(int Start, int End, Node By)>();
+        Dictionary<Node, List<(Node User, int Input)>>? uses = null;
         foreach (Block b in fn.Blocks)
             foreach (Node n in b.Nodes)
             {
@@ -79,17 +187,42 @@ public static class StackSplitting
                     else if (n.Op is Op.Call)
                     {
                         int extent = escapeExtent?.Invoke(n, i) ?? -1;
+                        if (extent == StackPromotion.NotTaken) continue; // what the slot held before: no argument of this call
                         bool reads = !(writesOnly?.Invoke(n, i) ?? false) || extent <= 0;
                         bool writes = !(readsOnly?.Invoke(n, i) ?? false) || extent <= 0;
                         all.Add(new Access(n, i, at, extent > 0 ? at + extent : int.MaxValue, reads, writes));
                     }
+                    // The top half of an address, cut off where the address went into a stack slot kept as two
+                    // 32-bit cells (an outgoing argument), that no call takes afterwards.
+                    else if (!KeepTopHalves && TopHalfEndsNowhere(n, i, fn, escapeExtent, lowHalfOnly, ref uses)) { }
                     else escaped.Add((at, Reach(at), n)); // kept in a value, stored, combined: not followed
                 }
             }
         foreach (Block b in fn.Blocks)
             foreach (Node phi in b.Phis)
+            {
+                if (phi.Dead) continue;
+                bool any = false, every = true;
+                foreach (Node input in phi.In)
+                {
+                    if (IsStackAddress(input, out int at) && Owned(at)) any = true;
+                    else every = false;
+                }
+                if (!any) continue;
+                // A merged address that is only handed to calls: each way in is an access those calls make.
+                if (every && MergedArgument(phi, fn, escapeExtent, ref uses) is { } handed)
+                {
+                    for (int way = 0; way < phi.In.Length; way++)
+                    {
+                        IsStackAddress(phi.In[way], out int at);
+                        foreach (var (call, input, extent) in handed)
+                            all.Add(new Access(phi, way, at, at + extent, !(writesOnly?.Invoke(call, input) ?? false), !(readsOnly?.Invoke(call, input) ?? false)) { At = call });
+                    }
+                    continue;
+                }
                 foreach (Node input in phi.In)
                     if (IsStackAddress(input, out int at) && Owned(at)) escaped.Add((at, Reach(at), phi));
+            }
 
         // How far a call given a stack address may reach when its extent is not known: the function's locals end
         // at the return address; above it, as far as anything here touches that memory.
@@ -128,6 +261,12 @@ public static class StackSplitting
             if (escaped.Any(e => e.Start < end && start < e.End))
             {
                 Trace?.Invoke($"object [{start}, {end}) at {offset}: its address is kept in a value ({Function.Describe(escaped.First(e => e.Start < end && start < e.End).By)})");
+                if (Trace != null && Detail)
+                    foreach (Access a in all.Where(a => a.End == int.MaxValue && a.Start < end && start < Top(a.Start)).Take(12))
+                    {
+                        string text = Function.Describe(a.User);
+                        Trace($"    reach unknown from {a.Start}: {(text.Length > 150 ? text[..150] : text)}");
+                    }
                 continue;
             }
             var accesses = all.Where(a => a.Start < end && start < Math.Min(a.End, Top(a.Start))).ToList();
@@ -166,9 +305,34 @@ public static class StackSplitting
                 return x;
             }
             void Union(int a, int b) => parent[Find(a)] = Find(b);
+            // One way into a merged address is one address, whichever call takes it: its accesses stay together.
+            var ways = new Dictionary<(Node, int), int>();
+            foreach (Access a in accesses)
+            {
+                if (a.At == null) continue;
+                if (ways.TryGetValue((a.User, a.Input), out int first)) Union(a.Id, first);
+                else ways[(a.User, a.Input)] = a.Id;
+            }
 
             // Reaching definitions per piece, block by block.
-            var byBlock = accesses.GroupBy(a => a.User.Block!).ToDictionary(g => g.Key, g => g.OrderBy(a => a.User.Block!.Nodes.IndexOf(a.User)).ToList());
+            foreach (Access a in accesses)
+            {
+                a.Path = null;
+                if (a.At == null) continue;
+                Block join = a.User.Block!;
+                if (!ReferenceEquals(a.At.Block, join) || a.Input >= join.Preds.Count || join.Preds[a.Input].Succs.Count != 1) continue;
+                int callAt = join.Nodes.IndexOf(a.At);
+                bool writtenBefore = false;
+                foreach (Access other in accesses)
+                    if (other.Defines && !ReferenceEquals(other.Where, a.At) && ReferenceEquals(other.Where.Block, join) && join.Nodes.IndexOf(other.Where) < callAt)
+                    {
+                        writtenBefore = true;
+                        break;
+                    }
+                if (!writtenBefore) a.Path = join.Preds[a.Input];
+            }
+            var byBlock = accesses.GroupBy(a => a.Path ?? a.Where.Block!)
+                .ToDictionary(g => g.Key, g => g.OrderBy(a => a.Path != null ? int.MaxValue : a.Where.Block!.Nodes.IndexOf(a.Where)).ToList());
             var cfg = new Cfg(fn);
             var outSets = new Dictionary<Block, HashSet<int>[]>();
             HashSet<int>[] In(Block b)
@@ -200,7 +364,11 @@ public static class StackSplitting
                     for (int p = first; p < last; p++)
                         foreach (int d in sets[p]) Union(a.Id, d);
                 if (a.Defines)
-                    for (int p = first; p < last; p++) sets[p] = [a.Id];
+                    for (int p = first; p < last; p++)
+                    {
+                        if (a.At != null && a.Path == null) sets[p].Add(a.Id); // on one way in only: what was there may still be
+                        else sets[p] = [a.Id];
+                    }
             }
             bool changed = true;
             for (int round = 0; changed && round < 32; round++)
@@ -234,7 +402,7 @@ public static class StackSplitting
             // A lifetime made of writes alone is never read: its stores and fills do nothing.
             foreach (var unread in accesses.GroupBy(a => Find(a.Id)).ToList())
             {
-                if (unread.Any(a => a.Uses) || !unread.All(a => a.User.Op == Op.Store || (removable?.Invoke(a.User, a.Input) ?? false))) continue;
+                if (unread.Any(a => a.Uses) || !unread.All(a => a.At == null && (a.User.Op == Op.Store || (removable?.Invoke(a.User, a.Input) ?? false)))) continue;
                 foreach (Access a in unread)
                 {
                     a.User.Dead = true;
@@ -245,14 +413,14 @@ public static class StackSplitting
                 moved++;
             }
             // A removed copy also stops reading its source, here or in another object.
-            accesses.RemoveAll(a => a.User.Dead);
-            all.RemoveAll(a => a.User.Dead);
+            accesses.RemoveAll(a => a.User.Dead || a.At is { Dead: true });
+            all.RemoveAll(a => a.User.Dead || a.At is { Dead: true });
             var groups = accesses.GroupBy(a => Find(a.Id)).OrderByDescending(g => g.Count()).ToList();
             if (Trace != null && Detail)
-                foreach (Access a in accesses.OrderBy(a => a.User.Block!.Id).ThenBy(a => a.User.Block!.Nodes.IndexOf(a.User)))
+                foreach (Access a in accesses.OrderBy(a => a.Where.Block!.Id).ThenBy(a => a.Where.Block!.Nodes.IndexOf(a.Where)))
                 {
                     string text = Function.Describe(a.User);
-                    Trace($"    {a.User.Block} [{a.Start}, {a.End}) {(a.Uses ? "reads" : "")}{(a.Defines ? " writes" : "")} group {Find(a.Id)}: {(text.Length > 90 ? text[..90] : text)}");
+                    Trace($"    {a.Where.Block} [{a.Start}, {a.End}) {(a.Uses ? "reads" : "")}{(a.Defines ? " writes" : "")} group {Find(a.Id)}: {(text.Length > 90 ? text[..90] : text)}");
                 }
             Trace?.Invoke($"object [{start}, {end}) at {offset}: {accesses.Count} accesses, {pieces} pieces, {groups.Count} lifetimes");
             if (groups.Count < 2) continue;
@@ -269,13 +437,18 @@ public static class StackSplitting
             {
                 int newStart = nextBase;
                 nextBase -= Math.Max(0x100, (size + 0xFF) & ~0xFF);
+                // (Several calls may take one merged address: its way in is given the new address once.)
+                var redirected = new HashSet<(Node, int)>();
                 foreach (Access a in group)
                 {
-                    Block block = a.User.Block!;
+                    if (!redirected.Add((a.User, a.Input))) continue;
+                    // The new address stands before what uses it: for a way into a merged address, at the end
+                    // of the block that way comes from.
+                    Block block = a.At != null ? a.User.Block!.Preds[a.Input] : a.User.Block!;
                     Node constant = fn.NewNode(Op.Const, VT.I64, block);
                     constant.Imm = newStart + (a.Start - start);
                     Node address = fn.NewNode(Op.Add, VT.I64, block, sp0, constant);
-                    int at = block.Nodes.IndexOf(a.User);
+                    int at = a.At != null ? Math.Max(0, block.Nodes.Count - 1) : block.Nodes.IndexOf(a.User);
                     block.Nodes.Insert(at, constant);
                     block.Nodes.Insert(at + 1, address);
                     a.User.In[a.Input] = address;

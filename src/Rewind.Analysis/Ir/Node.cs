@@ -264,6 +264,8 @@ public sealed class Function
     {
         var sb = new StringBuilder();
         sb.AppendLine($"function 0x{Address:X}");
+        if (Params.Count != 0) sb.AppendLine("params: " + string.Join(", ", Params.OrderBy(p => p.Key).Select(p => $"v{p.Key}=%{p.Value.Id}:{p.Value.Type}")));
+        if (StackParams.Count != 0) sb.AppendLine("stack params: " + string.Join(", ", StackParams.OrderBy(p => p.Key).Select(p => $"{p.Key}=%{p.Value.Id}:{p.Value.Type}")));
         foreach (Block b in Blocks)
         {
             sb.Append($"{b}: [0x{b.Start:X}..0x{b.End:X})");

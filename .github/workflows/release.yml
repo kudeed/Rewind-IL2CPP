@@ -1,0 +1,43 @@
+name: Release
+
+# Every push to main or experimental becomes a release of that branch: an installer (Rewind-<branch>-Setup.exe), a
+# portable zip, and the update feed installed copies of Rewind read. Both are normal releases; once main has one,
+# the "Latest release" badge stays on main's newest. See installer/pack.ps1 for the versions and what goes in.
+
+on:
+  push:
+    branches: [main, experimental]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref_name == 'main' || github.ref_name == 'experimental'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Install vpk
+        run: dotnet tool install -g vpk --version 1.2.161
+
+      - name: Build, pack and publish
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANNEL: ${{ github.ref_name }}
+        run: ./installer/pack.ps1 -Channel $env:CHANNEL -Download -Upload

@@ -294,8 +294,30 @@ public sealed class IrBuilder(Function fn)
         if (lo.Op == Op.Trunc && lo.In[0].Type == VT.I64 && hi.Op == Op.Trunc && hi.In[0].Op == Op.ShrU &&
             hi.In[0].In[1].IsConstValue(32) && ReferenceEquals(hi.In[0].In[0], lo.In[0]))
             return lo.In[0];
+        // The same where the bottom half was narrowed further in (a stack address: "trunc(rsp) + c").
+        if (!NoSumHalves && hi.Op == Op.Trunc && hi.In[0].Op == Op.ShrU && hi.In[0].In[1].IsConstValue(32) &&
+            IsLowHalf(lo, hi.In[0].In[0]))
+            return hi.In[0].In[0];
         if (hi.IsConstValue(0)) return ZExt(lo, VT.I64);
         return Raw(Op.Concat, VT.I64, hi, lo);
+    }
+
+    internal static readonly bool NoSumHalves = Environment.GetEnvironmentVariable("REWIND_NO_SUM_HALVES") != null;
+
+    /// <summary>
+    /// Is "low" the bottom 32 bits of the 64-bit "whole"? Narrowing moves inside sums and the like when it is
+    /// built (see <see cref="Trunc"/>), so the bottom half of "a + c" is written "trunc(a) + c": the same
+    /// operation on the bottom halves of the operands.
+    /// </summary>
+    internal static bool IsLowHalf(Node low, Node whole, Func<Node, Node>? resolve = null, int depth = 0)
+    {
+        if (resolve != null) { low = resolve(low); whole = resolve(whole); }
+        if (low.Type != VT.I32 || whole.Type != VT.I64) return false;
+        if (whole.IsConst) return low.IsConst && (uint)low.UImm == (uint)whole.UImm;
+        if (low.Op == Op.Trunc && ReferenceEquals(resolve != null ? resolve(low.In[0]) : low.In[0], whole)) return true;
+        if (depth >= 4 || low.Op != whole.Op || low.In.Length != 2 || whole.In.Length != 2) return false;
+        if (whole.Op is not (Op.Add or Op.Sub or Op.Mul or Op.And or Op.Or or Op.Xor)) return false;
+        return IsLowHalf(low.In[0], whole.In[0], resolve, depth + 1) && IsLowHalf(low.In[1], whole.In[1], resolve, depth + 1);
     }
 
     public Node BitsToF(Node bits)

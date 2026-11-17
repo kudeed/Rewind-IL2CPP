@@ -52,6 +52,20 @@ internal static class Program
 
     private static int Main(string[] args)
     {
+        // The desktop app reads this tool's output through a pipe and asks for UTF-8, so that paths outside the
+        // console's code page come through intact. The console's code page is changed only when asked.
+        if (Environment.GetEnvironmentVariable("REWIND_UTF8_OUTPUT") == "1")
+        {
+            try
+            {
+                Console.OutputEncoding = new System.Text.UTF8Encoding(false);
+            }
+            catch (IOException)
+            {
+                // No console to change.
+            }
+        }
+
         // Method recovery walks deep expression trees recursively; give it room.
         int exit = 0;
         var worker = new Thread(() => exit = Run(args), 1 << 30);
