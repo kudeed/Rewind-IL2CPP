@@ -81,6 +81,13 @@ public static class HelperDiscovery
             // The library made for this very version settles it when it recognizes the runtime at all.
             if (exact && kinds >= 20) break;
         }
-        return best ?? new DiscoveredHelpers(new RuntimeHelpers(), context, "none (no signature library for this platform)", 0, false);
+        if (best == null) return new DiscoveredHelpers(new RuntimeHelpers(), context, "none (no signature library for this platform)", 0, false);
+        // What no library recognized, the compiled methods may show by the way they call it.
+        if (HelperRoles.Identify(model, context, index, best.Helpers) is { } found)
+        {
+            log(found);
+            best = best with { Kinds = best.Helpers.ByAddress.Values.Select(i => i.Kind).Distinct().Count() };
+        }
+        return best;
     }
 }
