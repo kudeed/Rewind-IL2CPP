@@ -127,8 +127,11 @@ to the arguments.
 
 - Method bodies are only recovered for x64 Windows builds. ARM64, which covers most Android games, gets
   complete types and signatures but placeholder bodies.
-- Generic methods, and methods of generic types, still get placeholder bodies.
-- `try`/`catch`/`finally` blocks aren't rebuilt yet. Methods that use them are flagged.
+- Generic methods, and methods of generic types, are recovered from the code their instantiations over
+  reference types share. A definition that is only compiled for value types still gets a placeholder body.
+  Where the shared code doesn't say which instantiation a call is to, the call is marked as a gap.
+- `try`/`catch`/`finally` blocks are rebuilt, but not always. When a value is kept in a register across a
+  caught exception, or the end of a `catch` can't be found, the method is flagged.
 - Structs copied in 8- or 16-byte pieces, and structs kept on the stack, often aren't resolved to their
   fields yet. In real games this is the most common kind of gap.
 - Inlined code mostly isn't folded back into a call. Simple field accessors and trivial constructors are, but
