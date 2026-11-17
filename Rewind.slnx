@@ -3,6 +3,7 @@
     <Project Path="src/Rewind.Analysis/Rewind.Analysis.csproj" />
     <Project Path="src/Rewind.Cli/Rewind.Cli.csproj" />
     <Project Path="src/Rewind.Core/Rewind.Core.csproj" />
+    <Project Path="src/Rewind.Gui/Rewind.Gui.csproj" />
     <Project Path="src/Rewind.Lab/Rewind.Lab.csproj" />
     <Project Path="src/Rewind.Output/Rewind.Output.csproj" />
   </Folder>

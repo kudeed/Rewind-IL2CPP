@@ -1,0 +1,52 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    The desktop front end: a Material 3 window over the command-line decompiler (rewind.exe), which it runs as a
+    child process. It holds no decompiler code of its own, so what it produces is exactly what "rewind" produces.
+    The installer (installer/pack.ps1) puts both in one folder and keeps them up to date from the GitHub releases
+    of this repository with Velopack (see README).
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <!-- So that the whole solution still builds where WPF cannot run. -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <AssemblyName>Rewind.Gui</AssemblyName>
+    <RootNamespace>Rewind.Gui</RootNamespace>
+    <ApplicationIcon>..\..\assets\rewind.ico</ApplicationIcon>
+    <!-- Velopack's install, update and uninstall steps start the app; Program.Main hands them over first. -->
+    <StartupObject>Rewind.Gui.Program</StartupObject>
+    <!-- A desktop app: the decompiler's server-style settings belong to the command-line tool. -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <!-- Overridden by installer/pack.ps1 with the version being released. -->
+    <Version>0.1.0</Version>
+    <Product>Rewind</Product>
+    <Description>Rewind: a Unity IL2CPP decompiler</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="MaterialDesignThemes" Version="5.4.0" />
+    <PackageReference Include="Velopack" Version="1.2.161" />
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
+    <PackageReference Include="MaterialColorUtilities" Version="0.3.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- App.xaml only holds resources; the entry point is Program.Main. -->
+    <ApplicationDefinition Remove="App.xaml" />
+    <Page Include="App.xaml" />
+  </ItemGroup>
+  <ItemGroup>
+    <Resource Include="..\..\assets\rewind-logo.png" Link="Assets\rewind-logo.png" />
+    <Resource Include="..\..\assets\rewind-logo-dark.png" Link="Assets\rewind-logo-dark.png" />
+    <Resource Include="..\..\assets\rewind.ico" Link="Assets\rewind.ico" />
+    <!-- Google Sans and Google Sans Code (SIL Open Font License 1.1), Latin, Greek and Cyrillic subsets. -->
+    <Resource Include="Fonts\*.ttf" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The licenses travel with the app. -->
+    <None Include="Fonts\OFL-*.txt" Link="licenses\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\LICENSE" Link="licenses\LICENSE.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\NOTICE" Link="licenses\NOTICE.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\THIRD-PARTY-NOTICES.md" Link="licenses\THIRD-PARTY-NOTICES.md" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

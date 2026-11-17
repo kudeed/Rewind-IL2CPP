@@ -1,0 +1,45 @@
+<Window x:Class="Rewind.Gui.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:materialDesign="http://materialdesigninxaml.net/winfx/xaml/themes"
+        xmlns:views="clr-namespace:Rewind.Gui.Views"
+        Title="Rewind"
+        Width="1320" Height="880" MinWidth="980" MinHeight="640"
+        WindowStartupLocation="CenterScreen"
+        Background="{DynamicResource M3.PageBrush}"
+        Foreground="{DynamicResource M3.OnSurface}"
+        FontFamily="{StaticResource M3.Font}"
+        TextElement.FontFamily="{StaticResource M3.Font}"
+        TextElement.Foreground="{DynamicResource M3.OnSurface}"
+        UseLayoutRounding="True"
+        Icon="pack://application:,,,/Assets/rewind.ico"
+        AllowDrop="True" DragOver="OnDragOver" Drop="OnDrop">
+  <Grid>
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="96" />
+      <ColumnDefinition Width="*" />
+    </Grid.ColumnDefinitions>
+
+    <!-- Navigation rail -->
+    <StackPanel Grid.Column="0" Margin="0,20,0,0">
+      <Image Source="{DynamicResource Rewind.Logo}" Width="48" Height="48" Margin="0,0,0,36" ToolTip="Rewind"
+             RenderOptions.BitmapScalingMode="HighQuality" />
+      <ListBox Style="{StaticResource M3.NavRail}" ItemsSource="{Binding NavItems}" SelectedIndex="{Binding SelectedPage}"
+               AutomationProperties.Name="Pages" />
+    </StackPanel>
+
+    <!-- Pages -->
+    <Grid Grid.Column="1" x:Name="Pages">
+      <views:DecompileView x:Name="DecompilePage" DataContext="{Binding Decompile}"
+                           Visibility="{Binding DataContext.SelectedPage, RelativeSource={RelativeSource AncestorType=Window}, Converter={StaticResource Page}, ConverterParameter=0}" />
+      <views:SettingsView x:Name="SettingsPage" DataContext="{Binding Settings}"
+                          Visibility="{Binding DataContext.SelectedPage, RelativeSource={RelativeSource AncestorType=Window}, Converter={StaticResource Page}, ConverterParameter=1}" />
+      <views:AboutView x:Name="AboutPage" DataContext="{Binding Settings}"
+                       Visibility="{Binding DataContext.SelectedPage, RelativeSource={RelativeSource AncestorType=Window}, Converter={StaticResource Page}, ConverterParameter=2}" />
+    </Grid>
+
+    <materialDesign:Snackbar Grid.Column="1" MessageQueue="{Binding Messages}" HorizontalAlignment="Center" VerticalAlignment="Bottom"
+                             Margin="0,0,0,24" Background="{DynamicResource M3.InverseSurface}" Foreground="{DynamicResource M3.InverseOnSurface}"
+                             FontFamily="{StaticResource M3.Font}" materialDesign:ElevationAssist.Elevation="Dp3" />
+  </Grid>
+</Window>

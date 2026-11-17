@@ -1,0 +1,514 @@
+<UserControl x:Class="Rewind.Gui.Views.DecompileView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:materialDesign="http://materialdesigninxaml.net/winfx/xaml/themes"
+             xmlns:local="clr-namespace:Rewind.Gui"
+             xmlns:vm="clr-namespace:Rewind.Gui.ViewModels"
+             xmlns:ex="clr-namespace:Rewind.Gui.Expressive">
+  <UserControl.Resources>
+    <local:PathName x:Key="PathName" />
+    <ex:BoolToAngle x:Key="Angle" />
+  </UserControl.Resources>
+  <Grid Margin="8,0,24,0">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="5*" MinWidth="440" />
+      <ColumnDefinition Width="24" />
+      <ColumnDefinition Width="6*" MinWidth="400" />
+    </Grid.ColumnDefinitions>
+
+    <!-- ================= What to read and what to do with it ================= -->
+    <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="0,0,12,0">
+      <StackPanel Margin="0,28,0,32">
+        <TextBlock Text="Decompile" Style="{StaticResource M3.PageTitle}" Margin="16,0,0,4" />
+        <TextBlock Style="{StaticResource M3.Supporting}" Margin="16,0,16,0"
+                   Text="Turns a Unity game built with IL2CPP back into .NET assemblies with real method bodies, and C# source you can read." />
+
+        <!-- Game -->
+        <TextBlock Text="Game" Style="{StaticResource M3.GroupLabel}" />
+        <Border Style="{StaticResource M3.Card}" Padding="24">
+          <StackPanel>
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+              </Grid.ColumnDefinitions>
+              <Grid Width="64" Height="64" VerticalAlignment="Top">
+                <ex:ShapeView Fill="{DynamicResource M3.PrimaryContainer}" Lobes="9" Depth="0.07" TurnSeconds="30" />
+                <materialDesign:PackIcon Kind="GamepadVariantOutline" Width="30" Height="30" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                         Foreground="{DynamicResource M3.OnPrimaryContainer}" ex:Motion.Pop="True" />
+              </Grid>
+              <StackPanel Grid.Column="1" Margin="20,6,0,0">
+                <TextBlock Text="Drop a game here, or choose one" Style="{StaticResource M3.TitleMedium}" />
+                <TextBlock Style="{StaticResource M3.Supporting}" Margin="0,2,0,0"
+                           Text="A game folder, its .exe, an APK, XAPK, APKS, AAB or IPA, or the IL2CPP binary itself." />
+              </StackPanel>
+            </Grid>
+            <WrapPanel Margin="76,16,0,0">
+              <Button Style="{StaticResource M3.TonalButton}" Command="{Binding BrowseInputFolderCommand}" AutomationProperties.Name="Choose a folder" Margin="0,0,8,0" Padding="16,0,24,0">
+                <StackPanel Orientation="Horizontal">
+                  <materialDesign:PackIcon Kind="FolderOpenOutline" Style="{StaticResource M3.Icon}" />
+                  <TextBlock Text="Folder" />
+                </StackPanel>
+              </Button>
+              <Button Style="{StaticResource M3.TonalButton}" Command="{Binding BrowseInputFileCommand}" AutomationProperties.Name="Choose a file" Padding="16,0,24,0">
+                <StackPanel Orientation="Horizontal">
+                  <materialDesign:PackIcon Kind="FileSearchOutline" Style="{StaticResource M3.Icon}" />
+                  <TextBlock Text="File" />
+                </StackPanel>
+              </Button>
+            </WrapPanel>
+            <TextBox Style="{StaticResource M3.Field}" Margin="0,20,0,0" Text="{Binding Input, UpdateSourceTrigger=PropertyChanged}"
+                     AutomationProperties.Name="Game" materialDesign:HintAssist.Hint="Path" materialDesign:TextFieldAssist.HasClearButton="True" />
+            <StackPanel Visibility="{Binding RecentInputs.Count, Converter={StaticResource VisibleWhenAny}}" Margin="0,16,0,0">
+              <TextBlock Text="Recent" Style="{StaticResource M3.LabelLarge}" Foreground="{DynamicResource M3.OnSurfaceVariant}" Margin="0,0,0,8" />
+              <ItemsControl ItemsSource="{Binding RecentInputs}">
+                <ItemsControl.ItemsPanel>
+                  <ItemsPanelTemplate>
+                    <WrapPanel />
+                  </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate>
+                    <Button Style="{StaticResource M3.OutlinedButton}" Height="32" Padding="8,0,16,0" Margin="0,0,8,8"
+                            materialDesign:ButtonAssist.CornerRadius="8" Foreground="{DynamicResource M3.OnSurface}"
+                            Command="{Binding DataContext.UseRecentCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                            CommandParameter="{Binding}" ToolTip="{Binding}">
+                      <StackPanel Orientation="Horizontal">
+                        <materialDesign:PackIcon Kind="History" Width="18" Height="18" Margin="0,0,8,0" VerticalAlignment="Center"
+                                                 Foreground="{DynamicResource M3.Primary}" />
+                        <TextBlock Text="{Binding Converter={StaticResource PathName}}" VerticalAlignment="Center" />
+                      </StackPanel>
+                    </Button>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+            </StackPanel>
+          </StackPanel>
+        </Border>
+
+        <!-- Action -->
+        <TextBlock Text="Action" Style="{StaticResource M3.GroupLabel}" />
+        <Border Style="{StaticResource M3.Card}">
+          <StackPanel>
+            <UniformGrid Rows="1">
+              <RadioButton Style="{StaticResource M3.SegmentFirst}" GroupName="command" IsChecked="{Binding IsDecompile}" Content="Decompile" />
+              <RadioButton Style="{StaticResource M3.Segment}" GroupName="command" IsChecked="{Binding IsDump}" Content="dump.cs" />
+              <RadioButton Style="{StaticResource M3.SegmentLast}" GroupName="command" IsChecked="{Binding IsInfo}" Content="Info" />
+            </UniformGrid>
+            <TextBlock Text="{Binding CommandDescription}" Style="{StaticResource M3.Supporting}" Margin="4,12,4,0" />
+            <Grid Margin="0,16,0,0" Visibility="{Binding NeedsOutput, Converter={StaticResource Visible}}">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+              </Grid.ColumnDefinitions>
+              <TextBox Style="{StaticResource M3.Field}" Text="{Binding OutputDir, UpdateSourceTrigger=PropertyChanged}" AutomationProperties.Name="Output folder"
+                       materialDesign:HintAssist.Hint="Output folder"
+                       materialDesign:HintAssist.HelperText="A folder named after the game, unless you choose one" />
+              <Button Grid.Column="1" Style="{StaticResource M3.IconButton}" Command="{Binding BrowseOutputCommand}" AutomationProperties.Name="Choose the output folder"
+                      ToolTip="Choose the output folder" Margin="8,4,0,0" VerticalAlignment="Top">
+                <materialDesign:PackIcon Kind="FolderOpenOutline" Width="24" Height="24" />
+              </Button>
+            </Grid>
+          </StackPanel>
+        </Border>
+
+        <!-- Options -->
+        <StackPanel Visibility="{Binding IsDecompile, Converter={StaticResource Visible}}">
+          <TextBlock Text="Options" Style="{StaticResource M3.GroupLabel}" />
+          <local:ListGroup>
+            <Border Style="{StaticResource M3.Row}">
+              <DockPanel>
+                <ToggleButton DockPanel.Dock="Right" Style="{StaticResource M3.Switch}" IsChecked="{Binding WriteSource}" AutomationProperties.Name="Write C# source" Margin="16,0,0,0" />
+                <materialDesign:PackIcon DockPanel.Dock="Left" Kind="CodeBraces" Style="{StaticResource M3.RowIcon}" />
+                <StackPanel VerticalAlignment="Center">
+                  <TextBlock Text="Write C# source" Style="{StaticResource M3.BodyLarge}" />
+                  <TextBlock Text="Off: only the rebuilt assemblies, for any .NET decompiler" Style="{StaticResource M3.Supporting}" />
+                </StackPanel>
+              </DockPanel>
+            </Border>
+            <Border Style="{StaticResource M3.Row}" IsEnabled="{Binding WriteSource}">
+              <DockPanel>
+                <ComboBox DockPanel.Dock="Right" Style="{StaticResource M3.Combo}" Width="230" Margin="16,0,0,0" VerticalAlignment="Center"
+                          ItemsSource="{Binding CSharpChoices}" SelectedItem="{Binding CSharp}" DisplayMemberPath="Label" AutomationProperties.Name="C# version" />
+                <materialDesign:PackIcon DockPanel.Dock="Left" Kind="LanguageCsharp" Style="{StaticResource M3.RowIcon}" />
+                <StackPanel VerticalAlignment="Center">
+                  <TextBlock Text="C# version" Style="{StaticResource M3.BodyLarge}" />
+                  <TextBlock Text="The game's Unity version, to compile the source in its project" Style="{StaticResource M3.Supporting}" />
+                </StackPanel>
+              </DockPanel>
+            </Border>
+            <Border Style="{StaticResource M3.Row}" IsEnabled="{Binding WriteSource}">
+              <DockPanel>
+                <ToggleButton DockPanel.Dock="Right" Style="{StaticResource M3.Switch}" IsChecked="{Binding StateMachines}" AutomationProperties.Name="Iterators and async methods as classes" Margin="16,0,0,0" />
+                <materialDesign:PackIcon DockPanel.Dock="Left" Kind="Repeat" Style="{StaticResource M3.RowIcon}" />
+                <StackPanel VerticalAlignment="Center">
+                  <TextBlock Text="Iterators and async methods as classes" Style="{StaticResource M3.BodyLarge}" />
+                  <TextBlock Text="As the compiler made them, without yield return and await" Style="{StaticResource M3.Supporting}" />
+                </StackPanel>
+              </DockPanel>
+            </Border>
+            <Border Style="{StaticResource M3.Row}">
+              <DockPanel>
+                <ComboBox DockPanel.Dock="Right" Style="{StaticResource M3.Combo}" Width="230" Margin="16,0,0,0" VerticalAlignment="Center"
+                          ItemsSource="{Binding ThreadChoices}" SelectedItem="{Binding Threads}" DisplayMemberPath="Label" AutomationProperties.Name="Threads" />
+                <materialDesign:PackIcon DockPanel.Dock="Left" Kind="Memory" Style="{StaticResource M3.RowIcon}" />
+                <StackPanel VerticalAlignment="Center">
+                  <TextBlock Text="Threads" Style="{StaticResource M3.BodyLarge}" />
+                  <TextBlock Text="The output is the same for any number" Style="{StaticResource M3.Supporting}" />
+                </StackPanel>
+              </DockPanel>
+            </Border>
+            <Border Style="{StaticResource M3.Row}">
+              <DockPanel>
+                <ToggleButton DockPanel.Dock="Right" Style="{StaticResource M3.Switch}" IsChecked="{Binding AllAssemblies}" AutomationProperties.Name="All assemblies" Margin="16,0,0,0" />
+                <materialDesign:PackIcon DockPanel.Dock="Left" Kind="PackageVariantClosed" Style="{StaticResource M3.RowIcon}" />
+                <StackPanel VerticalAlignment="Center">
+                  <TextBlock Text="All assemblies" Style="{StaticResource M3.BodyLarge}" />
+                  <TextBlock Text="Off: only the assemblies you choose" Style="{StaticResource M3.Supporting}" />
+                </StackPanel>
+              </DockPanel>
+            </Border>
+            <Border Style="{StaticResource M3.Row}" Visibility="{Binding AllAssemblies, Converter={StaticResource Collapsed}}" Padding="20,16">
+              <StackPanel>
+                <DockPanel>
+                  <Button DockPanel.Dock="Right" Style="{StaticResource M3.TextButton}" Command="{Binding ChooseNoAssembliesCommand}" Content="None"
+                          Visibility="{Binding Assemblies.Count, Converter={StaticResource VisibleWhenAny}}" />
+                  <Button DockPanel.Dock="Right" Style="{StaticResource M3.TonalButton}" Command="{Binding ReadAssembliesCommand}" Padding="16,0,24,0"
+                          AutomationProperties.Name="Read the list of assemblies">
+                    <StackPanel Orientation="Horizontal">
+                      <materialDesign:PackIcon Kind="FormatListChecks" Style="{StaticResource M3.Icon}" />
+                      <TextBlock Text="Read the list" />
+                    </StackPanel>
+                  </Button>
+                  <TextBlock Text="{Binding AssemblySummary}" Style="{StaticResource M3.Supporting}" VerticalAlignment="Center" Margin="0,0,16,0" />
+                </DockPanel>
+                <ex:WavyProgress Style="{StaticResource M3.Wavy}" IsIndeterminate="True" Margin="0,12,0,0"
+                                 Visibility="{Binding IsReadingAssemblies, Converter={StaticResource Visible}}" />
+                <TextBox Style="{StaticResource M3.Field}" Margin="0,12,0,0" Text="{Binding AssemblyFilter, UpdateSourceTrigger=PropertyChanged}"
+                         AutomationProperties.Name="Filter assemblies" materialDesign:HintAssist.Hint="Filter" materialDesign:TextFieldAssist.HasClearButton="True"
+                         materialDesign:TextFieldAssist.LeadingIcon="Magnify" materialDesign:TextFieldAssist.HasLeadingIcon="True"
+                         Visibility="{Binding Assemblies.Count, Converter={StaticResource VisibleWhenAny}}" />
+                <ListBox ItemsSource="{Binding AssemblyView}" MaxHeight="280" Margin="-8,8,0,0" Background="Transparent" BorderThickness="0"
+                         ItemContainerStyle="{StaticResource M3.PlainItem}"
+                         Visibility="{Binding Assemblies.Count, Converter={StaticResource VisibleWhenAny}}"
+                         VirtualizingPanel.IsVirtualizing="True" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                  <ListBox.ItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:AssemblyChoice}">
+                      <CheckBox Style="{StaticResource M3.CheckBox}" IsChecked="{Binding IsChecked}">
+                        <DockPanel>
+                          <TextBlock DockPanel.Dock="Right" Text="{Binding Types}" Style="{StaticResource M3.Supporting}" Margin="12,0,4,0" />
+                          <TextBlock Text="{Binding Name}" Style="{StaticResource M3.BodyLarge}" TextTrimming="CharacterEllipsis" TextWrapping="NoWrap" />
+                        </DockPanel>
+                      </CheckBox>
+                    </DataTemplate>
+                  </ListBox.ItemTemplate>
+                </ListBox>
+                <TextBox Style="{StaticResource M3.Field}" Margin="0,12,0,0" Text="{Binding TypedAssemblies, UpdateSourceTrigger=PropertyChanged}"
+                         AutomationProperties.Name="Assembly names" materialDesign:HintAssist.Hint="Assembly names"
+                         materialDesign:HintAssist.HelperText="Separated by commas, for example Assembly-CSharp" />
+              </StackPanel>
+            </Border>
+          </local:ListGroup>
+        </StackPanel>
+
+        <!-- Advanced -->
+        <TextBlock Text="Advanced" Style="{StaticResource M3.GroupLabel}" />
+        <local:ListGroup>
+          <ToggleButton x:Name="AdvancedToggle" Style="{StaticResource M3.RowButton}" AutomationProperties.Name="Advanced">
+            <DockPanel>
+              <Grid DockPanel.Dock="Right" Width="40" Height="40" VerticalAlignment="Center">
+                <Ellipse Fill="{DynamicResource M3.SurfaceContainerHighest}" />
+                <materialDesign:PackIcon Kind="ChevronDown" Width="24" Height="24" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                         Foreground="{DynamicResource M3.OnSurfaceVariant}"
+                                         ex:Motion.Rotation="{Binding IsChecked, ElementName=AdvancedToggle, Converter={StaticResource Angle}, ConverterParameter=180}" />
+              </Grid>
+              <materialDesign:PackIcon DockPanel.Dock="Left" Kind="TuneVariant" Style="{StaticResource M3.RowIcon}" />
+              <StackPanel VerticalAlignment="Center">
+                <TextBlock Text="Files, versions and details" Style="{StaticResource M3.BodyLarge}" />
+                <TextBlock Text="Only when Rewind cannot find them on its own" Style="{StaticResource M3.Supporting}" />
+              </StackPanel>
+            </DockPanel>
+          </ToggleButton>
+          <Border Style="{StaticResource M3.Row}" Visibility="{Binding IsChecked, ElementName=AdvancedToggle, Converter={StaticResource Visible}}" Padding="20,16">
+            <StackPanel>
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBox Style="{StaticResource M3.Field}" Text="{Binding Metadata, UpdateSourceTrigger=PropertyChanged}"
+                         materialDesign:HintAssist.Hint="Metadata file (global-metadata.dat)" materialDesign:TextFieldAssist.HasClearButton="True" />
+                <Button Grid.Column="1" Style="{StaticResource M3.IconButton}" Command="{Binding BrowseMetadataCommand}" ToolTip="Choose" Margin="8,4,0,0"
+                        AutomationProperties.Name="Choose the metadata file">
+                  <materialDesign:PackIcon Kind="FileSearchOutline" Width="22" Height="22" />
+                </Button>
+              </Grid>
+              <Grid Margin="0,12,0,0">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBox Style="{StaticResource M3.Field}" Text="{Binding Binary, UpdateSourceTrigger=PropertyChanged}"
+                         materialDesign:HintAssist.Hint="Native binary (GameAssembly.dll, libil2cpp.so)" materialDesign:TextFieldAssist.HasClearButton="True" />
+                <Button Grid.Column="1" Style="{StaticResource M3.IconButton}" Command="{Binding BrowseBinaryCommand}" ToolTip="Choose" Margin="8,4,0,0"
+                        AutomationProperties.Name="Choose the native binary">
+                  <materialDesign:PackIcon Kind="FileSearchOutline" Width="22" Height="22" />
+                </Button>
+              </Grid>
+              <Grid Margin="0,12,0,0">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="16" />
+                  <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <ComboBox Style="{StaticResource M3.Combo}" ItemsSource="{Binding AbiChoices}" SelectedItem="{Binding Abi}" DisplayMemberPath="Label"
+                          materialDesign:HintAssist.Hint="Android ABI" AutomationProperties.Name="Android ABI" />
+                <TextBox Grid.Column="2" Style="{StaticResource M3.Field}" Margin="0" Text="{Binding Unity, UpdateSourceTrigger=PropertyChanged}"
+                         materialDesign:HintAssist.Hint="Unity version" materialDesign:TextFieldAssist.HasClearButton="True"
+                         materialDesign:HintAssist.HelperText="For example 2022.3.33f1" AutomationProperties.Name="Unity version" />
+              </Grid>
+              <Grid Margin="0,16,0,0">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="Auto" />
+                  <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBox Style="{StaticResource M3.Field}" Text="{Binding Signatures, UpdateSourceTrigger=PropertyChanged}"
+                         materialDesign:HintAssist.Hint="Signature library" materialDesign:TextFieldAssist.HasClearButton="True"
+                         materialDesign:HintAssist.HelperText="Decompile: a .sig file or a folder of them; by default the ones that come with Rewind" />
+                <Button Grid.Column="1" Style="{StaticResource M3.IconButton}" Command="{Binding BrowseSignatureFileCommand}" ToolTip="Choose a file" Margin="8,4,0,0"
+                        AutomationProperties.Name="Choose a signature library">
+                  <materialDesign:PackIcon Kind="FileSearchOutline" Width="22" Height="22" />
+                </Button>
+                <Button Grid.Column="2" Style="{StaticResource M3.IconButton}" Command="{Binding BrowseSignatureFolderCommand}" ToolTip="Choose a folder" Margin="0,4,0,0"
+                        AutomationProperties.Name="Choose a folder of signature libraries">
+                  <materialDesign:PackIcon Kind="FolderOpenOutline" Width="22" Height="22" />
+                </Button>
+              </Grid>
+            </StackPanel>
+          </Border>
+          <Border Style="{StaticResource M3.Row}" Visibility="{Binding IsChecked, ElementName=AdvancedToggle, Converter={StaticResource Visible}}">
+            <DockPanel>
+              <ToggleButton DockPanel.Dock="Right" Style="{StaticResource M3.Switch}" IsChecked="{Binding Verbose}" AutomationProperties.Name="Print progress details" Margin="16,0,0,0" />
+              <materialDesign:PackIcon DockPanel.Dock="Left" Kind="TextLong" Style="{StaticResource M3.RowIcon}" />
+              <StackPanel VerticalAlignment="Center">
+                <TextBlock Text="Print progress details" Style="{StaticResource M3.BodyLarge}" />
+                <TextBlock Text="More lines in the output while it runs" Style="{StaticResource M3.Supporting}" />
+              </StackPanel>
+            </DockPanel>
+          </Border>
+          <Button Style="{StaticResource M3.RowButton}" Command="{Binding ResetAdvancedCommand}" MinHeight="56"
+                  Visibility="{Binding IsChecked, ElementName=AdvancedToggle, Converter={StaticResource Visible}}">
+            <DockPanel>
+              <materialDesign:PackIcon DockPanel.Dock="Left" Kind="History" Style="{StaticResource M3.RowIcon}" Foreground="{DynamicResource M3.Primary}" />
+              <TextBlock Text="Reset these" Style="{StaticResource M3.LabelLarge}" Foreground="{DynamicResource M3.Primary}" VerticalAlignment="Center" />
+            </DockPanel>
+          </Button>
+        </local:ListGroup>
+      </StackPanel>
+    </ScrollViewer>
+
+    <!-- ================= Running and the result ================= -->
+    <Grid Grid.Column="2" Margin="0,28,0,24">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="*" />
+      </Grid.RowDefinitions>
+
+      <!-- The command -->
+      <Border Grid.Row="0" Style="{StaticResource M3.Card}" Padding="24,18,16,20">
+        <StackPanel>
+          <DockPanel>
+            <Button DockPanel.Dock="Right" Style="{StaticResource M3.TonalIconButton}" Command="{Binding CopyCommandLineCommand}"
+                    ToolTip="Copy the command" AutomationProperties.Name="Copy the command" Margin="0,-6,0,0">
+              <materialDesign:PackIcon Width="20" Height="20" ex:Motion.Pop="True">
+                <materialDesign:PackIcon.Style>
+                  <Style TargetType="materialDesign:PackIcon">
+                    <Setter Property="Kind" Value="ContentCopy" />
+                    <Style.Triggers>
+                      <DataTrigger Binding="{Binding CommandCopied}" Value="True">
+                        <Setter Property="Kind" Value="Check" />
+                      </DataTrigger>
+                    </Style.Triggers>
+                  </Style>
+                </materialDesign:PackIcon.Style>
+              </materialDesign:PackIcon>
+            </Button>
+            <TextBlock Text="Command" Style="{StaticResource M3.TitleMedium}" VerticalAlignment="Center" />
+          </DockPanel>
+          <Border Background="{DynamicResource M3.CodeBrush}" CornerRadius="16" Padding="16,12" Margin="0,8,8,0">
+            <TextBlock Text="{Binding CommandLine}" FontFamily="{StaticResource M3.Mono}" FontSize="13" TextWrapping="Wrap" LineHeight="20" />
+          </Border>
+          <TextBlock Style="{StaticResource M3.Supporting}" Margin="0,10,8,0"
+                     Text="The same command works in a terminal: the installer puts rewind on your PATH." />
+        </StackPanel>
+      </Border>
+
+      <!-- Run, or how far it got -->
+      <Grid Grid.Row="1" Margin="0,20,0,20" MinHeight="56">
+        <Button Style="{StaticResource M3.Fab}" Command="{Binding RunCommand}" HorizontalAlignment="Left"
+                AutomationProperties.Name="Run" Visibility="{Binding IsRunning, Converter={StaticResource Collapsed}}" ex:Motion.SpringIn="True">
+          <StackPanel Orientation="Horizontal">
+            <materialDesign:PackIcon Kind="PlayArrow" Width="28" Height="28" Margin="0,0,12,0" VerticalAlignment="Center" />
+            <TextBlock Text="{Binding RunLabel}" VerticalAlignment="Center" />
+          </StackPanel>
+        </Button>
+        <Border Style="{StaticResource M3.Card}" Padding="16,14,24,14" Visibility="{Binding IsRunning, Converter={StaticResource Visible}}" ex:Motion.SpringIn="True">
+          <DockPanel>
+            <ex:LoadingIndicator DockPanel.Dock="Left" Width="52" Height="52" Fill="{DynamicResource M3.Primary}" Container="{DynamicResource M3.PrimaryContainer}"
+                                 Margin="0,0,16,0" VerticalAlignment="Center" />
+            <Button DockPanel.Dock="Right" Style="{StaticResource M3.TonalButton}" Command="{Binding StopCommand}" AutomationProperties.Name="Stop" Padding="16,0,24,0"
+                    Margin="20,0,0,0" VerticalAlignment="Center">
+              <StackPanel Orientation="Horizontal">
+                <materialDesign:PackIcon Kind="Stop" Style="{StaticResource M3.Icon}" />
+                <TextBlock Text="Stop" />
+              </StackPanel>
+            </Button>
+            <StackPanel VerticalAlignment="Center">
+              <DockPanel>
+                <TextBlock DockPanel.Dock="Right" Text="{Binding Elapsed}" Style="{StaticResource M3.Supporting}" />
+                <TextBlock Text="{Binding Phase}" Style="{StaticResource M3.TitleMedium}" />
+              </DockPanel>
+              <ex:WavyProgress Style="{StaticResource M3.Wavy}" IsIndeterminate="True" Margin="0,8,0,0" />
+            </StackPanel>
+          </DockPanel>
+        </Border>
+      </Grid>
+
+      <!-- The result -->
+      <Border Grid.Row="2" CornerRadius="28" Padding="24,22" Margin="0,0,0,20" Visibility="{Binding HasOutcome, Converter={StaticResource Visible}}"
+              ex:Motion.SpringIn="True">
+        <Border.Style>
+          <Style TargetType="Border">
+            <Setter Property="Background" Value="{DynamicResource M3.SurfaceContainerHigh}" />
+            <Setter Property="TextElement.Foreground" Value="{DynamicResource M3.OnSurface}" />
+            <Style.Triggers>
+              <DataTrigger Binding="{Binding Outcome}" Value="{x:Static vm:Outcome.Done}">
+                <Setter Property="Background" Value="{DynamicResource M3.PrimaryContainer}" />
+                <Setter Property="TextElement.Foreground" Value="{DynamicResource M3.OnPrimaryContainer}" />
+              </DataTrigger>
+              <DataTrigger Binding="{Binding Outcome}" Value="{x:Static vm:Outcome.Protected}">
+                <Setter Property="Background" Value="{DynamicResource M3.TertiaryContainer}" />
+                <Setter Property="TextElement.Foreground" Value="{DynamicResource M3.OnTertiaryContainer}" />
+              </DataTrigger>
+              <DataTrigger Binding="{Binding Outcome}" Value="{x:Static vm:Outcome.Failed}">
+                <Setter Property="Background" Value="{DynamicResource M3.ErrorContainer}" />
+                <Setter Property="TextElement.Foreground" Value="{DynamicResource M3.OnErrorContainer}" />
+              </DataTrigger>
+              <DataTrigger Binding="{Binding Outcome}" Value="{x:Static vm:Outcome.Refused}">
+                <Setter Property="Background" Value="{DynamicResource M3.ErrorContainer}" />
+                <Setter Property="TextElement.Foreground" Value="{DynamicResource M3.OnErrorContainer}" />
+              </DataTrigger>
+            </Style.Triggers>
+          </Style>
+        </Border.Style>
+        <StackPanel>
+          <DockPanel>
+            <Grid DockPanel.Dock="Left" Width="56" Height="56" Margin="0,0,20,0" VerticalAlignment="Top">
+              <ex:ShapeView Fill="{Binding (TextElement.Foreground), RelativeSource={RelativeSource AncestorType=Border}}" Lobes="10" Depth="0.1" TurnSeconds="40" />
+              <materialDesign:PackIcon Kind="{Binding OutcomeIcon}" Width="28" Height="28" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                       Foreground="{Binding Background, RelativeSource={RelativeSource AncestorType=Border}}" ex:Motion.Pop="True" />
+            </Grid>
+            <StackPanel>
+              <TextBlock Style="{StaticResource M3.DisplayMedium}" Margin="0,-6,0,2"
+                         ex:Motion.CountFormat="{}{0:F1}%" ex:Motion.Count="{Binding OutcomePercent}"
+                         Visibility="{Binding OutcomeBig, Converter={StaticResource VisibleWithText}}" />
+              <TextBlock Text="{Binding OutcomeTitle}" Style="{StaticResource M3.TitleMedium}" />
+              <TextBlock Text="{Binding OutcomeDetail}" Style="{StaticResource M3.BodyMedium}" Margin="0,6,0,0" Opacity="0.9"
+                         Visibility="{Binding OutcomeDetail, Converter={StaticResource VisibleWithText}}" />
+            </StackPanel>
+          </DockPanel>
+          <WrapPanel Margin="44,16,0,0">
+            <Button Style="{StaticResource M3.FilledButton}" Command="{Binding OpenOutputCommand}" AutomationProperties.Name="Open the output" Margin="0,0,8,0" Padding="16,0,24,0"
+                    Visibility="{Binding CanOpenOutput, Converter={StaticResource Visible}}">
+              <StackPanel Orientation="Horizontal">
+                <materialDesign:PackIcon Kind="FolderOpenOutline" Style="{StaticResource M3.Icon}" />
+                <TextBlock Text="Open the output" />
+              </StackPanel>
+            </Button>
+            <Button Style="{StaticResource M3.TextButton}" Command="{Binding OpenSourceCommand}" AutomationProperties.Name="Open the C# source" Foreground="{Binding (TextElement.Foreground), RelativeSource={RelativeSource AncestorType=Border}}"
+                    Visibility="{Binding CanOpenSource, Converter={StaticResource Visible}}">
+              <StackPanel Orientation="Horizontal">
+                <materialDesign:PackIcon Kind="LanguageCsharp" Style="{StaticResource M3.Icon}" />
+                <TextBlock Text="C# source" />
+              </StackPanel>
+            </Button>
+            <Button Style="{StaticResource M3.TextButton}" Command="{Binding OpenReportCommand}" AutomationProperties.Name="Open the recovery report" Foreground="{Binding (TextElement.Foreground), RelativeSource={RelativeSource AncestorType=Border}}"
+                    Visibility="{Binding CanOpenReport, Converter={StaticResource Visible}}">
+              <StackPanel Orientation="Horizontal">
+                <materialDesign:PackIcon Kind="FileDocumentOutline" Style="{StaticResource M3.Icon}" />
+                <TextBlock Text="Recovery report" />
+              </StackPanel>
+            </Button>
+          </WrapPanel>
+        </StackPanel>
+      </Border>
+
+      <!-- What rewind printed -->
+      <Border Grid.Row="3" Style="{StaticResource M3.Card}" Padding="8">
+        <DockPanel>
+          <DockPanel DockPanel.Dock="Top" Margin="16,6,0,6">
+            <Button DockPanel.Dock="Right" Style="{StaticResource M3.IconButton}" Command="{Binding ClearLogCommand}" ToolTip="Clear" AutomationProperties.Name="Clear the output">
+              <materialDesign:PackIcon Kind="Broom" Width="20" Height="20" />
+            </Button>
+            <Button DockPanel.Dock="Right" Style="{StaticResource M3.IconButton}" Command="{Binding CopyLogCommand}" ToolTip="Copy all" AutomationProperties.Name="Copy all output">
+              <materialDesign:PackIcon Width="20" Height="20" ex:Motion.Pop="True">
+                <materialDesign:PackIcon.Style>
+                  <Style TargetType="materialDesign:PackIcon">
+                    <Setter Property="Kind" Value="ContentCopy" />
+                    <Style.Triggers>
+                      <DataTrigger Binding="{Binding LogCopied}" Value="True">
+                        <Setter Property="Kind" Value="Check" />
+                      </DataTrigger>
+                    </Style.Triggers>
+                  </Style>
+                </materialDesign:PackIcon.Style>
+              </materialDesign:PackIcon>
+            </Button>
+            <TextBlock Text="Output" Style="{StaticResource M3.TitleMedium}" VerticalAlignment="Center" />
+          </DockPanel>
+          <Border Background="{DynamicResource M3.CodeBrush}" CornerRadius="18">
+            <Grid>
+              <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" Visibility="{Binding Lines.Count, Converter={StaticResource VisibleWhenNone}}">
+                <materialDesign:PackIcon Kind="ConsoleLine" Width="40" Height="40" HorizontalAlignment="Center" Foreground="{DynamicResource M3.OutlineVariant}" />
+                <TextBlock Text="What rewind prints shows up here" Style="{StaticResource M3.Supporting}" Margin="0,8,0,0" />
+              </StackPanel>
+              <ListBox x:Name="Log" ItemsSource="{Binding Lines}" FontFamily="{StaticResource M3.Mono}" FontSize="12.5"
+                       Background="Transparent" BorderThickness="0" Padding="4,10" SelectionMode="Extended"
+                       ItemContainerStyle="{StaticResource M3.PlainItem}"
+                       VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                       ScrollViewer.HorizontalScrollBarVisibility="Auto">
+                <ListBox.ItemTemplate>
+                  <DataTemplate DataType="{x:Type vm:LogLine}">
+                    <TextBlock x:Name="Text" Text="{Binding Text}" Foreground="{DynamicResource M3.OnSurface}" LineHeight="19" LineStackingStrategy="BlockLineHeight" />
+                    <DataTemplate.Triggers>
+                      <DataTrigger Binding="{Binding Kind}" Value="{x:Static vm:LineKind.Command}">
+                        <Setter TargetName="Text" Property="Foreground" Value="{DynamicResource M3.Primary}" />
+                        <Setter TargetName="Text" Property="FontWeight" Value="Medium" />
+                      </DataTrigger>
+                      <DataTrigger Binding="{Binding Kind}" Value="{x:Static vm:LineKind.Error}">
+                        <Setter TargetName="Text" Property="Foreground" Value="{DynamicResource M3.Error}" />
+                      </DataTrigger>
+                      <DataTrigger Binding="{Binding Kind}" Value="{x:Static vm:LineKind.Warning}">
+                        <Setter TargetName="Text" Property="Foreground" Value="{DynamicResource M3.Tertiary}" />
+                      </DataTrigger>
+                      <DataTrigger Binding="{Binding Kind}" Value="{x:Static vm:LineKind.Note}">
+                        <Setter TargetName="Text" Property="Foreground" Value="{DynamicResource M3.OnSurfaceVariant}" />
+                      </DataTrigger>
+                      <DataTrigger Binding="{Binding Kind}" Value="{x:Static vm:LineKind.Done}">
+                        <Setter TargetName="Text" Property="Foreground" Value="{DynamicResource M3.Primary}" />
+                        <Setter TargetName="Text" Property="FontWeight" Value="Medium" />
+                      </DataTrigger>
+                    </DataTemplate.Triggers>
+                  </DataTemplate>
+                </ListBox.ItemTemplate>
+              </ListBox>
+            </Grid>
+          </Border>
+        </DockPanel>
+      </Border>
+    </Grid>
+  </Grid>
+</UserControl>
