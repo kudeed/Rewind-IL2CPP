@@ -567,6 +567,7 @@ public sealed class MethodPipeline
             StructFolding.Run(result, _program, this);
             _inlineFolding.Run(result);
         }
+        StructFromParts.Run(result, this);
         WriteBacks.Run(result, _program);
         AccessorFolding.Run(result, _program);
         LibraryInternals.Run(result, _program);
