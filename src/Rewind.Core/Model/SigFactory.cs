@@ -5,15 +5,17 @@ namespace Rewind.Model;
 /// <summary>Creates interned <see cref="TypeSig"/> instances and performs generic substitution.</summary>
 public sealed class SigFactory
 {
-    private readonly Dictionary<string, TypeSig> _interned = new(StringComparer.Ordinal);
+    // (Shared by every thread that recovers methods: two that ask for the same type at the same time must get
+    // the same instance, since types are compared by reference.)
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, TypeSig> _interned = new(StringComparer.Ordinal);
 
     private T Intern<T>(string key, Func<T> create) where T : TypeSig
     {
         if (_interned.TryGetValue(key, out TypeSig? existing)) return (T)existing;
         T sig = create();
         sig.Key = key;
-        _interned[key] = sig;
-        return sig;
+        // (Made twice by two threads: the one that got there first is the type; the other is dropped unseen.)
+        return (T)_interned.GetOrAdd(key, sig);
     }
 
     public PrimitiveSig Primitive(Il2CppTypeEnum element, TypeDef? definition = null) =>
