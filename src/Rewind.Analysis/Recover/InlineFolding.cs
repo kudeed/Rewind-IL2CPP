@@ -57,7 +57,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
     /// they are used, and the parameter back where all of it is made anew - for a parameter that the method
     /// neither changes nor takes the address of, so that it is the same all the way through.
     /// </summary>
-    private void WholeParameters(HMethod? h)
+    internal void WholeParameters(HMethod? h)
     {
         if (NoWhole || h == null || h.Blocks.Count == 0 || h.TryRegions.Count != 0) return;
         var sets = new Dictionary<HVar, int>();
@@ -168,10 +168,21 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         /// <summary>The fields it touches and the methods it calls.</summary>
         public readonly HashSet<object> Members = [];
         public int Size;
+        // (Looked at on first use, by whichever thread uses the model first: each kept as one number, which
+        // another thread reads whole or not at all.)
+        private volatile int _early, _ownFirst;
         /// <summary>Whether it reads all its parameters before it does anything else (see ReadsFirst); null: not looked at yet.</summary>
-        public bool? Early;
+        public bool? Early
+        {
+            get => _early == 0 ? null : _early == 2;
+            set => _early = value == null ? 0 : value.Value ? 2 : 1;
+        }
         /// <summary>Whether it names its object once, as the first thing it works out, and does not change it (see ThisFirst); null: not looked at yet.</summary>
-        public bool? OwnFirst;
+        public bool? OwnFirst
+        {
+            get => _ownFirst == 0 ? null : _ownFirst == 2;
+            set => _ownFirst = value == null ? 0 : value.Value ? 2 : 1;
+        }
     }
 
     private HExpr[]? Reexpress(HNewObject made, MethodDef wanted) => StructFolding.Reexpress(made, wanted, pipeline);
@@ -222,9 +233,25 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         _ => null,
     };
 
-    private readonly Dictionary<TypeDef, List<Template>> _templates = [];
-    private readonly HashSet<TypeDef> _building = [];
-    private readonly Dictionary<TypeSig, List<Template>> _instanceTemplates = [];
+    // What pasted code is compared with is the same whoever makes it - nothing in it depends on the method that
+    // first needs it - so it is kept for every pipeline of this one's kind and every thread
+    // (RecoveryCache.Templates). What would be made while a recovery for another's use is under way would hold
+    // just there, and is not kept at all (pasted code is put back in the method asked for, not in what that
+    // asks for: it does not happen).
+    private bool Made<T>(object key, out T? made) where T : class
+    {
+        object? found = null;
+        bool known = pipeline.NothingUnderWay && pipeline.Kept.Templates.TryGetValue(key, out found);
+        made = (T?)found;
+        return known;
+    }
+
+    private T? Keep<T>(object key, T? made) where T : class
+    {
+        if (pipeline.NothingUnderWay) return (T?)pipeline.Kept.Templates.GetOrAdd(key, made);
+        RecoveryStats.NotKept();
+        return made;
+    }
 
     private static int Rank(MethodDef m) => m.Name.StartsWith("op_", StringComparison.Ordinal) ? 0 : m.Name.StartsWith("get_", StringComparison.Ordinal) ? 1 : 2;
 
@@ -274,20 +301,21 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
     }
 
     /// <summary>The methods of the class a member belongs to; for a generic class, as compiled for the type arguments the place has.</summary>
-    private List<Template> TemplatesOf(TypeDef type, TypeSig? instance)
+    private List<Template> TemplatesOf(TypeDef type, TypeSig? instance) => TemplatesOf(type, instance, Levels);
+
+    private List<Template> TemplatesOf(TypeDef type, TypeSig? instance, int level)
     {
-        if (type.GenericParameters.Length == 0) return TemplatesOf(type);
+        if (type.GenericParameters.Length == 0) return TemplatesOf(type, level);
         if (NoGenerics || instance is not GenericInstSig g || !ReferenceEquals(g.Definition, type) || g.ContainsGenericParameter) return [];
-        if (_instanceTemplates.TryGetValue(g, out List<Template>? known)) return known;
+        if (Made(g, out List<Template>? known)) return known!;
         var list = new List<Template>();
-        _instanceTemplates[g] = [];
+        long started = RecoveryStats.Begin();
         foreach (MethodDef m in type.Methods)
         {
             if (m.IsAbstract || m.IsConstructor || m.GenericParameters.Length != 0 || m.Name == ".cctor") continue;
             if (InstanceFor(m, g.Arguments) is not { } inst) continue;
             if (program.Code.Get(inst.Address) is not { Instructions: <= 200 } code) continue;
             HMethod? body = pipeline.CoreBody(inst);
-            WholeParameters(body);
             Template? template = code.Instructions <= 96 ? Make(m, body) : null;
             if (template == null && !NoFlows) template = MakeFlow(m, body);
             if (Tracing(m))
@@ -305,90 +333,126 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             list.Add(template);
         }
         list = list.OrderByDescending(t => t.Size).ThenBy(t => Rank(t.Method)).ToList();
-        return _instanceTemplates[g] = list;
+        RecoveryStats.End(RecoveryStats.Kind.Templates, started);
+        return Keep(g, list)!;
     }
 
-    private List<Template> TemplatesOf(TypeDef type)
+    /// <summary>
+    /// How many times over a method with branches is taken with what it has pasted in of other classes put
+    /// back (see TemplatesOf): in the methods of those classes the same is done one time less, and so on down
+    /// to their statements as they stand. What a class's list is must not depend on which class was asked for
+    /// first, and two classes whose methods each have the other's pasted in would otherwise each wait for the
+    /// other's list.
+    /// </summary>
+    private static readonly int Levels =
+        int.TryParse(Environment.GetEnvironmentVariable("REWIND_INLINE_LEVELS"), out int levels) && levels >= 0 ? levels : 2;
+
+    /// <summary>
+    /// The methods of a class as their code reads: each as its statements stand, and each also with the private
+    /// methods of its class put back that it has pasted in. In the order of the class's methods.
+    /// </summary>
+    private List<Template> PlainTemplatesOf(TypeDef type)
     {
-        if (_templates.TryGetValue(type, out List<Template>? known)) return known;
-        if (!_building.Add(type)) return [];
+        if (Made((type, -1), out List<Template>? known)) return known!;
         var list = new List<Template>();
+        long started = RecoveryStats.Begin();
+        (MethodDef? current, HashSet<MethodDef>? barred, bool decided, bool putBack, bool partly) = (_current, _barred, _decided, _putBack, _partly);
         try
         {
+            foreach (MethodDef m in type.Methods)
             {
-                foreach (MethodDef m in type.Methods)
+                if (m.Address == 0 || m.IsAbstract || m.IsConstructor || m.GenericParameters.Length != 0 || m.Name == ".cctor") continue;
+                if (program.Code.Get(m.Address) is not { Instructions: <= 200 } code) continue;
+                HMethod? body = pipeline.CoreBody(m);
+                int had = list.Count;
+                if (code.Instructions <= 96 && Make(m, body) is { } template) list.Add(template);
+                else if (!NoFlows && MakeFlow(m, body) is { } flow) list.Add(flow);
+                if (Tracing(m))
                 {
-                    if (m.Address == 0 || m.IsAbstract || m.IsConstructor || m.GenericParameters.Length != 0 || m.Name == ".cctor") continue;
-                    if (program.Code.Get(m.Address) is not { Instructions: <= 200 } code) continue;
-                    HMethod? body = pipeline.CoreBody(m);
-                    WholeParameters(body);
-                    int had = list.Count;
-                    if (code.Instructions <= 96 && Make(m, body) is { } template) list.Add(template);
-                    else if (!NoFlows && MakeFlow(m, body) is { } flow) list.Add(flow);
-                    if (Tracing(m))
-                    {
-                        Console.Error.WriteLine($"[inline] {m.FullName}: {code.Instructions} instructions, {(body == null ? "not recovered" : body.Blocks.Count + " blocks")}, {(list.Count == had ? "no model" : list[^1].Flow != null ? "a model with branches" : "a model")}");
-                        if (body != null) Console.Error.WriteLine(HirPrinter.Print(body));
-                    }
+                    Console.Error.WriteLine($"[inline] {m.FullName}: {code.Instructions} instructions, {(body == null ? "not recovered" : body.Blocks.Count + " blocks")}, {(list.Count == had ? "no model" : list[^1].Flow != null ? "a model with branches" : "a model")}");
+                    if (body != null) Console.Error.WriteLine(HirPrinter.Print(body));
                 }
-                // A method may itself have had a private method of its class pasted in, which the place at hand
-                // calls instead ("Euler" is "Internal_FromEulerRad" of a vector, and that is the native call).
-                // So each method is also taken with those put back.
-                List<Template> raw = list.Where(t => t.Flow == null).OrderByDescending(t => t.Size).ToList();
-                bool Hidden(object member) => member is MethodDef m && ReferenceEquals(m.DeclaringType, type) && (m.Flags & MethodDef.AccessMask) != 6;
-                foreach (Template template in raw)
+            }
+            // A method may itself have had a private method of its class pasted in, which the place at hand
+            // calls instead ("Euler" is "Internal_FromEulerRad" of a vector, and that is the native call).
+            // So each method is also taken with those put back.
+            List<Template> raw = list.Where(t => t.Flow == null).OrderByDescending(t => t.Size).ToList();
+            bool Hidden(object member) => member is MethodDef m && ReferenceEquals(m.DeclaringType, type) && (m.Flags & MethodDef.AccessMask) != 6;
+            foreach (Template template in raw)
+            {
+                if (!template.Members.Any(Hidden)) continue;
+                if (pipeline.FreshCoreBody(template.Method) is not { } own) continue;
+                // (The method whose statements are looked at is this one, whoever asked for the list.)
+                (_current, _barred, _decided, _putBack) = (template.Method, null, false, false);
+                bool changed = false;
+                for (int round = 0; round < 16; round++)
                 {
-                    if (!template.Members.Any(Hidden)) continue;
-                    if (pipeline.FreshCoreBody(template.Method) is not { } own) continue;
-                    bool changed = false;
-                    for (int round = 0; round < 16; round++)
-                    {
-                        if (!Pass(own, Hidden, (_, _) => raw, t => !ReferenceEquals(t.Method, template.Method) && (t.Method.Flags & MethodDef.AccessMask) != 6, false)) break;
-                        changed = true;
-                    }
-                    if (changed && Make(template.Method, own) is { } folded)
-                    {
-                        list.Add(folded);
-                        if (Tracing(template.Method)) Console.Error.WriteLine($"[inline] {template.Method.FullName}: with its class's own methods put back\n{HirPrinter.Print(own)}");
-                    }
+                    if (!Pass(own, Hidden, (_, _) => raw, t => !ReferenceEquals(t.Method, template.Method) && (t.Method.Flags & MethodDef.AccessMask) != 6, false)) break;
+                    changed = true;
                 }
-                // The same for what a method has pasted in of other classes. Its own code was compiled with
-                // its assembly, where the compiler pasted in what it liked; pasted into the code of another
-                // assembly, it was compiled again there, where only what is marked for it is pasted in and
-                // the rest is called. So each method with branches is also taken with everything put back
-                // that can be.
-                if (!NoFlows && !NoPutBack)
+                if (changed && Make(template.Method, own) is { } folded)
                 {
-                    bool putBack = _putBack;
-                    _putBack = false;
-                    bool Elsewhere(object member) => !ReferenceEquals(member is FieldDef f ? f.DeclaringType : ((MethodDef)member).DeclaringType, type);
-                    foreach (Template template in list.Where(t => t.Flow != null).ToList())
-                    {
-                        if (!template.Members.Any(Elsewhere)) continue;
-                        if (pipeline.FreshCoreBody(template.Method) is not { } own) continue;
-                        bool changed = false;
-                        for (int round = 0; round < 32; round++)
-                        {
-                            if (!Pass(own, Elsewhere, TemplatesOf, t => !ReferenceEquals(t.Method, template.Method), true)) break;
-                            changed = true;
-                        }
-                        if (!changed) continue;
-                        Template? folded = MakeFlow(template.Method, own) ?? Make(template.Method, own);
-                        if (Tracing(template.Method))
-                            Console.Error.WriteLine($"[inline] {template.Method.FullName}: with what it calls put back, {(folded == null ? "no model" : folded.Flow != null ? "a model with branches" : "a model")}\n{HirPrinter.Print(own)}");
-                        if (folded != null) list.Add(folded);
-                    }
-                    _putBack = putBack;
+                    list.Add(folded);
+                    if (Tracing(template.Method)) Console.Error.WriteLine($"[inline] {template.Method.FullName}: with its class's own methods put back\n{HirPrinter.Print(own)}");
                 }
             }
         }
         finally
         {
-            _building.Remove(type);
+            (_current, _barred, _decided, _putBack, _partly) = (current, barred, decided, putBack, partly);
+            RecoveryStats.End(RecoveryStats.Kind.Templates, started);
+        }
+        return Keep((type, -1), list)!;
+    }
+
+    /// <summary>
+    /// The methods of a class to compare pasted code with, the largest first. At level 0 as their code reads
+    /// (PlainTemplatesOf). Above that, each method with branches also with what it has pasted in of other
+    /// classes put back, as far as the lists of those classes one level down show it: its own code was compiled
+    /// with its assembly, where the compiler pasted in what it liked; pasted into the code of another assembly,
+    /// it was compiled again there, where only what is marked for it is pasted in and the rest is called.
+    /// </summary>
+    private List<Template> TemplatesOf(TypeDef type, int level)
+    {
+        if (NoFlows || NoPutBack) level = 0;
+        if (Made((type, level), out List<Template>? known)) return known!;
+        var list = new List<Template>(PlainTemplatesOf(type));
+        if (level > 0)
+        {
+            long started = RecoveryStats.Begin();
+            (MethodDef? current, HashSet<MethodDef>? barred, bool decided, bool putBack, bool partly) = (_current, _barred, _decided, _putBack, _partly);
+            try
+            {
+                bool Elsewhere(object member) => !ReferenceEquals(member is FieldDef f ? f.DeclaringType : ((MethodDef)member).DeclaringType, type);
+                List<Template> Below(TypeDef other, TypeSig? instance) => TemplatesOf(other, instance, level - 1);
+                foreach (Template template in list.Where(t => t.Flow != null).ToList())
+                {
+                    if (!template.Members.Any(Elsewhere)) continue;
+                    if (pipeline.FreshCoreBody(template.Method) is not { } own) continue;
+                    bool changed = false;
+                    for (int round = 0; round < 32; round++)
+                    {
+                        // (The method whose statements are looked at is this one, whoever asked for the list.)
+                        (_current, _barred, _decided, _putBack) = (template.Method, null, false, false);
+                        if (!Pass(own, Elsewhere, Below, t => !ReferenceEquals(t.Method, template.Method), true)) break;
+                        changed = true;
+                    }
+                    if (!changed) continue;
+                    Template? folded = MakeFlow(template.Method, own) ?? Make(template.Method, own);
+                    if (Tracing(template.Method))
+                        Console.Error.WriteLine($"[inline] {template.Method.FullName}: with what it calls put back, {(folded == null ? "no model" : folded.Flow != null ? "a model with branches" : "a model")}\n{HirPrinter.Print(own)}");
+                    if (folded != null) list.Add(folded);
+                }
+            }
+            finally
+            {
+                (_current, _barred, _decided, _putBack, _partly) = (current, barred, decided, putBack, partly);
+                RecoveryStats.End(RecoveryStats.Kind.Templates, started);
+            }
         }
         // The largest first: a method that calls another small one contains that one's statements too.
         list = list.OrderByDescending(t => t.Size).ThenBy(t => Rank(t.Method)).ToList();
-        return _templates[type] = list;
+        return Keep((type, level), list)!;
     }
 
     private static void Measure(Template template, IEnumerable<HStmt> statements, HExpr? result)
@@ -507,6 +571,17 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             _ => Within(user, owner),
         };
     }
+
+    /// <summary>
+    /// Whether a method is nothing but one call of another ("void OnDestroy() => Unregister();"). Pasted in, it
+    /// reads exactly as that call written out does: where the place could have made the call itself, the code
+    /// does not say which of the two the source had, and the call stays as it stands.
+    /// </summary>
+    private static bool OnlyCalls(Template template, MethodDef called) =>
+        template.Flow == null &&
+        (template.Result == null
+            ? template.Statements is [HEval { Expression: HCall only }] && ReferenceEquals(only.Method, called)
+            : template.Statements.Count == 0 && template.Result is HCall returned && ReferenceEquals(returned.Method, called));
 
     /// <summary>
     /// A value that is the same wherever in the block it is computed, as long as the variables it names are not
@@ -960,7 +1035,9 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         if (Disabled) return;
         MethodDef current = method.Method;
         MethodDef? outer = _current;
+        HashSet<MethodDef>? outerBarred = _barred;
         _current = current;
+        _barred = pipeline.BarredFor(current);
         try
         {
             Fold(method, current);
@@ -968,11 +1045,14 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         finally
         {
             _current = outer;
+            _barred = outerBarred;
         }
     }
 
     /// <summary>The method whose statements are being looked at (null outside Run).</summary>
     private MethodDef? _current;
+    /// <summary>The methods that one must not be written as a call of.</summary>
+    private HashSet<MethodDef>? _barred;
     private static readonly bool NoStoredBehind = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_STORED_BEHIND") != null;
 
     /// <summary>
@@ -1011,7 +1091,9 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         bool Foreign(object member) => member is FieldDef f
             ? !AccessorIndex.IsBackingField(f) && !AccessorFolding.IsAccessible(f, current)
             : !IsAccessible((MethodDef)member, current);
-        bool Usable(Template t) => !ReferenceEquals(t.Method, current) && IsAccessible(t.Method, current);
+        // (Not a method this one must not be written as a call of: see MethodPipeline.TwinOf.)
+        HashSet<MethodDef>? barred = _barred;
+        bool Usable(Template t) => !ReferenceEquals(t.Method, current) && IsAccessible(t.Method, current) && !(barred?.Contains(t.Method) ?? false);
         // The methods with branches first: the larger a method, the more of the smaller ones' statements it contains.
         _putBack = !NoPutBack;
         _putBackBudget = 48;
@@ -1031,7 +1113,6 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         for (int round = 0; round < 64 && Constructors(method); round++) { }
     }
 
-    private readonly Dictionary<MethodDef, Template?> _constructorFlows = [];
 
     /// <summary>
     /// A constructor with branches ("_values = values ?? new Dictionary()"), pasted in after the allocation of
@@ -1051,11 +1132,8 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                 foreach (MethodDef constructor in definition.Methods)
                 {
                     if (constructor.Name != ".ctor" || constructor.IsStatic || constructor.Address == 0 || ReferenceEquals(constructor, method.Method)) continue;
-                    if (!_constructorFlows.TryGetValue(constructor, out Template? template))
-                    {
-                        template = program.Code.Get(constructor.Address) is { Instructions: <= 200 } ? MakeFlow(constructor, pipeline.CoreBody(constructor)) : null;
-                        _constructorFlows[constructor] = template;
-                    }
+                    if (!Made(constructor, out Template? template))
+                        template = Keep(constructor, program.Code.Get(constructor.Address) is { Instructions: <= 200 } ? MakeFlow(constructor, pipeline.CoreBody(constructor)) : null);
                     if (template == null) continue;
                     counts ??= Counts.Of(method);
                     if (!TryFoldFlow(method, block, i + 1, template, counts)) continue;
@@ -1154,12 +1232,17 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                     foreach (Template template in candidates)
                     {
                         if (!template.Members.Contains(anchor) || !usable(template)) continue;
+                        if (anchor is MethodDef called && OnlyCalls(template, called) && IsAccessible(called, method.Method)) continue;
                         // The call put back is named in this assembly's code: its class must be one that code can name.
                         if (!AssemblyScope.Names(method.Method.DeclaringType.Assembly, template.Method.DeclaringType.Assembly)) continue;
                         if (Tracing(template.Method)) Console.Error.WriteLine($"[inline] {method.Method.Name}: trying {template.Method.Name}{(template.Flow != null ? " (with branches)" : "")} for {anchor} at L{block.Id}:{i}");
                         counts ??= Counts.Of(method);
                         _partly = false;
-                        if (template.Flow != null ? TryFoldFlow(method, block, i, template, counts) : TryFold(method, block, i, template, anchor, counts)) return true;
+                        if (template.Flow != null ? TryFoldFlow(method, block, i, template, counts) : TryFold(method, block, i, template, anchor, counts))
+                        {
+                            (method.PutBack ??= []).Add(template.Method);
+                            return true;
+                        }
                         if (template.Flow != null && _partly && _putBack && _putBackBudget > 0 && PutBack(method, block, template, counts)) return true;
                     }
                 }
@@ -1207,7 +1290,8 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         {
             if (member is not MethodDef callee || ReferenceEquals(callee, template.Method) || ReferenceEquals(callee, method.Method)) continue;
             if (callee.DeclaringType.GenericParameters.Length != 0 || callee.GenericParameters.Length != 0) continue;
-            foreach (Template inner in TemplatesOf(callee.DeclaringType))
+            if (ReferenceEquals(method.Method, _current) && (_barred?.Contains(callee) ?? false)) continue;
+            foreach (Template inner in TemplatesOf(callee.DeclaringType, Levels))
             {
                 if (!ReferenceEquals(inner.Method, callee)) continue;
                 foreach (HBlock b in near)
@@ -1221,7 +1305,9 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                             else if (e is HCall c && inner.Members.Contains(c.Method)) anchor = c.Method;
                         });
                         if (anchor == null) continue;
+                        if (anchor is MethodDef called && OnlyCalls(inner, called) && IsAccessible(called, method.Method)) continue;
                         if (!(inner.Flow != null ? TryFoldFlow(method, b, i, inner, counts) : TryFold(method, b, i, inner, anchor, counts))) continue;
+                        (method.PutBack ??= []).Add(callee);
                         if (tracing) Console.Error.WriteLine($"[inline] {method.Method.Name}: {callee.FullName} put back for {template.Method.Name}");
                         return true;
                     }
@@ -1636,6 +1722,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
 
     private static readonly bool NoApart = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_APART") != null;
     private static readonly bool NoCallFirst = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_CALL_FIRST") != null;
+    private static readonly bool NoTempUse = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_TEMP_USE") != null;
     private const int ApartMost = 6;
 
     /// <summary>
@@ -1722,6 +1809,20 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             }
             bool tracing = Tracing(m);
             if (tracing) Console.Error.WriteLine($"[inline] {m.FullName} in {method.Method.FullName} at L{block.Id}:{at}: statements {(matched ? "match" : "differ")}");
+            if (tracing && !matched)
+            {
+                // (Which of them: the first one the place has differently.)
+                var again = new Unifier(this, template, site, counts) { Loose = early };
+                for (int k = 0; k < n; k++)
+                {
+                    again.At = start + k;
+                    again.Position = k;
+                    if (again.Statement(template.Statements[k], site[start + k])) continue;
+                    Console.Error.WriteLine($"[inline]   the method has: {HirPrinter.Print(template.Statements[k], method).Trim()}");
+                    Console.Error.WriteLine($"[inline]   the place has:  {HirPrinter.Print(site[start + k], method).Trim()}");
+                    break;
+                }
+            }
             // The place may have other things of its own done between the method's statements and the use of what
             // it returns (the compiler worked the argument out early, then went on with something else): see Apart.
             bool apart = false;
@@ -1745,45 +1846,59 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             {
                 user = apart ? at : start + n;
                 if (user >= site.Count) continue;
-                var candidates = new List<HExpr>();
-                FinallyFolding.Visit(site[user], candidates.Add);
+                // A method that only hands back what it reads, where the place keeps part of that read in a
+                // temporary of its own ("t = list._data; n = *t - 1" for "n = list.Count - 1"): the member the method
+                // is found by is in the temporary's statement, the value is used in the next one. That one is
+                // looked at too; the temporary is read through (and goes with the call put back).
+                int lastUser = user;
+                if (!NoTempUse && !apart && n == 0 && user == at && at + 1 < site.Count &&
+                    site[at] is HAssign { Target: HLocal { Variable: var held } } && counts.IsTemp(held))
+                    lastUser = at + 1;
                 // (A method that is one call of what it is handed, in order, reads its parameters first too.)
                 bool loose = n == 0 ? OneExpression(template) || (!NoCallFirst && ReadsFirst(template)) : early && !apart;
-                foreach (HExpr candidate in candidates)
+                for (int u = user; u <= lastUser && replaced == null; u++)
                 {
-                    // An assignment's target is a place, not a value.
-                    if (site[user] is HAssign { Target: var target } && ReferenceEquals(target, candidate)) continue;
-                    Unifier trial = unifier.Clone();
-                    trial.At = user;
-                    trial.Position = n;
-                    trial.Loose = loose;
-                    bool turned = false;
-                    if (!trial.Expression(template.Result, candidate))
+                    var candidates = new List<HExpr>();
+                    FinallyFolding.Visit(site[u], candidates.Add);
+                    foreach (HExpr candidate in candidates)
                     {
-                        // A test the place asks the other way round (the compiler turned it to suit its jump):
-                        // the method's answer, negated.
-                        if (NoTurned || template.Result is not HCompare { Op: var asked } question || candidate is not HCompare { Op: var other } ||
-                            other != Opposite(asked) || (asked is not (HCompareOp.Eq or HCompareOp.Ne) && !(Whole(question.Left.Type) && Whole(question.Right.Type))))
-                            continue;
-                        trial = unifier.Clone();
-                        trial.At = user;
+                        // An assignment's target is a place, not a value.
+                        if (site[u] is HAssign { Target: var target } && ReferenceEquals(target, candidate)) continue;
+                        Unifier trial = unifier.Clone();
+                        trial.At = u;
                         trial.Position = n;
                         trial.Loose = loose;
-                        if (!trial.Expression(new HCompare(other, question.Left, question.Right) { Type = question.Type }, candidate)) continue;
-                        turned = true;
+                        bool turned = false;
+                        if (!trial.Expression(template.Result, candidate))
+                        {
+                            // A test the place asks the other way round (the compiler turned it to suit its jump):
+                            // the method's answer, negated.
+                            if (NoTurned || template.Result is not HCompare { Op: var asked } question || candidate is not HCompare { Op: var other } ||
+                                other != Opposite(asked) || (asked is not (HCompareOp.Eq or HCompareOp.Ne) && !(Whole(question.Left.Type) && Whole(question.Right.Type))))
+                                continue;
+                            trial = unifier.Clone();
+                            trial.At = u;
+                            trial.Position = n;
+                            trial.Loose = loose;
+                            if (!trial.Expression(new HCompare(other, question.Left, question.Right) { Type = question.Type }, candidate)) continue;
+                            turned = true;
+                        }
+                        // Arguments that do work are worked out in the order of the parameters, after the object
+                        // the method is called on: that must be the order they stand in here.
+                        if (trial.Working)
+                        {
+                            bool ordered = Stable(trial.This) || ThisFirst(template);
+                            for (int k = 1; k < trial.Order.Count && ordered; k++) ordered = trial.Order[k - 1] < trial.Order[k];
+                            if (!ordered) continue;
+                        }
+                        // In the next statement, only through the temporary: the read must be the one it holds.
+                        if (u != user && !trial.Consumed.Contains(at)) continue;
+                        unifier = trial;
+                        replaced = candidate;
+                        negated = turned;
+                        user = u;
+                        break;
                     }
-                    // Arguments that do work are worked out in the order of the parameters, after the object
-                    // the method is called on: that must be the order they stand in here.
-                    if (trial.Working)
-                    {
-                        bool ordered = Stable(trial.This) || ThisFirst(template);
-                        for (int k = 1; k < trial.Order.Count && ordered; k++) ordered = trial.Order[k - 1] < trial.Order[k];
-                        if (!ordered) continue;
-                    }
-                    unifier = trial;
-                    replaced = candidate;
-                    negated = turned;
-                    break;
                 }
                 if (replaced == null)
                 {

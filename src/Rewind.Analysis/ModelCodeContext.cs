@@ -16,6 +16,7 @@ public sealed class ModelCodeContext : ILiftContext
 
     /// <summary>Addresses of functions known never to return (filled in by helper discovery).</summary>
     public HashSet<ulong> NoReturn { get; } = [];
+    // (An auto-property with an initializer may still be given another value in a constructor: Fork's.)
 
     /// <summary>Optional: argument layout per call target.</summary>
     public Func<ulong, CallShape?>? ShapeProvider { get; set; }
@@ -40,6 +41,20 @@ public sealed class ModelCodeContext : ILiftContext
         _starts = starts.ToArray();
         Array.Sort(_starts);
     }
+
+    /// <summary>
+    /// The same tables for another thread's analysis to ask through (see ProgramAnalysis.Fork): what is known of
+    /// the image is shared and no longer changes; whom the questions about call targets go to is each one's own.
+    /// </summary>
+    private ModelCodeContext(ModelCodeContext source)
+    {
+        Model = source.Model;
+        _starts = source._starts;
+        _startSet = source._startSet;
+        NoReturn = source.NoReturn;
+    }
+
+    public ModelCodeContext Fork() => new(this);
 
     public bool IsManaged(ulong address) => Model.MethodsByAddress.ContainsKey(address) || Model.InstsByAddress.ContainsKey(address);
 

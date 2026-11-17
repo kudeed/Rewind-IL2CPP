@@ -27,12 +27,25 @@ public sealed class MethodPipeline
     private readonly X64Lifter _lifter;
     private readonly Normalizer _normalizer;
 
-    public MethodPipeline(ProgramAnalysis program)
+    public MethodPipeline(ProgramAnalysis program) : this(program, forAccessors: false)
+    {
+    }
+
+    /// <summary>
+    /// <paramref name="forAccessors"/>: the pipeline that reads the candidates for a field's accessor
+    /// (AccessorIndex). While it runs, no field has an accessor to ask for, so what it recovers on the way is not
+    /// what another pipeline would recover: it is kept apart.
+    /// </summary>
+    internal MethodPipeline(ProgramAnalysis program, bool forAccessors)
     {
         _program = program;
         _lifter = program.NewLifter();
         _normalizer = new Normalizer(program);
+        Kept = forAccessors ? program.KeptForAccessors : program.Kept;
     }
+
+    /// <summary>What this pipeline's recoveries ask each other for, kept for every pipeline of its kind and every thread.</summary>
+    internal RecoveryCache Kept { get; }
 
     /// <summary>
     /// What a recovered body uses, whatever the order and the temporaries: the methods it calls, the fields it
@@ -147,14 +160,166 @@ public sealed class MethodPipeline
         // (None of its own: none at all - also where this recovery was started from within such a one.)
         (HashSet<GenericParam>? builder, HashSet<GenericParam>? layouts) = (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters);
         (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters) = (own, own);
+        ForgetOpen();
+        long started = RecoveryStats.Begin();
         try
         {
-            return Build(Lift(method, classArgs, methodArgs, address));
+            HMethod built = Build(Lift(method, classArgs, methodArgs, address));
+            // Written as nothing but a call of a method that is itself nothing but such a call: see TwinOf.
+            for (int round = 0; round < 8 && !NoTwins && !_probing && (TwinOf(built, address != 0 ? address : method.Address) ?? CallerPutBack(built)) is { } twin; round++)
+            {
+                if (!_barred.TryGetValue(method, out HashSet<MethodDef>? barred)) _barred[method] = barred = [];
+                if (!barred.Add(twin)) break;
+                built = Build(Lift(method, classArgs, methodArgs, address));
+            }
+            return built;
         }
         finally
         {
+            RecoveryStats.End(RecoveryStats.Kind.Method, started);
             (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters) = (builder, layouts);
+            ForgetOpen();
         }
+    }
+
+    private static readonly bool NoTwins = Environment.GetEnvironmentVariable("REWIND_NO_TWIN_CHECK") != null;
+    private readonly Dictionary<MethodDef, HashSet<MethodDef>> _barred = [];
+    private readonly Dictionary<MethodDef, MethodDef?> _passesOn = [];
+    private bool _probing;
+
+    /// <summary>The methods a method must not be written as a call of (null while the question is how it reads without that rule).</summary>
+    internal HashSet<MethodDef>? BarredFor(MethodDef method) => _probing ? null : _barred.GetValueOrDefault(method);
+
+    /// <summary>
+    /// The method called, when the whole of a method was found to be the pasted-in statements of another and
+    /// is now nothing but a call of that one.
+    /// </summary>
+    private static MethodDef? PassedOnTo(HMethod h)
+    {
+        if (h.PutBack == null || h.Problems.Count != 0 || h.Blocks.Count == 0 || h.TryRegions.Count != 0) return null;
+        // (Its statements, through the jumps that only lead on to the next block.)
+        var statements = new List<HStmt>();
+        HBlock? block = h.Blocks[0];
+        for (int guard = 0; block != null && guard < 8; guard++)
+        {
+            HBlock? next = null;
+            foreach (HStmt s in block.Statements)
+            {
+                if (s is HJump jump) next = jump.Target;
+                else statements.Add(s);
+            }
+            block = next;
+        }
+        if (block != null) return null;
+        HExpr? only = statements switch
+        {
+            [HEval { Expression: var e }, HReturn { Value: null }] => e,
+            [HReturn { Value: { } e }] => e,
+            [HAssign { Target: HLocal { Variable: var set }, Value: var e }, HReturn { Value: HLocal { Variable: var returned } }] when ReferenceEquals(set, returned) => e,
+            _ => null,
+        };
+        return only is HCall call && h.PutBack.Contains(call.Method) && !ReferenceEquals(call.Method, h.Method) ? call.Method : null;
+    }
+
+    /// <summary>The method that a method, read without the rules below, comes out as nothing but a call of (having its statements); null when it is more than that.</summary>
+    private MethodDef? PassesOnTo(MethodDef method)
+    {
+        if (_passesOn.TryGetValue(method, out MethodDef? known)) return known;
+        if (method.Address == 0 || method.DeclaringType.GenericParameters.Length != 0 || method.GenericParameters.Length != 0) return null;
+        _passesOn[method] = null; // asked again while it is being read: no
+        MethodDef? passes = null;
+        (HashSet<GenericParam>? builder, HashSet<GenericParam>? layouts) = (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters);
+        (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters) = (null, null);
+        ForgetOpen();
+        bool probing = _probing;
+        _probing = true;
+        // (How the method reads on its own: a check for a copy of a method that is under way where this was
+        // asked is not under way here.)
+        _program.Auxiliary++;
+        long started = RecoveryStats.Begin();
+        try
+        {
+            passes = PassedOnTo(Build(Lift(method)));
+        }
+        catch (Exception e) when (e is not OutOfMemoryException and not StackOverflowException)
+        {
+            passes = null;
+        }
+        finally
+        {
+            RecoveryStats.End(RecoveryStats.Kind.Passing, started);
+            _program.Auxiliary--;
+            _probing = probing;
+            (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters) = (builder, layouts);
+            ForgetOpen();
+        }
+        return _passesOn[method] = passes;
+    }
+
+    /// <summary>
+    /// How much a method looks like one whose source was a single call of another, where the code of the two
+    /// is the same and cannot tell: one the compiler made (a lambda), one with more parameters (a call from one
+    /// with fewer would have to make their values up), one the engine or a base class calls by name or slot, one
+    /// that more code can see.
+    /// </summary>
+    private static int PassingRank(MethodDef m)
+    {
+        bool made = m.Name.Contains('<') || m.DeclaringType.Name.Contains('<');
+        bool message = !m.IsStatic && (m.IsVirtual || m.Name is "Awake" or "Start" or "Update" or "FixedUpdate" or "LateUpdate" or "OnEnable" or "OnDisable" or "OnDestroy"
+            or "OnValidate" or "Reset" or "OnGUI" or "OnApplicationQuit" or "OnApplicationPause" or "OnApplicationFocus" or "Spawned" or "Despawned" or "FixedUpdateNetwork" or "Render");
+        int access = (m.Flags & MethodDef.AccessMask) switch { 6 => 3, 5 or 4 => 2, 3 or 2 => 1, _ => 0 };
+        return (made ? 1000 : 0) + Math.Min(m.Parameters.Length, 9) * 100 + (message ? 10 : 0) + access;
+    }
+
+    /// <summary>
+    /// Two methods with the same statements - one function in the image (the linker keeps one copy of identical
+    /// code), or each with the other, or the same third one, pasted in - would each be found to be the pasted-in
+    /// statements of the other, and each be written as a call of the other: a method that calls itself without
+    /// end. Which of them called which, the code does not say. So a method that has become nothing but a call of
+    /// another, which read on its own would be such a call too, stays that only if it looks more like the
+    /// caller of the two (PassingRank); otherwise it keeps its statements. Returns the method it must not be a
+    /// call of.
+    /// </summary>
+    private MethodDef? TwinOf(HMethod built, ulong address)
+    {
+        if (PassedOnTo(built) is not { } target) return null;
+        MethodDef method = built.Method;
+        bool generic = target.DeclaringType.GenericParameters.Length != 0 || target.GenericParameters.Length != 0;
+        bool twin = generic ? target.Address != 0 && target.Address == address : PassesOnTo(target) != null;
+        if (!twin) return null;
+        return PassingRank(method) > PassingRank(target) ? null : target;
+    }
+
+    /// <summary>
+    /// The same in part: statements of a method were found to be the pasted-in statements of another and put
+    /// back as a call of it - of one that is itself nothing but a call of this method ("int Count => _count;"
+    /// seen in the getter of _count). Those statements are this method's own: the other one has them because
+    /// this one was pasted into it. Returns that other method, which this one must not be written as a call of.
+    /// </summary>
+    private MethodDef? CallerPutBack(HMethod built)
+    {
+        if (built.PutBack == null) return null;
+        MethodDef method = built.Method;
+        foreach (MethodDef other in built.PutBack)
+        {
+            if (ReferenceEquals(other, method) || (_barred.TryGetValue(method, out HashSet<MethodDef>? barred) && barred.Contains(other))) continue;
+            // (A method that only passes a call on to one of another class does so through something of its
+            // own - a field, a parameter: its statements are not found in that one as they stand.)
+            if (!Related(other.DeclaringType, method.DeclaringType)) continue;
+            if (ReferenceEquals(PassesOnTo(other), method)) return other;
+        }
+        return null;
+    }
+
+    private static bool Related(TypeDef a, TypeDef b)
+    {
+        int guard = 0;
+        for (TypeDef? t = a; t != null && guard++ < 64; t = t.BaseType?.Definition)
+            if (ReferenceEquals(t, b)) return true;
+        guard = 0;
+        for (TypeDef? t = b; t != null && guard++ < 64; t = t.BaseType?.Definition)
+            if (ReferenceEquals(t, a)) return true;
+        return false;
     }
 
     public LiftedMethod Lift(MethodDef method, TypeSig[]? classArgs = null, TypeSig[]? methodArgs = null, ulong address = 0)
@@ -194,13 +359,14 @@ public sealed class MethodPipeline
         }
         CheckShape(fn, "parked addresses");
         ParkedAddresses.Canonicalize(fn);
-        List<FrameObject> frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, boxes));
+        Dictionary<int, int>? stackArguments = StackArguments(abi);
+        List<FrameObject> frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, boxes), stackArguments);
         DeadCode.Run(fn);
         // A promoted slot that held a stack address turns what was read through it into direct stack accesses:
         // with those in view, more can be promoted.
         for (int again = 0; again < 2 && ParkedAddresses.Canonicalize(fn); again++)
         {
-            frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, boxes));
+            frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, boxes), stackArguments);
             DeadCode.Run(fn);
         }
         _normalizer.Cleanup(fn);
@@ -209,6 +375,7 @@ public sealed class MethodPipeline
         CheckShape(fn, "loop values");
         if (Environment.GetEnvironmentVariable("REWIND_NO_CLASS_SPLIT") == null && ClassMerges.Run(fn, IsClassOrMethodSlot)) _normalizer.Cleanup(fn);
         CheckShape(fn, "class merges");
+        if (Environment.GetEnvironmentVariable("REWIND_NO_WIDENED_CONSTANTS") == null) FoldWidenedConstants(fn);
         return new LiftedMethod
         {
             Method = method,
@@ -219,6 +386,69 @@ public sealed class MethodPipeline
             Normalization = normalization,
             Frame = frame,
         };
+    }
+
+    /// <summary>
+    /// A constant made wider or narrower is a constant. The passes above can leave one standing as an operation
+    /// (a register found to hold zero wherever it is read, behind the "mov ecx, r13d" that reads it): what asks
+    /// "is this a constant?" - the slot number handed to an interface call, a size, a shift count - then says no.
+    /// </summary>
+    private static void FoldWidenedConstants(Function fn)
+    {
+        Dictionary<Node, Node>? replace = null;
+        for (int round = 0; round < 4; round++)
+        {
+            bool any = false;
+            foreach (Block b in fn.Blocks)
+                foreach (Node n in b.Nodes)
+                {
+                    if (n.Dead || n.Op is not (Op.ZExt or Op.SExt or Op.Trunc) || n.In.Length != 1 || !n.Type.IsInt()) continue;
+                    Node from = n.In[0];
+                    while (replace != null && replace.TryGetValue(from, out Node? known)) from = known;
+                    if (!from.IsConst || !from.Type.IsInt() || from.Type == VT.I1 || n.Type == VT.I1) continue;
+                    long value = n.Op == Op.SExt ? IrBuilder.SImm(from) : (long)from.UImm;
+                    Node constant = fn.NewNode(Op.Const, n.Type, null);
+                    constant.Imm = n.Type.Bits() >= 64 ? value : (long)((ulong)value & n.Type.Mask());
+                    (replace ??= [])[n] = constant;
+                    n.Dead = true;
+                    any = true;
+                }
+            if (!any) break;
+        }
+        if (replace == null) return;
+        Node Resolve(Node n)
+        {
+            while (replace.TryGetValue(n, out Node? next)) n = next;
+            return n;
+        }
+        foreach (Block b in fn.Blocks)
+        {
+            foreach (Node n in b.Phis)
+                for (int i = 0; i < n.In.Length; i++) n.In[i] = Resolve(n.In[i]);
+            foreach (Node n in b.Nodes)
+                for (int i = 0; i < n.In.Length; i++) n.In[i] = Resolve(n.In[i]);
+            b.Nodes.RemoveAll(n => n.Dead);
+        }
+    }
+
+    /// <summary>The arguments a method is handed on the stack: where (from the entry stack pointer), and how many bytes of the slot they are.</summary>
+    private static Dictionary<int, int>? StackArguments(MethodAbi abi)
+    {
+        if (!abi.Known) return null;
+        Dictionary<int, int>? result = null;
+        foreach (AbiParam p in abi.Params)
+        {
+            if (p.Role != ParamRole.Argument || p.Position < Win64Abi.RegisterSlots) continue;
+            int bytes = p.Pass switch
+            {
+                PassKind.Indirect => 8,
+                PassKind.Float => p.IsDouble ? 8 : 4,
+                _ => p.Size is 1 or 2 or 4 or 8 ? p.Size : 8,
+            };
+            // (Above the return address and the four slots kept for the arguments that come in registers.)
+            (result ??= [])[8 + 8 * p.Position] = bytes;
+        }
+        return result;
     }
 
     private static readonly bool CheckShapes = Environment.GetEnvironmentVariable("REWIND_CHECK_SHAPE") != null;
@@ -295,7 +525,8 @@ public sealed class MethodPipeline
         // A networked property read in the middle of a struct being filled kept the stores apart (its check is a
         // branch): with the read put back they are one run, which may be one struct made in one go.
         if ((_guardedAccessors ??= new GuardedAccessorFolding(this)).Run(result) && !NoStructsAgain) StructFolding.Run(result, _program, this);
-        (_inlineFolding ??= new InlineFolding(this, _program)).Run(result);
+        ElementParts.Run(result);
+        Inline.Run(result);
         if (WrapperFolding.Lift(result, this))
         {
             StructFolding.Run(result, _program, this);
@@ -377,9 +608,117 @@ public sealed class MethodPipeline
         return type;
     }
 
-    private readonly Dictionary<(MethodDef, string), HMethod?> _constructorBodies = [];
     internal static readonly bool NoConstructorFlows = Environment.GetEnvironmentVariable("REWIND_NO_CONSTRUCTOR_FLOWS") != null;
-    private readonly HashSet<MethodDef> _recovering = [];
+
+    // ---- what recoveries ask each other for -------------------------------------------------------------------
+    //
+    // The recovered statements of another method - to compare pasted code with, to read an accessor from, to put
+    // a constructor back - are the same for whoever asks, so they are kept, and kept for every thread
+    // (RecoveryCache). For that they must not depend on who asked first, on the order the methods are recovered
+    // in, or on the thread. One thing could make them: a recovery for another's use asks for others in turn (a
+    // constructor makes an object, whose constructor makes another ...), and that has to end somewhere - two
+    // constructors may each make the other. It ends by depth: the method asked for may ask so many deep
+    // (Depth), what it asks for one less, and so on down to a recovery that is refused whatever it asks for. A
+    // body is then what it is for the depth it has left, and for nothing else.
+    //
+    // Most never get near the end. A body that was recovered with nothing refused below it is the same at every
+    // depth that is at least what it used, and is kept once for all of them; only one that something was
+    // refused to is kept for its depth alone. (Ending at what is under way further up instead - a constructor
+    // is not recovered inside itself - makes a body depend on everything under way when it was asked for: among
+    // many constructors that make each other that is a different body for every way to get there.)
+
+    /// <summary>How many recoveries for the use of another may be under way inside one another.</summary>
+    private static readonly int Depth =
+        int.TryParse(Environment.GetEnvironmentVariable("REWIND_ASK_DEPTH"), out int depth) && depth >= 0 ? depth : 4;
+
+    private sealed class Asking
+    {
+        /// <summary>How deep the recoveries went that this one asked for (0: it asked for none).</summary>
+        public int Used;
+        /// <summary>Whether this one, or one it asked for, was refused something because the depth was used up.</summary>
+        public bool Cut;
+    }
+
+    private readonly List<Asking> _asking = [];
+    /// <summary>How deep recoveries for the use of another may still go from here.</summary>
+    private int _left = Depth;
+
+    /// <summary>Whether no recovery for the use of another is under way: what is made now is made the same anywhere.</summary>
+    internal bool NothingUnderWay => _asking.Count == 0;
+
+    private static void Note(Asking? outer, int used, bool cut)
+    {
+        if (outer == null) return;
+        outer.Used = Math.Max(outer.Used, used + 1);
+        outer.Cut |= cut;
+    }
+
+    /// <summary>
+    /// The statements of a method, for another recovery: the kept ones, else recovered now and kept. Null also
+    /// where the depth is used up. <paramref name="kept"/> null: made anew every time, for the caller to change.
+    /// </summary>
+    private HMethod? Ask<TKey>(IDictionary<(TKey Key, int Left), RecoveryCache.Body>? kept, TKey key, RecoveryStats.Kind kind, Func<HMethod?> recover)
+        where TKey : notnull
+    {
+        Asking? outer = _asking.Count != 0 ? _asking[^1] : null;
+        if (_left == 0)
+        {
+            if (outer != null) outer.Cut = true;
+            return null;
+        }
+        int left = _left - 1; // how deep what is asked for may ask in turn
+        if (kept != null &&
+            ((kept.TryGetValue((key, RecoveryCache.Whole), out RecoveryCache.Body? known) && known.Used <= left) || kept.TryGetValue((key, left), out known)))
+        {
+            Note(outer, known.Used, known.Cut);
+            return known.Statements;
+        }
+        var asking = new Asking();
+        _asking.Add(asking);
+        _left = left;
+        _program.Auxiliary++;
+        HMethod? body = null;
+        long started = RecoveryStats.Begin();
+        try
+        {
+            body = recover();
+        }
+        catch (Exception)
+        {
+            body = null;
+        }
+        finally
+        {
+            RecoveryStats.End(kind, started);
+            _program.Auxiliary--;
+            _left = left + 1;
+            _asking.RemoveAt(_asking.Count - 1);
+            Note(outer, asking.Used, asking.Cut);
+        }
+        if (kept == null) return body;
+        var made = new RecoveryCache.Body(body, asking.Used, asking.Cut);
+        if (RecoveryCache.Check && body != null) made.Text = HirPrinter.Print(body);
+        (TKey, int) at = (key, asking.Cut ? left : RecoveryCache.Whole);
+        if (kept is System.Collections.Concurrent.ConcurrentDictionary<(TKey Key, int Left), RecoveryCache.Body> shared) return shared.GetOrAdd(at, made).Statements;
+        kept[at] = made;
+        return body;
+    }
+
+    /// <summary>
+    /// Bodies for type arguments that name a type parameter: constructors of a generic class, and methods. What
+    /// a type parameter stands for is known only to the recovery under way (RecoverAt): these are kept for that
+    /// one alone.
+    /// </summary>
+    private readonly Dictionary<((MethodDef Constructor, string Arguments) Key, int Left), RecoveryCache.Body> _openConstructors = [];
+    private readonly Dictionary<(MethodInst Key, int Left), RecoveryCache.Body> _openInstances = [];
+
+    private void ForgetOpen()
+    {
+        if (_openConstructors.Count != 0) _openConstructors.Clear();
+        if (_openInstances.Count != 0) _openInstances.Clear();
+    }
+
+    private InlineFolding Inline => _inlineFolding ??= new InlineFolding(this, _program);
 
     /// <summary>
     /// The recovered statements of a constructor, when they are complete and a plain run without branches:
@@ -395,10 +734,10 @@ public sealed class MethodPipeline
     internal HMethod? ConstructorFlow(MethodDef constructor, TypeSig[] classArguments)
     {
         string key = classArguments.Length == 0 ? "" : string.Join(",", classArguments.Select(a => a.Key));
-        if (_constructorBodies.TryGetValue((constructor, key), out HMethod? known)) return known;
-        if (!_recovering.Add(constructor)) return null; // being recovered right now, further up
-        HMethod? body = null;
-        try
+        bool open = false;
+        foreach (TypeSig argument in classArguments) open |= argument.ContainsGenericParameter;
+        IDictionary<((MethodDef Constructor, string Arguments) Key, int Left), RecoveryCache.Body> kept = open ? _openConstructors : Kept.Constructors;
+        return Ask(kept, (constructor, key), RecoveryStats.Kind.Constructor, () =>
         {
             LiftedMethod? lifted = null;
             if (constructor.DeclaringType.GenericParameters.Length == 0)
@@ -424,56 +763,32 @@ public sealed class MethodPipeline
                     }
                 }
             }
-            if (lifted != null)
-            {
-                HMethod h = BuildCore(lifted);
-                if (h.Problems.Count == 0 && h.Blocks.Count != 0 && h.TryRegions.Count == 0 &&
-                    (h.Blocks.Count == 1 ? h.Blocks[0].Statements is [.., HReturn { Value: null }] : !NoConstructorFlows))
-                    body = h;
-            }
-        }
-        catch (Exception)
-        {
-            body = null;
-        }
-        finally
-        {
-            _recovering.Remove(constructor);
-        }
-        return _constructorBodies[(constructor, key)] = body;
+            if (lifted == null) return null;
+            HMethod h = BuildCore(lifted);
+            return h.Problems.Count == 0 && h.Blocks.Count != 0 && h.TryRegions.Count == 0 &&
+                   (h.Blocks.Count == 1 ? h.Blocks[0].Statements is [.., HReturn { Value: null }] : !NoConstructorFlows)
+                ? h
+                : null;
+        });
     }
-
-    private readonly Dictionary<MethodDef, HMethod?> _coreBodies = [];
 
     /// <summary>
     /// The recovered statements of a method as they stand before accessors are put back into them - what code
-    /// pasted from that method into another looks like there. Null when the method has no code of its own or
-    /// was not recovered completely.
+    /// pasted from that method into another looks like there - with a struct parameter that arrives in pieces
+    /// whole again (InlineFolding.WholeParameters). Null when the method has no code of its own or was not
+    /// recovered completely. They are everybody's: not to be changed (see FreshCoreBody).
     /// </summary>
     internal HMethod? CoreBody(MethodDef method)
     {
-        if (_coreBodies.TryGetValue(method, out HMethod? known)) return known;
         if (method.Address == 0 || method.DeclaringType.GenericParameters.Length != 0 || method.GenericParameters.Length != 0) return null;
-        if (!_recovering.Add(method)) return null; // being recovered right now, further up
-        HMethod? body = null;
-        try
+        return Ask(Kept.Methods, method, RecoveryStats.Kind.Body, () =>
         {
             HMethod h = BuildCore(Lift(method));
-            if (h.Problems.Count == 0) body = h;
-        }
-        catch (Exception)
-        {
-            body = null;
-        }
-        finally
-        {
-            _recovering.Remove(method);
-        }
-        return _coreBodies[method] = body;
+            if (h.Problems.Count != 0) return null;
+            if (!method.IsConstructor && method.Name != ".cctor") Inline.WholeParameters(h);
+            return h;
+        });
     }
-
-    private readonly Dictionary<MethodInst, HMethod?> _instanceBodies = [];
-    private readonly HashSet<ulong> _recoveringAt = [];
 
     /// <summary>
     /// CoreBody for one instantiation of a method of a generic class: the statements the code compiled for those
@@ -481,43 +796,29 @@ public sealed class MethodPipeline
     /// </summary>
     internal HMethod? CoreBody(MethodInst inst)
     {
-        if (_instanceBodies.TryGetValue(inst, out HMethod? known)) return known;
-        if (inst.Address == 0 || !_recoveringAt.Add(inst.Address)) return null;
-        HMethod? body = null;
-        try
+        if (inst.Address == 0) return null;
+        bool open = false;
+        foreach (TypeSig argument in inst.ClassArguments) open |= argument.ContainsGenericParameter;
+        foreach (TypeSig argument in inst.MethodArguments) open |= argument.ContainsGenericParameter;
+        IDictionary<(MethodInst Key, int Left), RecoveryCache.Body> kept = open ? _openInstances : Kept.Instances;
+        return Ask(kept, inst, RecoveryStats.Kind.Body, () =>
         {
             HMethod h = BuildCore(Lift(inst.Method, inst.ClassArguments, inst.MethodArguments, inst.Address));
-            if (h.Problems.Count == 0) body = h;
-        }
-        catch (Exception)
-        {
-            body = null;
-        }
-        finally
-        {
-            _recoveringAt.Remove(inst.Address);
-        }
-        return _instanceBodies[inst] = body;
+            if (h.Problems.Count != 0) return null;
+            if (!inst.Method.IsConstructor && inst.Method.Name != ".cctor") Inline.WholeParameters(h);
+            return h;
+        });
     }
 
-    /// <summary>The same statements as CoreBody gives, made anew: the caller's own, to change as it likes.</summary>
+    /// <summary>The same statements as CoreBody gives before a parameter is made whole, made anew: the caller's own, to change as it likes.</summary>
     internal HMethod? FreshCoreBody(MethodDef method)
     {
         if (method.Address == 0 || method.DeclaringType.GenericParameters.Length != 0 || method.GenericParameters.Length != 0) return null;
-        if (!_recovering.Add(method)) return null;
-        try
+        return Ask<MethodDef>(null, method, RecoveryStats.Kind.Fresh, () =>
         {
             HMethod h = BuildCore(Lift(method));
             return h.Problems.Count == 0 ? h : null;
-        }
-        catch (Exception)
-        {
-            return null;
-        }
-        finally
-        {
-            _recovering.Remove(method);
-        }
+        });
     }
 
     /// <summary>Everything up to, but not including, the rewriting of private field accesses into accessor calls.</summary>
@@ -533,6 +834,8 @@ public sealed class MethodPipeline
             _program.Translations--;
         }
     }
+
+    private static readonly bool NoLoopValuesAgain = Environment.GetEnvironmentVariable("REWIND_NO_LOOP_VALUES_AGAIN") != null;
 
     private HMethod BuildCoreOf(LiftedMethod lifted)
     {
@@ -559,9 +862,11 @@ public sealed class MethodPipeline
                 break;
             Dictionary<int, int> after = InPlaceBoxes(fn);
             ParkedAddresses.Canonicalize(fn);
-            lifted.Frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, after, current));
+            lifted.Frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, after, current), StackArguments(lifted.Abi));
             DeadCode.Run(fn);
             _normalizer.Cleanup(fn);
+            // A loop variable that was kept in the memory just separated is a merged value only now.
+            if (!NoLoopValuesAgain && LoopValues.Run(fn, ArgumentBits)) _normalizer.Cleanup(fn);
             (builder, result) = BuildRounds(lifted);
         }
         FieldOwners.Run(result, _program.Model);

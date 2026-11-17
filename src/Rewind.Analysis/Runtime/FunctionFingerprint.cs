@@ -292,4 +292,28 @@ public sealed class CodeIndex(ICodeContext context)
         _deep[(address, depth)] = result;
         return result;
     }
+
+    /// <summary>
+    /// The fingerprint the function would have, one level deep, if what it calls had the given fingerprints (one
+    /// for each call, in order): Deep(address, 1) with other functions in place of its callees.
+    /// </summary>
+    public Fingerprint? WithCallees(ulong address, IReadOnlyList<Fingerprint> callees)
+    {
+        FunctionCode? code = Get(address);
+        if (code == null || callees.Count != code.Callees.Count) return null;
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        hash.AppendData(BitConverter.GetBytes(code.Shallow.Hash));
+        hash.AppendData(BitConverter.GetBytes(code.Shallow.Length));
+        foreach (string name in code.Names)
+        {
+            hash.AppendData(Encoding.ASCII.GetBytes(name));
+            hash.AppendData([0]);
+        }
+        foreach (Fingerprint inner in callees)
+        {
+            hash.AppendData(BitConverter.GetBytes(inner.Hash));
+            hash.AppendData(BitConverter.GetBytes(inner.Length));
+        }
+        return new Fingerprint(code.Shallow.Length, BitConverter.ToUInt64(hash.GetHashAndReset()));
+    }
 }

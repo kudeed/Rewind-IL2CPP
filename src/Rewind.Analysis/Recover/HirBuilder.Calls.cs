@@ -970,7 +970,8 @@ public sealed partial class HirBuilder
     private static readonly bool NoInvokerShapes = Environment.GetEnvironmentVariable("REWIND_NO_INVOKER_SHAPES") != null;
     private static readonly bool NoGenericInvokerShapes = Environment.GetEnvironmentVariable("REWIND_NO_GENERIC_INVOKERS") != null;
     private static readonly bool NoRgctxCalls = Environment.GetEnvironmentVariable("REWIND_NO_RGCTX_CALLS") != null;
-    private static readonly Dictionary<ulong, HelperInfo?> InvokerShapes = [];
+    // (Asked from every thread that recovers methods; what a function is does not depend on who asks.)
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, HelperInfo?> InvokerShapes = new();
 
     /// <summary>
     /// Whether a function without a name is one of those IL2CPP makes for calling a method by its slot:
@@ -1061,7 +1062,7 @@ public sealed partial class HirBuilder
                     found = new HelperInfo(HelperKind.InterfaceInvoker, 0, false, true, "InterfaceInvoker (known by its code)");
             }
         }
-        return InvokerShapes[address] = found;
+        return InvokerShapes.GetOrAdd(address, found);
     }
 
     private readonly Dictionary<ulong, long?> _constantFunctions = [];
@@ -1691,7 +1692,8 @@ public sealed partial class HirBuilder
             {
                 // class_is_assignable_from(K, obj->klass): "obj is K" (the object is not null: its class was read).
                 if (a0 == null || a1 == null || EvalKlass(a0) is not { } type || Eval(a1) is not SObjKlass { Object: var subject }) break;
-                HExpr test = new HCompare(HCompareOp.Ne, new HTypeExpr(HTypeOp.IsInst, type, Value(subject)) { Type = type }, new HConst(null, type)) { Type = _bool };
+                // (Of a struct type the object is a boxed one: there is one or there is none, as with any object.)
+                HExpr test = new HCompare(HCompareOp.Ne, new HTypeExpr(HTypeOp.IsInst, type, Value(subject)) { Type = type }, new HConst(null, IsReference(type) ? type : _object)) { Type = _bool };
                 FinishCall(call, test, ReturnKind.Integer, _bool, tail);
                 return;
             }

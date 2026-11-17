@@ -62,6 +62,7 @@ Options:
 | `--csharp <version>` | write source for an older C# version, for example `9` for a Unity 2021.2+ project |
 | `--state-machines` | show iterators and async methods as the classes the compiler made of them, instead of `yield return` and `await` |
 | `--signatures <path>` | the signature file or folder to use for recognizing runtime functions |
+| `--threads <n>` | how many threads recover method bodies (default: one per processor, or the `REWIND_THREADS` environment variable). The output is the same for any number |
 | `--metadata <file>`, `--binary <file>` | use these files instead of searching for them |
 | `--abi <name>` | which Android ABI to use from a package (`arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`) |
 | `--unity <version>` | the Unity version, if Rewind can't work it out (for example `2022.3.33f1`) |

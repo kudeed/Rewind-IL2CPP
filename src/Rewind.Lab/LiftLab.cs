@@ -37,7 +37,8 @@ internal static class LiftLab
             context.DiscoverCallTargets();
             var index = new Rewind.Analysis.Runtime.CodeIndex(context);
             var library = Rewind.Analysis.Runtime.HelperLibrary.Load(symbolsPath);
-            var matched = library.Match(index, model.Image, context.FunctionStarts.Where(a => !context.IsManaged(a)), out var report);
+            var matched = library.Match(index, model.Image, context.FunctionStarts.Where(a => !context.IsManaged(a)), out var report,
+                context.FunctionStarts.Where(context.IsManaged));
             Console.WriteLine($"helpers from {Path.GetFileName(symbolsPath)}: {report}");
             var watch = Stopwatch.StartNew();
             var analysis = new ProgramAnalysis(model, matched, context);
@@ -334,8 +335,18 @@ internal static class LiftLab
         int shown = 0;
         foreach (MethodDef method in model.Methods)
         {
-            if (method.Address == 0 || !method.FullName.Contains(filter, StringComparison.Ordinal)) continue;
-            Rewind.Analysis.Recover.LiftedMethod lifted = pipeline.Lift(method);
+            if (!method.FullName.Contains(filter, StringComparison.Ordinal)) continue;
+            Rewind.Analysis.Recover.LiftedMethod lifted;
+            if (method.Address == 0)
+            {
+                // A generic definition: the body its instantiations over reference types share, with its own type parameters.
+                static bool IsObject(TypeSig t) => t is PrimitiveSig { Element: Rewind.Runtime.Il2CppTypeEnum.Object };
+                MethodInst? shared = program.InstsOf(method).FirstOrDefault(i => i.Address != 0 && i.ClassArguments.All(IsObject) && i.MethodArguments.All(IsObject));
+                if (shared == null) continue;
+                lifted = pipeline.Lift(method, method.DeclaringType.GenericParameters.Select(p => (TypeSig)model.Sigs.GenericParam(p)).ToArray(),
+                    method.GenericParameters.Select(p => (TypeSig)model.Sigs.GenericParam(p)).ToArray(), shared.Address);
+            }
+            else lifted = pipeline.Lift(method);
             Console.WriteLine($"=== {method.FullName}  (frame objects {lifted.Frame.Count}: {string.Join(", ", lifted.Frame)})");
             Console.WriteLine(lifted.Function.Dump(n => Annotate(n, model, symbols)));
             if (++shown >= 12) break;

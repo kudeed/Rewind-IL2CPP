@@ -366,9 +366,12 @@ internal sealed class GuardedAccessorFolding(MethodPipeline pipeline)
         Unhold(method);
 
         var candidates = new List<Accessor>();
+        // (Not the accessors this method must not be written as a call of: see MethodPipeline.TwinOf.)
+        HashSet<MethodDef>? barred = pipeline.BarredFor(method.Method);
         foreach (TypeDef type in classes)
             foreach (Accessor a in Accessors(type))
-                if (!candidates.Contains(a) && !ReferenceEquals(a.Getter, method.Method) && !ReferenceEquals(a.Setter, method.Method))
+                if (!candidates.Contains(a) && !ReferenceEquals(a.Getter, method.Method) && !ReferenceEquals(a.Setter, method.Method) &&
+                    !(barred != null && ((a.Getter != null && barred.Contains(a.Getter)) || (a.Setter != null && barred.Contains(a.Setter)))))
                     candidates.Add(a);
         // An accessor of a networked property is that code: its own check stays.
         string? own = method.Method.Name.StartsWith("get_", StringComparison.Ordinal) || method.Method.Name.StartsWith("set_", StringComparison.Ordinal)
@@ -399,6 +402,7 @@ internal sealed class GuardedAccessorFolding(MethodPipeline pipeline)
                     }
                     if (match.Self == null || !Derives(ClassOf(match.Self), a.Property.DeclaringType)) continue;
                     any = true;
+                    (method.PutBack ??= []).Add(a.Getter!);
                     HExpr got = new HCall { Method = a.Getter!, This = Read(match.Self), Arguments = [], Virtual = a.Getter!.IsVirtual, Type = a.Getter.ReturnType };
                     return opposite ? new HUnary(HUnaryOp.LogicalNot, got) { Type = got.Type } : got;
                 }
@@ -514,6 +518,7 @@ internal sealed class GuardedAccessorFolding(MethodPipeline pipeline)
                                 var match = new Match();
                                 if (!match.Unify(candidate.Store.Target, a.Target) || !match.Unify(candidate.Store.Value, a.Value) || match.Self == null || match.Argument == null ||
                                     !Derives(ClassOf(match.Self), candidate.Property.DeclaringType)) continue;
+                                (method.PutBack ??= []).Add(candidate.Setter!);
                                 call = new HEval(new HCall
                                 {
                                     Method = candidate.Setter!, This = Read(match.Self), Arguments = [Read(match.Argument)], Virtual = candidate.Setter!.IsVirtual,

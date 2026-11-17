@@ -54,58 +54,56 @@ public sealed class ProgramAnalysis
     private Dictionary<MethodDef, List<MethodInst>>? _instsOf;
 
     /// <summary>The compiled instantiations of a generic method or of a method of a generic type.</summary>
-    public IReadOnlyList<MethodInst> InstsOf(MethodDef method)
+    public IReadOnlyList<MethodInst> InstsOf(MethodDef method) =>
+        InstTable().TryGetValue(method, out List<MethodInst>? found) ? found : [];
+
+    private Dictionary<MethodDef, List<MethodInst>> InstTable()
     {
-        if (_instsOf == null)
+        if (_instsOf != null) return _instsOf;
+        var table = new Dictionary<MethodDef, List<MethodInst>>();
+        foreach (MethodInst inst in Model.MethodInsts)
         {
-            _instsOf = [];
-            foreach (MethodInst inst in Model.MethodInsts)
-            {
-                if (inst.Address == 0) continue;
-                if (!_instsOf.TryGetValue(inst.Method, out List<MethodInst>? list)) _instsOf[inst.Method] = list = [];
-                list.Add(inst);
-            }
+            if (inst.Address == 0) continue;
+            if (!table.TryGetValue(inst.Method, out List<MethodInst>? list)) table[inst.Method] = list = [];
+            list.Add(inst);
         }
-        return _instsOf.TryGetValue(method, out List<MethodInst>? found) ? found : [];
+        return _instsOf = table;
     }
 
     private Dictionary<ulong, Rewind.Binary.FunctionRange>? _ranges;
     private readonly Dictionary<ulong, CxxFunctionInfo?> _cxx = [];
 
     /// <summary>The unwind-table entry of the function starting at <paramref name="address"/>, if it has one.</summary>
-    public Rewind.Binary.FunctionRange? RangeOf(ulong address)
+    public Rewind.Binary.FunctionRange? RangeOf(ulong address) =>
+        RangeTable().TryGetValue(address, out Rewind.Binary.FunctionRange found) ? found : null;
+
+    private Dictionary<ulong, Rewind.Binary.FunctionRange> RangeTable()
     {
-        if (_ranges == null)
-        {
-            _ranges = [];
-            foreach (Rewind.Binary.FunctionRange f in Model.Image.FunctionTable)
-                if (!f.Chained)
-                    _ranges.TryAdd(f.Start, f);
-        }
-        return _ranges.TryGetValue(address, out Rewind.Binary.FunctionRange found) ? found : null;
+        if (_ranges != null) return _ranges;
+        var table = new Dictionary<ulong, Rewind.Binary.FunctionRange>();
+        foreach (Rewind.Binary.FunctionRange f in Model.Image.FunctionTable)
+            if (!f.Chained)
+                table.TryAdd(f.Start, f);
+        return _ranges = table;
     }
 
-    private Lazy<(Dictionary<ulong, PInvokeImport> BySlot, Dictionary<MethodDef, PInvokeImport> ByMethod)>? _pinvoke;
+    // (One table for the program and every fork of it, made by whoever asks first.)
+    private readonly Lazy<(Dictionary<ulong, PInvokeImport> BySlot, Dictionary<MethodDef, PInvokeImport> ByMethod)> _pinvoke;
 
-    private (Dictionary<ulong, PInvokeImport> BySlot, Dictionary<MethodDef, PInvokeImport> ByMethod) PInvoke
+    private (Dictionary<ulong, PInvokeImport> BySlot, Dictionary<MethodDef, PInvokeImport> ByMethod) PInvoke => _pinvoke.Value;
+
+    private (Dictionary<ulong, PInvokeImport>, Dictionary<MethodDef, PInvokeImport>) ScanPInvoke()
     {
-        get
+        var bySlot = new Dictionary<ulong, PInvokeImport>();
+        var byMethod = new Dictionary<MethodDef, PInvokeImport>();
+        var shared = new HashSet<ulong>();
+        foreach (PInvokeImport import in PInvokeImports.Scan(Model, Helpers))
         {
-            _pinvoke ??= new Lazy<(Dictionary<ulong, PInvokeImport>, Dictionary<MethodDef, PInvokeImport>)>(() =>
-            {
-                var bySlot = new Dictionary<ulong, PInvokeImport>();
-                var byMethod = new Dictionary<MethodDef, PInvokeImport>();
-                var shared = new HashSet<ulong>();
-                foreach (PInvokeImport import in PInvokeImports.Scan(Model, Helpers))
-                {
-                    byMethod[import.Method] = import;
-                    if (!bySlot.TryAdd(import.CacheSlot, import)) shared.Add(import.CacheSlot);
-                }
-                foreach (ulong slot in shared) bySlot.Remove(slot); // two declarations, one cache: not a usable key
-                return (bySlot, byMethod);
-            }, LazyThreadSafetyMode.ExecutionAndPublication);
-            return _pinvoke.Value;
+            byMethod[import.Method] = import;
+            if (!bySlot.TryAdd(import.CacheSlot, import)) shared.Add(import.CacheSlot);
         }
+        foreach (ulong slot in shared) bySlot.Remove(slot); // two declarations, one cache: not a usable key
+        return (bySlot, byMethod);
     }
 
     /// <summary>
@@ -126,13 +124,36 @@ public sealed class ProgramAnalysis
     public long NamedCheckTime;
     private static readonly bool CopyTrace = Environment.GetEnvironmentVariable("REWIND_COPY_TRACE") != null;
 
-    /// <summary>The functions being checked right now as copies of a method: there, the function is read as that method.</summary>
+    /// <summary>
+    /// The functions being checked right now as copies of a method: there, the function is read as that method -
+    /// in the two readings the check compares, not in what those ask for in turn (the statements of another
+    /// method are the same whether or not a check is under way).
+    /// </summary>
     private readonly HashSet<(ulong, MethodDef)> _assumed = [];
-    public bool CheckingCopies => _assumed.Count != 0;
-    public bool AssumedCopy(ulong address, MethodDef method) => _assumed.Contains((address, method));
+    private int _assumedAt;
+    public bool CheckingCopies => _assumed.Count != 0 && Auxiliary == _assumedAt;
+    public bool AssumedCopy(ulong address, MethodDef method) => Auxiliary == _assumedAt && _assumed.Contains((address, method));
 
     public bool OwnTranslation;
     public int Translations, Building;
+    /// <summary>How many recoveries for the use of another recovery are under way inside one another (see MethodPipeline.Ask).</summary>
+    public int Auxiliary;
+
+    /// <summary>
+    /// What recoveries ask each other for: one for the program and all its forks. And the same for the
+    /// recoveries that look for a field's accessor (AccessorIndex): while one of those runs, a field has no
+    /// accessor to ask for, so what is recovered on the way may read differently and is kept apart.
+    /// </summary>
+    internal Recover.RecoveryCache Kept { get; } = new();
+    internal Recover.RecoveryCache KeptForAccessors { get; } = new();
+
+    /// <summary>For REWIND_CHECK_KEPT: how many bodies are kept, and which of them were changed after they were kept (none should be).</summary>
+    public (int Kept, List<string> Changed) CheckKept()
+    {
+        List<string> changed = Kept.Changed();
+        changed.AddRange(KeptForAccessors.Changed());
+        return (Kept.Count + KeptForAccessors.Count, changed);
+    }
 
     private readonly Dictionary<(ulong, string), bool> _copiesOf = [];
 
@@ -181,6 +202,8 @@ public sealed class ProgramAnalysis
         NamedChecks++;
         var watch = System.Diagnostics.Stopwatch.StartNew();
         _assumed.Add((address, method));
+        int assumedAt = _assumedAt;
+        _assumedAt = Auxiliary;
         try
         {
         foreach (ulong original in originals)
@@ -195,6 +218,7 @@ public sealed class ProgramAnalysis
         finally
         {
             _assumed.Remove((address, method));
+            _assumedAt = assumedAt;
         }
         if (same) NamedCopies++;
         NamedCheckTime += watch.ElapsedMilliseconds;
@@ -379,6 +403,7 @@ public sealed class ProgramAnalysis
     {
         Model = model;
         Helpers = helpers;
+        _pinvoke = new(ScanPInvoke, LazyThreadSafetyMode.ExecutionAndPublication);
         Context = context ?? new ModelCodeContext(model);
         Context.ShapeProvider = ShapeOf;
         Context.ExceptionProvider = ExceptionInfo;
@@ -395,6 +420,43 @@ public sealed class ProgramAnalysis
         ExactCopies = CopyMatcher.Find(this);
         InlineCopies = InlineCopyFinder.Find(this);
         _shapes.Clear();
+    }
+
+    /// <summary>
+    /// The same program for another thread to recover methods with. What was found out about the program when
+    /// it was loaded is shared and no longer changes: the model, the support functions, the copies, the tables
+    /// of the image. Everything that is filled in or set while methods are recovered is the fork's own - what
+    /// was computed so far, what is being recovered right now and inside what, the accessors found - so that no
+    /// thread sees another's unfinished work. A thread uses one fork, and one fork is used by one thread.
+    /// </summary>
+    public ProgramAnalysis Fork() => new(this);
+
+    private ProgramAnalysis(ProgramAnalysis source)
+    {
+        Model = source.Model;
+        Helpers = source.Helpers;
+        Kept = source.Kept;
+        KeptForAccessors = source.KeptForAccessors;
+        _pinvoke = source._pinvoke;
+        Context = source.Context.Fork();
+        Context.ShapeProvider = ShapeOf;
+        Context.ExceptionProvider = ExceptionInfo;
+        Context.InlineProvider = ShouldInline;
+        Layouts = new LayoutCalculator(Model);
+        Replicated = new ReplicatedLayout(Model);
+        Abi = new Win64Abi(Model, Layouts);
+        Defaults = source.Defaults;
+        Klass = source.Klass;
+        ForwardedMethods = source.ForwardedMethods;
+        ForwardedInsts = source.ForwardedInsts;
+        ExactCopies = source.ExactCopies;
+        InlineCopies = source.InlineCopies;
+        FrameHints = source.FrameHints;
+        // (Tables made on first use: made now, by the one thread that forks, and then only read.)
+        _instsOf = source.InstTable();
+        _ranges = source.RangeTable();
+        source.FindAllocator();
+        (_allocatorSearched, _rawAllocator, _typeFromHandle) = (true, source._rawAllocator, source._typeFromHandle);
     }
 
     private void FindForwarders()

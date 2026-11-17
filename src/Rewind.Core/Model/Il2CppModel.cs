@@ -58,7 +58,8 @@ public sealed class Il2CppModel
     private readonly TypeSig?[] _sigByTypeIndex;
     private readonly Dictionary<string, TypeDef> _typesByName = new(StringComparer.Ordinal);
     private readonly Dictionary<ulong, MetadataUsage> _legacyUsages = [];
-    private readonly Dictionary<ulong, MetadataUsage?> _usageCache = [];
+    // (Asked by every thread that recovers methods.)
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, MetadataUsage?> _usageCache = new();
 
     public Il2CppModel(NativeImage image, MetadataFile metadata, Il2CppBinary binary)
     {
@@ -774,7 +775,6 @@ public sealed class Il2CppModel
                 result = MakeUsage(kind, index);
             }
         }
-        _usageCache[va] = result;
-        return result;
+        return _usageCache.GetOrAdd(va, result);
     }
 }

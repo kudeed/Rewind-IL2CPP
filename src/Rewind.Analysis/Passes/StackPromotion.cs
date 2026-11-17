@@ -20,6 +20,7 @@ public sealed class FrameObject
 public static class StackPromotion
 {
     public const int StackParamVarBase = 0x10000;
+    private static readonly bool NoEntryArguments = Environment.GetEnvironmentVariable("REWIND_NO_ENTRY_ARGUMENTS") != null;
 
     private readonly record struct Access(Node User, int Offset, int Size, bool IsStore);
 
@@ -134,7 +135,10 @@ public static class StackPromotion
     /// For a stack address used as input <c>index</c> of <c>user</c> (a call argument, typically): how many
     /// bytes the callee may touch, or -1 when unknown.
     /// </param>
-    public static List<FrameObject> Run(Function fn, Func<Node, int, int>? escapeExtent = null)
+    /// <param name="stackArguments">
+    /// The arguments the method is handed on the stack: offset from the entry stack pointer -> size in bytes.
+    /// </param>
+    public static List<FrameObject> Run(Function fn, Func<Node, int, int>? escapeExtent = null, IReadOnlyDictionary<int, int>? stackArguments = null)
     {
         var frameObjects = new List<FrameObject>();
         if (!fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0)) return frameObjects;
@@ -416,6 +420,55 @@ public static class StackPromotion
                 last.Size = Math.Max(last.Size, end - last.Offset);
             }
             else frameObjects.Add(new FrameObject { Offset = start, Size = end - start });
+        }
+
+        // An argument handed over on the stack whose slot stays memory - its address goes somewhere ("ref" of the
+        // parameter), or it is read where an exception leads: what that memory holds when the method starts is
+        // the argument. Nothing in the code says so (the caller wrote it), so it is said here, as a store on
+        // entry. (Without it the slot is a variable nothing was put in, and reads as zero.)
+        if (stackArguments != null && !NoEntryArguments && fn.Entry.Preds.Count == 0)
+        {
+            int inserted = 0;
+            foreach (var (at, bytes) in stackArguments.OrderBy(kv => kv.Key))
+            {
+                if (bytes is not (1 or 2 or 4 or 8)) continue;
+                bool read = false, handedOn = false;
+                // (The slot is read as wide as the code reads it: a bool loaded as four bytes, of which one is looked at.)
+                int width = bytes;
+                foreach (Access a in accesses)
+                    if (!a.IsStore && !promoted.Contains(a.User) && a.Offset < at + 8 && at < a.Offset + a.Size)
+                    {
+                        read = true;
+                        if (a.Offset == at && a.Size is 2 or 4 or 8 && a.Size > width) width = a.Size;
+                    }
+                foreach (var (offset, _) in escapes)
+                    if (offset >= at && offset < at + 8)
+                        handedOn = true;
+                if (!read && !handedOn) continue;
+                // (Part of it may still have become a value: that part reads the same entry value.)
+                VT type = cellOf.TryGetValue(at, out int cell) ? cellType[cell] : VTExtensions.IntOfBytes(width);
+                if (!fn.StackParams.TryGetValue(at, out Node? param))
+                {
+                    param = fn.NewNode(Op.Param, type, null);
+                    param.Imm = Function.StackParamBase + at;
+                    fn.StackParams[at] = param;
+                }
+                // (Said once: the pass runs again as more of the stack is understood.)
+                bool said = false;
+                foreach (Node n in fn.Entry.Nodes)
+                    if (!n.Dead && n.Op == Op.Store && ReferenceEquals(n.In[1], param))
+                        said = true;
+                if (said) continue;
+                ulong address = fn.Entry.Nodes.Count != 0 ? fn.Entry.Nodes[0].Addr : fn.Address;
+                Node offsetNode = fn.NewNode(Op.Const, VT.I64, null);
+                offsetNode.Imm = at;
+                Node slot = fn.NewNode(Op.Add, VT.I64, fn.Entry, sp0, offsetNode);
+                slot.Addr = address;
+                Node store = fn.NewNode(Op.Store, VT.None, fn.Entry, slot, param);
+                store.Addr = address;
+                fn.Entry.Nodes.Insert(inserted++, slot);
+                fn.Entry.Nodes.Insert(inserted++, store);
+            }
         }
 
         if (cellType.Count == 0) return frameObjects;

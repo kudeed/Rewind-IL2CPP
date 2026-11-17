@@ -416,6 +416,15 @@ public sealed partial class HirBuilder
         return IntValue(c);
     }
 
+    /// <summary>Whether a value compared at 8 or 16 bits is one the program holds as a signed number of that width.</summary>
+    private bool HeldSigned(Node n)
+    {
+        int bits = n.Type.Bits();
+        if (bits is not (8 or 16) || n.IsConst) return false;
+        HExpr e = ScalarOf(Value(n), bits);
+        return e is not HConst && BitsOf(e.Type) == bits && !IsBool(e.Type) && IsSignedSmall(e.Type);
+    }
+
     /// <summary>
     /// An operand of a comparison performed on 8 or 16 bits. Only those bits take part, so a wider expression
     /// is cut down first (with the signedness the comparison uses).
@@ -424,7 +433,16 @@ public sealed partial class HirBuilder
     {
         int bits = n.Type.Bits();
         HExpr e = ScalarOf(Value(n), bits);
-        if (bits is not (8 or 16) || e is HConst) return e;
+        if (bits is not (8 or 16)) return e;
+        // A constant, as a number of the kind the other side is compared as: the byte 0xFF is 255 next to an
+        // unsigned value and -1 next to a signed one. ("(byte)x != -1" is always true.)
+        if (e is HConst { Value: int or long } constant && !IsBool(constant.Type))
+        {
+            long value = Convert.ToInt64(constant.Value);
+            long ranged = (bits, signed) switch { (8, true) => (sbyte)value, (8, false) => (byte)value, (16, true) => (short)value, _ => (ushort)value };
+            return ranged == value ? e : new HConst(constant.Value is long ? ranged : (int)ranged, constant.Type);
+        }
+        if (e is HConst) return e;
         int known = BitsOf(e.Type);
         if (known == bits && (IsBool(e.Type) || IsSignedSmall(e.Type) == signed)) return e;
         HConvKind kind = (bits, signed) switch
@@ -440,6 +458,8 @@ public sealed partial class HirBuilder
         return new HConv(kind, e) { Type = type };
     }
 
+    private static readonly bool NoHeldSigned = Environment.GetEnvironmentVariable("REWIND_NO_HELD_SIGNED") != null;
+
     private Sem CompareSem(Node n)
     {
         HCompareOp op = n.Op switch
@@ -453,6 +473,8 @@ public sealed partial class HirBuilder
         };
         if (TypeTestCompare(n) is { } typeTest) return typeTest;
         bool signedCompare = n.Op is Op.CmpLtS or Op.CmpLeS;
+        // Equal or not is the same question either way: asked the way the values are held ("x != -1" of an sbyte).
+        if (n.Op is Op.CmpEq or Op.CmpNe && !NoHeldSigned) signedCompare = HeldSigned(n.In[0]) || HeldSigned(n.In[1]);
         HExpr left = CompareOperand(n.In[0], signedCompare), right = CompareOperand(n.In[1], signedCompare);
 
         // A truth value compared with zero is the value itself, or its negation.
@@ -464,6 +486,16 @@ public sealed partial class HirBuilder
                 bool wantTrue = (n.Op == Op.CmpNe) == (zeroOrOne == 0);
                 return new SVal(wantTrue ? left : new HUnary(HUnaryOp.LogicalNot, left) { Type = _bool });
             }
+        }
+
+        // "x as T" is the object or nothing, also where T is a struct (the object is then a boxed one): measured
+        // against zero it asks whether there is one. (Taken as a T, the zero became a number, and the test an
+        // unboxing of the object as that number.)
+        if (n.Op is Op.CmpEq or Op.CmpNe)
+        {
+            if (right is HTypeExpr { Op: HTypeOp.IsInst } && left is HConst) (left, right) = (right, left);
+            if (left is HTypeExpr { Op: HTypeOp.IsInst, Target: var tested } && !IsReference(tested) && right is HConst { Value: null or 0 or 0L or false })
+                return new SVal(new HCompare(op, left, new HConst(null, _object)) { Type = _bool });
         }
 
         // Comparing a reference with the constant 0 is a null test.
@@ -512,6 +544,8 @@ public sealed partial class HirBuilder
         if (s is not SVal v) return s; // references and other non-numeric meanings pass through unchanged
         HExpr e = v.Expr;
         int from = inner.Type.Bits(), to = n.Type.Bits();
+        // A float's bytes made wider are its bits made wider. Converting the float itself would turn 60f into 60.
+        if (ReferenceEquals(e.Type, _float) && from <= 32) e = FloatBits(e);
         // A constant made wider is a constant.
         if (to == 64 && from is 8 or 16 or 32 && e is HConst { Value: int or long } constant)
         {
@@ -650,6 +684,8 @@ public sealed partial class HirBuilder
                     return new SVal(new HField { Object = e, Field = fs.Field, DeclaringType = e.Type, Type = fs.Type });
             }
             if (known == 0 && inner.Type == VT.I64 && to == 32 && e.Type == null) return v; // untyped 32-bit value in a 64-bit register
+            // The low bytes of a float or double are part of its bits, not the number converted.
+            if (IsFloat(e.Type)) e = FloatBits(e);
             HConvKind kind = to switch { 8 => HConvKind.U1, 16 => HConvKind.U2, 32 => HConvKind.I4, _ => HConvKind.I8 };
             TypeSig type = to switch { 8 => _byte, 16 => _ushort, 32 => _int, _ => _long };
             if (to == 1) return new SVal(new HCompare(HCompareOp.Ne, new HBinary(HBinaryOp.And, e, new HConst(1, _int)) { Type = _int }, new HConst(0, _int)) { Type = _bool });
@@ -1649,13 +1685,26 @@ public sealed partial class HirBuilder
     private static readonly bool NoRetypedWrites = Environment.GetEnvironmentVariable("REWIND_NO_RETYPED_WRITES") != null;
     private static readonly bool NoDeclaredFloats = Environment.GetEnvironmentVariable("REWIND_NO_DECLARED_FLOATS") != null;
 
+    private static readonly bool NoBoxLifetimes = Environment.GetEnvironmentVariable("REWIND_NO_BOX_LIFETIMES") != null;
+
     private void EmitStore(Node n)
     {
         // The header of a value boxed in place (its class, and the "not a real object" mark) is not a store
         // the program makes.
         if (_fakeBoxes.Count != 0 && IsFrameAddress(n.In[0], out int boxOffset) &&
             (_fakeBoxes.ContainsKey(boxOffset) || _fakeBoxes.ContainsKey(boxOffset - _ptr)))
-            return;
+        {
+            // (What is written there for the box: the class, and the mark - or, through the runtime's own
+            // constructor, nothing at all here.)
+            bool first = _fakeBoxes.ContainsKey(boxOffset);
+            Node written = n.In[1];
+            bool header = first ? written.Op == Op.SlotValue : written.IsConst && written.Imm == -1;
+            if (header || NoBoxLifetimes) return;
+            // Anything else stored in those bytes is the program's: the compiler keeps another local there
+            // while no box is ("key.message = message", then - later - the class of an enum boxed to be printed).
+            // Dropped, that local read as never set.
+            FrameConflicts.Add(first ? boxOffset : boxOffset - _ptr);
+        }
         if (_spillStores.Contains(n)) return; // a parked stack address (see PlanAddressSpills)
         if (_caughtStores.Contains(n)) return; // the catch object (see PlanCaughtSlots)
         Node valueNode = n.In[1];
@@ -1692,6 +1741,12 @@ public sealed partial class HirBuilder
                 return;
             case PPair pair:
             {
+                // A whole number where two floats are - a sum, a count widened to 64 bits, a constant that read
+                // as floats is no number anyone writes: other data in a reused slot (a loop's spilled offset
+                // where a vector was). Each lifetime gets its own memory (see StackSplitting).
+                if (!NoPairConflicts && (IsFloat(pair.Low.Type) || IsFloat(pair.High.Type)) && IsFrameAddress(n.In[0], out int pairAt) &&
+                    IsWholeNumber(valueNode, IsFloat(pair.Low.Type), IsFloat(pair.High.Type)))
+                    FrameConflicts.Add(pairAt);
                 Sem s = Eval(valueNode);
                 HExpr low, high;
                 if (s is SPair p) (low, high) = (p.Low, p.High);
@@ -1912,6 +1967,27 @@ public sealed partial class HirBuilder
         votes.Add(vote);
     }
 
+    private static readonly bool NoWidePairs = Environment.GetEnvironmentVariable("REWIND_NO_WIDE_PAIRS") != null;
+    private static readonly bool NoPairConflicts = Environment.GetEnvironmentVariable("REWIND_NO_PAIR_CONFLICTS") != null;
+
+    /// <summary>
+    /// True when eight bytes are a whole number and not two floats side by side: the result of integer
+    /// arithmetic, or a constant one of whose float halves would be a denormal or an odd "not a number".
+    /// </summary>
+    private static bool IsWholeNumber(Node value, bool lowIsFloat, bool highIsFloat)
+    {
+        if (value.Type != VT.I64) return false;
+        if (value.Op is Op.Add or Op.Sub or Op.Mul or Op.SExt) return true;
+        if (!value.IsConst) return false;
+        static bool Unlikely(uint bits)
+        {
+            uint exponent = (bits >> 23) & 0xFF, fraction = bits & 0x7FFFFF;
+            // (Infinity and the one "not a number" a program names are numbers people do write.)
+            return (exponent == 0 && fraction != 0) || (exponent == 0xFF && fraction != 0 && fraction != 0x400000);
+        }
+        return (lowIsFloat && Unlikely((uint)(value.UImm & 0xFFFFFFFF))) || (highIsFloat && Unlikely((uint)(value.UImm >> 32)));
+    }
+
     private Place FramePlace(int offset, int size)
     {
         // Prefer a typed object that covers this offset.
@@ -1922,6 +1998,12 @@ public sealed partial class HirBuilder
             if (offset >= start + Math.Max(1, typeSize)) continue;
             var local = new HLocal(FrameVar(start, type)) { Type = type };
             bool isStruct = type.Definition is { IsValueType: true, IsEnum: false } && type is not PrimitiveSig;
+            // Eight bytes moved where a variable of four is, with another of four right behind it: the two
+            // together (the x and y of a vector kept as separate numbers, copied in one go). Taken as the first
+            // alone, the second was never set.
+            if (!NoWidePairs && offset == start && !isStruct && size == 8 && typeSize == 4 &&
+                _frameTypes.TryGetValue(start + 4, out TypeSig? behind) && !IsStructType(behind) && _p.Layouts.SizeOf(behind) is { Known: true, Size: 4 })
+                return new PPair(local, new HLocal(FrameVar(start + 4, behind)) { Type = behind });
             if (offset == start && (!isStruct || size < 0 || size == typeSize)) return new PLocation(local, type);
             if (isStruct)
             {

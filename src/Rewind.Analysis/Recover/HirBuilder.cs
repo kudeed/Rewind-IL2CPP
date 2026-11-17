@@ -643,9 +643,10 @@ public sealed partial class HirBuilder
 
     /// <summary>
     /// The type parameters of the generic definition being recovered from the body its reference-type
-    /// instantiations share: there, each stands for a reference type.
+    /// instantiations share: there, each stands for a reference type. (Of the recovery under way on this
+    /// thread: each thread recovers its own methods.)
     /// </summary>
-    internal static HashSet<GenericParam>? OwnParameters;
+    [ThreadStatic] internal static HashSet<GenericParam>? OwnParameters;
 
     /// <summary>
     /// Whether nothing can be known of a type because it names a type parameter - other than the own ones of the

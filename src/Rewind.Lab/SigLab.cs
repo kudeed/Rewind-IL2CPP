@@ -18,6 +18,101 @@ internal static class SigLab
         return (context, new CodeIndex(context));
     }
 
+    /// <summary>
+    /// How close each library signature comes to the functions at the given addresses: the near-identical-code
+    /// stage's score (CodeIndex.Similarity of the sketches) and whether the instruction counts are close enough for
+    /// that stage to compare them at all. For finding out why a helper was not identified.
+    /// </summary>
+    public static int Near(string libraryPath, Il2CppModel target, string[] addresses)
+    {
+        HelperLibrary library = HelperLibrary.Load(libraryPath);
+        var (context, index) = Open(target);
+        // The identical-code stage, level by level: which functions have each fingerprint (callees taken in to that depth).
+        ulong[] candidates = context.FunctionStarts.Where(a => !context.IsManaged(a)).ToArray();
+        var levels = new Dictionary<Fingerprint, List<ulong>>?[CodeIndex.DefaultDepth + 1];
+        Dictionary<Fingerprint, List<ulong>> Level(int depth)
+        {
+            if (levels[depth] is { } ready) return ready;
+            var map = new Dictionary<Fingerprint, List<ulong>>();
+            foreach (ulong candidate in candidates)
+            {
+                if (index.Deep(candidate, depth) is not { } fingerprint) continue;
+                if (!map.TryGetValue(fingerprint, out List<ulong>? list)) map[fingerprint] = list = [];
+                list.Add(candidate);
+            }
+            return levels[depth] = map;
+        }
+        foreach (string text in addresses)
+        {
+            ulong address = Convert.ToUInt64(text.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? text[2..] : text, 16);
+            if (index.Get(address) is not { } code) { Console.WriteLine($"=== 0x{address:X}: no code"); continue; }
+            Console.WriteLine($"=== 0x{address:X}: {code.Instructions} instructions{(code.IsThunk ? $", thunk to 0x{index.ThunkTarget(address):X}" : "")}");
+            foreach (var (entry, score) in library.Entries
+                         .Where(e => !e.IsThunk)
+                         .Select(e => (e, CodeIndex.Similarity(e.Sketch, code.Sketch)))
+                         .OrderByDescending(x => x.Item2).Take(8))
+            {
+                bool window = code.Instructions >= entry.Instructions * 3 / 4 && code.Instructions <= entry.Instructions * 4 / 3 + 1;
+                Console.WriteLine($"  {score:F3}  {entry.Info.Kind,-24} {entry.Instructions,5} ins {(window ? "" : "(outside the size window) ")}{entry.Info.Name}");
+                if (score < 0.95) continue;
+                var parts = new List<string>();
+                for (int d = 0; d < levels.Length && d < entry.Depths.Length; d++)
+                {
+                    Level(d).TryGetValue(entry.Depths[d], out List<ulong>? hits);
+                    parts.Add($"depth {d}: {hits?.Count ?? 0} function(s){(hits != null && hits.Contains(address) ? ", this one among them" : "")}");
+                    if (hits == null) break;
+                }
+                Console.WriteLine($"         identical code ({entry.Depths[0].Length} bytes): {string.Join("; ", parts)}");
+            }
+            // REWIND_SIG_ALIKE: every function with the same code as this one - what it calls, how close that is to
+            // what the best signature calls, and from where it is called.
+            if (Environment.GetEnvironmentVariable("REWIND_SIG_ALIKE") != null &&
+                library.Entries.Where(e => !e.IsThunk && e.Depths.Length > 1).OrderByDescending(e => CodeIndex.Similarity(e.Sketch, code.Sketch)).FirstOrDefault() is { } top &&
+                Level(0).TryGetValue(top.Depths[0], out List<ulong>? alike))
+            {
+                var callers = new Dictionary<ulong, (int Managed, int Other)>();
+                foreach (ulong start in context.FunctionStarts)
+                {
+                    if (index.Get(start) is not { } from) continue;
+                    bool managed = context.IsManaged(start);
+                    foreach (ulong to in from.Callees.Distinct())
+                    {
+                        var (m, o) = callers.GetValueOrDefault(to);
+                        callers[to] = managed ? (m + 1, o) : (m, o + 1);
+                    }
+                }
+                // What the signature calls, told by its fingerprint one level down (see HelperLibrary.Match, 1b).
+                var expected = new List<HelperSignature>();
+                if (code.Callees.Count == 1)
+                    foreach (HelperSignature e in library.Entries)
+                        if (index.WithCallees(address, [e.Depths[0]]) == top.Depths[1])
+                            expected.Add(e);
+                Console.WriteLine($"  {alike.Count} functions with the code of {Short(top.Info.Name)}; it calls: {(expected.Count == 0 ? "not among the signatures" : string.Join(", ", expected.Select(e => $"{Short(e.Info.Name)} ({e.Instructions} ins)")))}");
+                foreach (ulong other in alike)
+                {
+                    FunctionCode same = index.Get(other)!;
+                    var (m, o) = callers.GetValueOrDefault(other);
+                    string calls = string.Join("; ", same.Callees.Select(c => index.Get(c) is { } cc
+                        ? $"0x{c:X} {cc.Instructions} ins" + (expected.Count != 0 ? $" {expected.Max(e => CodeIndex.Similarity(e.Sketch, cc.Sketch)):F3}" : "")
+                        : $"0x{c:X} no code"));
+                    Console.WriteLine($"    0x{other:X}{(other == address ? "*" : " ")} called from {m,5} managed, {o,4} other; calls {calls}");
+                }
+            }
+            // What it calls, and the signatures closest to each: a changed callee is what breaks the levels below 0.
+            foreach (ulong callee in code.Callees)
+            {
+                if (index.Get(callee) is not { } called) { Console.WriteLine($"  calls 0x{callee:X}: no code"); continue; }
+                string closest = string.Join(", ", library.Entries
+                    .Where(e => !e.IsThunk)
+                    .Select(e => (e, CodeIndex.Similarity(e.Sketch, called.Sketch)))
+                    .OrderByDescending(x => x.Item2).Take(3)
+                    .Select(x => $"{x.Item2:F3} {Short(x.e.Info.Name)} ({x.e.Instructions} ins{(index.Deep(callee, 0) == x.e.Depths[0] ? ", identical" : "")})"));
+                Console.WriteLine($"  calls 0x{callee:X}: {called.Instructions} instructions{(called.IsThunk ? $", thunk to 0x{index.ThunkTarget(callee):X}" : "")}; closest {closest}");
+            }
+        }
+        return 0;
+    }
+
     private static RuntimeHelpers FromSymbols(Il2CppModel model, string symbolsPath)
     {
         Dictionary<ulong, List<string>> symbols = CallStats.LoadSymbols(model.Image, symbolsPath);
@@ -65,7 +160,8 @@ internal static class SigLab
         Console.WriteLine($"library: {library.Entries.Count} signatures from Unity {library.Unity} {library.Platform}/{library.Arch}");
         var (context, index) = Open(target);
         var sw = Stopwatch.StartNew();
-        RuntimeHelpers matched = library.Match(index, target.Image, context.FunctionStarts.Where(a => !context.IsManaged(a)), out HelperMatchReport report);
+        RuntimeHelpers matched = library.Match(index, target.Image, context.FunctionStarts.Where(a => !context.IsManaged(a)), out HelperMatchReport report,
+            context.FunctionStarts.Where(context.IsManaged));
         Console.WriteLine($"{report} ({sw.ElapsedMilliseconds} ms)");
         // What matters is whether each kind of helper was found at all; a library holds several variants of each.
         var identifiedKinds = matched.ByAddress.Values.GroupBy(i => i.Kind).ToDictionary(g => g.Key, g => g.Count());

@@ -25,9 +25,13 @@ internal static class Program
             Console.WriteLine("usage: rewind-lab probe <binary> <global-metadata.dat> [symbols.tsv]");
             return 2;
         }
+        // REWIND_RECOVERY_STATS=live: the same every ten seconds while it runs (what is it doing so long?).
+        using var live = Environment.GetEnvironmentVariable("REWIND_RECOVERY_STATS") == "live"
+            ? new Timer(_ => Console.Error.WriteLine(Rewind.Analysis.Recover.RecoveryStats.Report()), null, 10000, 10000)
+            : null;
         try
         {
-            return args[0] switch
+            int code = args[0] switch
             {
                 "probe" => Probe(args[1], args[2], args.Length > 3 ? args[3] : null),
                 "truth-model" => TruthModel.Run(LoadModel(args[1]), args[2]),
@@ -61,8 +65,12 @@ internal static class Program
                 "nearest" => CodeLab.Nearest(LoadModel(args[1]), args[2], args[3..]),
                 "code" => CodeLab.Run(LoadModel(args[1]), args[2], args[3..]),
                 "sig-apply" => SigLab.Apply(args[1], LoadModel(args[2]), args.Length > 3 ? args[3] : null),
+                "sig-near" => SigLab.Near(args[1], LoadModel(args[2]), args[3..]),
                 _ => Fail($"unknown command '{args[0]}'"),
             };
+            // REWIND_RECOVERY_STATS: where the time of recovering went (gap-cover reports it itself, with more).
+            if (Rewind.Analysis.Recover.RecoveryStats.On && args[0] != "gap-cover") Console.Error.WriteLine(Rewind.Analysis.Recover.RecoveryStats.Report());
+            return code;
         }
         catch (Exception e)
         {
