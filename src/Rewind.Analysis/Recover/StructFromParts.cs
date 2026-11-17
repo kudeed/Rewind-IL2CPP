@@ -25,6 +25,8 @@ internal static class StructFromParts
     public static bool Run(HMethod method, MethodPipeline pipeline)
     {
         if (Disabled) return false;
+        // Copies made of a struct's fields just stored: made of the values stored.
+        bool forwarded = FieldForwarding.Run(method);
         bool any = false;
         for (int round = 0; round < 32; round++)
         {
@@ -39,7 +41,9 @@ internal static class StructFromParts
             if (!changed) break;
             any = true;
         }
-        return any;
+        // What was stored only to be read back by a copy now made of the values is stored for nothing.
+        if (forwarded || any) DeadStores.Run(method);
+        return any || forwarded;
     }
 
     // ---- what variables hold -------------------------------------------------------------------------------
