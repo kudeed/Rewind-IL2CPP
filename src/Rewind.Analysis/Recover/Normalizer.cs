@@ -24,7 +24,7 @@ public sealed class NormalizeResult
 /// initialization, static-constructor triggers, GC write barriers, and the explicit null / bounds / cast /
 /// divide checks that IL instructions perform implicitly. What remains maps directly onto IL.
 /// </summary>
-public sealed class Normalizer(ProgramAnalysis program)
+public sealed partial class Normalizer(ProgramAnalysis program)
 {
     private Function _fn = null!;
     private NormalizeResult _result = null!;
@@ -50,6 +50,7 @@ public sealed class Normalizer(ProgramAnalysis program)
         for (int round = 0; changed && round < 16; round++)
         {
             changed = RemoveGuards();
+            changed |= RemoveInlineBarriers();
             changed |= Structure();
             changed |= CollapseInterfaceLookups();
             changed |= CollapseLazyTargets();

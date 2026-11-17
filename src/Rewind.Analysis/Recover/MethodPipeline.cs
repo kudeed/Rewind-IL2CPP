@@ -935,6 +935,10 @@ public sealed class MethodPipeline
             ConstantTyping.Run(result, _program);
             AddressMerges.Run(result);
         }
+        // A bool's stack slot that still holds another number in the last build: read through the bool, that number
+        // would come out as 0 or 1.
+        if (builder.BoolSlotConflicts.Count != 0 && result.Problems.Count < 64)
+            result.Problems.Add("a number kept in the stack slot of a bool");
         // A call taken to reach no more than one object that turns out to take more - or that is still not
         // known, so that nothing says what it takes: the lifetimes were told apart on a footing that does not hold.
         if (assumed.Count != 0 && !AssumedReachHolds(assumed, fn, builder) && result.Problems.Count < 64)
@@ -1431,7 +1435,14 @@ public sealed class MethodPipeline
         if (position < 0) return -1;
 
         CallTarget target = _program.Resolve(info.Target);
-        if (target.Helper != null) return HelperReads(call, info, target.Helper.Kind, position);
+        if (target.Helper != null)
+        {
+            // modf(x, &whole) writes the whole part there, one number as wide as x, and nothing else. (Without a
+            // bound, the address of a pasted Math.Round's local reached the whole frame, and nothing on the stack
+            // became a value: the registers a catch handler saves stayed stores, of what it cannot know.)
+            if (!NoHelperExtents && target.Helper.Kind == HelperKind.Modf && position == 1) return target.Helper.IsDouble ? 8 : 4;
+            return HelperReads(call, info, target.Helper.Kind, position);
+        }
 
         int extent = -1, objects = 0, others = 0;
         void Consider(MethodAbi abi)

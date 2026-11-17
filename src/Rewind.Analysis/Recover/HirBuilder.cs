@@ -156,6 +156,9 @@ public sealed partial class HirBuilder
     /// <summary>Stack offsets whose memory looked like two different things (for StackSplitting).</summary>
     public HashSet<int> FrameConflicts { get; } = [];
 
+    /// <summary>Stack slots of a bool that are given or handed on as another number (a subset of FrameConflicts).</summary>
+    public HashSet<int> BoolSlotConflicts { get; } = [];
+
     /// <summary>
     /// Whether a merged value that is the address of one stack object or another becomes a reference variable
     /// (see DeclarePhis). Turned off for a build again where such a variable could not be written in C#.
@@ -230,12 +233,55 @@ public sealed partial class HirBuilder
             foreach (HStmt s in block.Statements)
             {
                 if (s is not HAssign { Target: HLocal { Variable: var slot } place, Value: var held } || !offsetOf.TryGetValue(slot, out int where)) continue;
-                if (place.Type == null || held.Type == null || held is HConst) continue;
+                if (place.Type == null || held.Type == null) continue;
+                // (A byte is how the native code keeps a bool: one taken out of a wider value, or merged with a
+                // constant 1, is typed byte and is the bool.)
+                if (!NoBoolConflicts && IsBoolType(place.Type) && !IsTruthValue(held) && IsNumber(held.Type) &&
+                    held.Type is not PrimitiveSig { Element: Il2CppTypeEnum.U1 or Il2CppTypeEnum.I1 })
+                {
+                    FrameConflicts.Add(where);
+                    BoolSlotConflicts.Add(where);
+                    continue;
+                }
+                if (held is HConst) continue;
                 if ((IsSmallNumber(place.Type) && IsReference(held.Type)) || (IsReference(place.Type) && IsSmallNumber(held.Type))) FrameConflicts.Add(where);
             }
+        if (NoBoolConflicts) return;
+        // A bool slot handed where another number is taken (an enum, a char): the slot held a bool for one
+        // variable and that number for another. Read through the bool, the number would come out as 0 or 1.
+        foreach (HBlock block in _h.Blocks)
+            foreach (HStmt s in block.Statements)
+                FinallyFolding.Visit(s, e =>
+                {
+                    if (e is not HCall call || call.Method.Parameters.Length != call.Arguments.Length) return;
+                    for (int i = 0; i < call.Arguments.Length; i++)
+                        if (call.Arguments[i] is HLocal { Variable: var v } local && IsBoolType(local.Type) && offsetOf.TryGetValue(v, out int at) &&
+                            call.Method.Parameters[i].Type is var wanted && !IsBoolType(wanted) && IsNumber(wanted))
+                        {
+                            FrameConflicts.Add(at);
+                            BoolSlotConflicts.Add(at);
+                        }
+                });
     }
 
+    private static bool IsBoolType(TypeSig? t) => t is PrimitiveSig { Element: Il2CppTypeEnum.Boolean };
+
+    /// <summary>A number of any width, or an enum.</summary>
+    private static bool IsNumber(TypeSig? t) => t switch
+    {
+        PrimitiveSig p => p.Element is Il2CppTypeEnum.Char or Il2CppTypeEnum.I1 or Il2CppTypeEnum.U1 or Il2CppTypeEnum.I2 or Il2CppTypeEnum.U2 or
+            Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4 or Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8 or Il2CppTypeEnum.I or Il2CppTypeEnum.U or
+            Il2CppTypeEnum.R4 or Il2CppTypeEnum.R8,
+        { Definition: { IsEnum: true } } => true,
+        _ => false,
+    };
+
+    /// <summary>What a bool can hold: a bool, or the number 0 or 1.</summary>
+    private static bool IsTruthValue(HExpr e) =>
+        IsBoolType(e.Type) || e is HConst { Value: false or true or 0 or 1 or 0L or 1L or (byte)0 or (byte)1 };
+
     private static readonly bool NoScalarConflicts = Environment.GetEnvironmentVariable("REWIND_NO_SCALAR_CONFLICTS") != null;
+    private static readonly bool NoBoolConflicts = Environment.GetEnvironmentVariable("REWIND_NO_BOOL_CONFLICTS") != null;
 
     private void CheckFrameVariables()
     {
