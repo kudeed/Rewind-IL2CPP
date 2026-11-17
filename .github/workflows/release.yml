@@ -1,8 +1,8 @@
 name: Release
 
 # Every push to main or experimental becomes a release of that branch: an installer (Rewind-<branch>-Setup.exe), a
-# portable zip, and the update feed installed copies of Rewind read. Experimental releases are pre-releases, so
-# "latest release" always means main. See installer/pack.ps1 for the versions and what goes in.
+# portable zip, and the update feed installed copies of Rewind read. Both are normal releases; once main has one,
+# the "Latest release" badge stays on main's newest. See installer/pack.ps1 for the versions and what goes in.
 
 on:
   push:
@@ -38,5 +38,6 @@ jobs:
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHANNEL: ${{ github.ref_name }}
         run: ./installer/pack.ps1 -Channel $env:CHANNEL -Download -Upload

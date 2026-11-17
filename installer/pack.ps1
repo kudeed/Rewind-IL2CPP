@@ -116,12 +116,20 @@ Run 'Packing with Velopack' {
 
 if ($Upload) {
     if (-not $env:GITHUB_TOKEN) { throw 'Uploading needs a GitHub token in GITHUB_TOKEN.' }
-    $name = if ($Channel -eq 'main') { "Rewind $Version" } else { "Rewind $Version (experimental)" }
+    # Both branches publish normal releases (a pre-release never shows as the repository's latest release).
     $arguments = @('upload', 'github', '--repoUrl', $repoUrl, '--token', $env:GITHUB_TOKEN, '--channel', $Channel,
-        '--outputDir', $releases, '--publish', '--releaseName', $name, '--tag', "v$Version",
+        '--outputDir', $releases, '--publish', '--releaseName', "Rewind $Version", '--tag', "v$Version",
         '--targetCommitish', (git -C $root rev-parse HEAD).Trim())
-    if ($Channel -eq 'experimental') { $arguments += '--pre' }
     Run 'Publishing the GitHub release' { & $vpk @arguments }
+
+    # A new release becomes the "Latest release". Once main has one, that badge stays on main's newest build.
+    $env:GH_TOKEN = $env:GITHUB_TOKEN
+    $repo = 'ratman-bit/Rewind-IL2CPP-Decompiler'
+    $mainTags = @(gh release list -R $repo --limit 100 --json tagName --jq '.[].tagName' | Where-Object { $_ -notlike '*-experimental' })
+    if ($mainTags.Count -gt 0) {
+        $newestMain = $mainTags | Sort-Object { [version]($_.TrimStart('v')) } -Descending | Select-Object -First 1
+        Run "Marking $newestMain as the latest release" { gh release edit $newestMain -R $repo --latest }
+    }
 }
 
 Write-Host "Done: $(Join-Path $releases "Rewind-$Channel-Setup.exe")"

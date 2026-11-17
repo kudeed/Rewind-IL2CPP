@@ -27,8 +27,10 @@ On Windows, get the installer from [Releases](https://github.com/ratman-bit/Rewi
 
 | Installer | Built from |
 | --- | --- |
-| `Rewind-main-Setup.exe`, in the latest release | the `main` branch: only work that passed the full test pass |
-| `Rewind-experimental-Setup.exe`, in the newest pre-release | the `experimental` branch: every change first, tested or not |
+| `Rewind-main-Setup.exe`, in the newest release named `Rewind <version>` | the `main` branch: only work that passed the full test pass |
+| `Rewind-experimental-Setup.exe`, in the newest release named `Rewind <version>-experimental` | the `experimental` branch: every change first, tested or not |
+
+Once `main` has a release, the one marked "Latest" is always `main`'s newest.
 
 It installs two things for your Windows account, with no administrator rights or .NET install needed:
 
