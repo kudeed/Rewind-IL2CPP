@@ -63,7 +63,23 @@ public sealed class AccessorIndex(ProgramAnalysis program)
         returned is not (PointerSig or ByRefSig or GenericParamSig) && held is not (PointerSig or ByRefSig or GenericParamSig);
 
     private static bool IsFieldOfThis(HExpr e, FieldDef field) =>
-        e is HField f && ReferenceEquals(f.Field, field) && (field.IsStatic ? f.Object == null : f.Object is HArg { Index: -1 });
+        (e is HField f && ReferenceEquals(f.Field, field) && (field.IsStatic ? f.Object == null : f.Object is HArg { Index: -1 })) ||
+        IsWholeOneFieldThis(e, field);
+
+    internal static readonly bool NoPropertyParts = Environment.GetEnvironmentVariable("REWIND_NO_PROPERTY_PARTS") != null;
+    private static readonly bool NoOneFieldGetters = Environment.GetEnvironmentVariable("REWIND_NO_ONE_FIELD_GETTERS") != null;
+
+    /// <summary>
+    /// "return this" of a struct whose only field is the field (LayerMask, whose int is its "value"): the struct
+    /// read whole is that field.
+    /// </summary>
+    private static bool IsWholeOneFieldThis(HExpr e, FieldDef field)
+    {
+        if (NoOneFieldGetters || field.IsStatic || field.DeclaringType is not { IsValueType: true } owner) return false;
+        if (owner.Fields.Count(x => !x.IsStatic) != 1 || field.Offset is not (0 or -1) && field.Offset != owner.Fields.First(x => !x.IsStatic).Offset) return false;
+        while (e is HConv c) e = c.Operand;
+        return e is HArg { Index: -1 } || e is HDeref { Pointer: HArg { Index: -1 } };
+    }
 
     private MethodDef? Find(FieldDef field, bool setter)
     {
@@ -327,10 +343,66 @@ public static class AccessorFolding
             }
         }
 
+        // The parts of a struct-typed field of a struct written one by one ("bounds.m_Extents.x = ..."), where the
+        // field is a property with a setter that only stores it: the property, given a copy with those parts.
+        static bool Same(HExpr a, HExpr b) => (a, b) switch
+        {
+            (HLocal x, HLocal y) => ReferenceEquals(x.Variable, y.Variable),
+            (HArg x, HArg y) => x.Index == y.Index,
+            (HField x, HField y) => ReferenceEquals(x.Field, y.Field) && (x.Object == null ? y.Object == null : y.Object != null && Same(x.Object, y.Object)),
+            _ => false,
+        };
+        bool Mentions(HExpr e, FieldDef field)
+        {
+            bool found = false;
+            FinallyFolding.Visit(e, x => found |= x is HField f && ReferenceEquals(f.Field, field));
+            return found;
+        }
+        bool PropertyParts(HBlock block, int i)
+        {
+            if (AccessorIndex.NoPropertyParts || block.Statements[i] is not HAssign { Target: HField { Object: HField { Object: { } owner } inner } } ||
+                Nameable(inner.Field) || inner.Type is not { IsValueType: true } partsType || owner is not (HLocal or HArg or HField) ||
+                index.GetterOf(inner.Field) is not { } getter || index.SetterOf(inner.Field) is not { } setter ||
+                ReferenceEquals(getter, current) || ReferenceEquals(setter, current)) return false;
+            int end = i;
+            var parts = new List<(HField Part, HExpr Value)>();
+            while (end < block.Statements.Count && block.Statements[end] is HAssign { Target: HField { Object: HField { Object: { } o } f } part, Value: var value } &&
+                   ReferenceEquals(f.Field, inner.Field) && Same(o, owner) && part.Field is { IsStatic: false })
+            {
+                if (Mentions(value, inner.Field)) return false; // reads what the run writes: left as it is
+                parts.Add((part, value));
+                end++;
+            }
+            var fieldsOf = partsType.Definition?.Fields.Where(x => !x.IsStatic).ToList() ?? [];
+            bool whole = fieldsOf.Count != 0 && fieldsOf.All(x => parts.Count(p => ReferenceEquals(p.Part.Field, x)) == 1);
+            HVar copy = method.NewLocal(partsType, "p");
+            HExpr Copy() => new HLocal(copy) { Type = partsType };
+            TypeSig? declaring = inner.DeclaringType is GenericInstSig ? inner.DeclaringType : null;
+            var rebuilt = new List<HStmt>
+            {
+                new HAssign(Copy(), whole
+                    ? new HTypeExpr(HTypeOp.Default, partsType, null) { Type = partsType }
+                    : new HCall { Method = getter, DeclaringType = declaring, This = Owner(owner), Arguments = [], Virtual = getter.IsVirtual, Type = partsType })
+                { Address = block.Statements[i].Address },
+            };
+            foreach (var (part, value) in parts)
+                rebuilt.Add(new HAssign(new HField { Field = part.Field, Object = Copy(), DeclaringType = part.DeclaringType, Type = part.Type }, Read(value)) { Address = block.Statements[i].Address });
+            rebuilt.Add(new HEval(new HCall { Method = setter, DeclaringType = declaring, This = Owner(owner), Arguments = [Copy()], Virtual = setter.IsVirtual, Type = setter.ReturnType })
+                { Address = block.Statements[end - 1].Address });
+            block.Statements.RemoveRange(i, end - i);
+            block.Statements.InsertRange(i, rebuilt);
+            return true;
+        }
+
         foreach (HBlock block in method.Blocks)
         {
             for (int i = 0; i < block.Statements.Count; i++)
             {
+                if (PropertyParts(block, i))
+                {
+                    i += block.Statements.Skip(i).TakeWhile(x => x is not HEval).Count();
+                    continue;
+                }
                 switch (block.Statements[i])
                 {
                     case HAssign a:
