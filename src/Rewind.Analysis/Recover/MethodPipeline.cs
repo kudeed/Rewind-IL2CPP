@@ -27,12 +27,25 @@ public sealed class MethodPipeline
     private readonly X64Lifter _lifter;
     private readonly Normalizer _normalizer;
 
-    public MethodPipeline(ProgramAnalysis program)
+    public MethodPipeline(ProgramAnalysis program) : this(program, forAccessors: false)
+    {
+    }
+
+    /// <summary>
+    /// <paramref name="forAccessors"/>: the pipeline that reads the candidates for a field's accessor
+    /// (AccessorIndex). While it runs, no field has an accessor to ask for, so what it recovers on the way is not
+    /// what another pipeline would recover: it is kept apart.
+    /// </summary>
+    internal MethodPipeline(ProgramAnalysis program, bool forAccessors)
     {
         _program = program;
         _lifter = program.NewLifter();
         _normalizer = new Normalizer(program);
+        Kept = forAccessors ? program.KeptForAccessors : program.Kept;
     }
+
+    /// <summary>What this pipeline's recoveries ask each other for, kept for every pipeline of its kind and every thread.</summary>
+    internal RecoveryCache Kept { get; }
 
     /// <summary>
     /// What a recovered body uses, whatever the order and the temporaries: the methods it calls, the fields it
@@ -147,6 +160,8 @@ public sealed class MethodPipeline
         // (None of its own: none at all - also where this recovery was started from within such a one.)
         (HashSet<GenericParam>? builder, HashSet<GenericParam>? layouts) = (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters);
         (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters) = (own, own);
+        ForgetOpen();
+        long started = RecoveryStats.Begin();
         try
         {
             HMethod built = Build(Lift(method, classArgs, methodArgs, address));
@@ -161,7 +176,9 @@ public sealed class MethodPipeline
         }
         finally
         {
+            RecoveryStats.End(RecoveryStats.Kind.Method, started);
             (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters) = (builder, layouts);
+            ForgetOpen();
         }
     }
 
@@ -213,8 +230,13 @@ public sealed class MethodPipeline
         MethodDef? passes = null;
         (HashSet<GenericParam>? builder, HashSet<GenericParam>? layouts) = (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters);
         (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters) = (null, null);
+        ForgetOpen();
         bool probing = _probing;
         _probing = true;
+        // (How the method reads on its own: a check for a copy of a method that is under way where this was
+        // asked is not under way here.)
+        _program.Auxiliary++;
+        long started = RecoveryStats.Begin();
         try
         {
             passes = PassedOnTo(Build(Lift(method)));
@@ -225,8 +247,11 @@ public sealed class MethodPipeline
         }
         finally
         {
+            RecoveryStats.End(RecoveryStats.Kind.Passing, started);
+            _program.Auxiliary--;
             _probing = probing;
             (HirBuilder.OwnParameters, _program.Layouts.ReferenceParameters) = (builder, layouts);
+            ForgetOpen();
         }
         return _passesOn[method] = passes;
     }
@@ -501,7 +526,7 @@ public sealed class MethodPipeline
         // branch): with the read put back they are one run, which may be one struct made in one go.
         if ((_guardedAccessors ??= new GuardedAccessorFolding(this)).Run(result) && !NoStructsAgain) StructFolding.Run(result, _program, this);
         ElementParts.Run(result);
-        (_inlineFolding ??= new InlineFolding(this, _program)).Run(result);
+        Inline.Run(result);
         if (WrapperFolding.Lift(result, this))
         {
             StructFolding.Run(result, _program, this);
@@ -583,9 +608,117 @@ public sealed class MethodPipeline
         return type;
     }
 
-    private readonly Dictionary<(MethodDef, string), HMethod?> _constructorBodies = [];
     internal static readonly bool NoConstructorFlows = Environment.GetEnvironmentVariable("REWIND_NO_CONSTRUCTOR_FLOWS") != null;
-    private readonly HashSet<MethodDef> _recovering = [];
+
+    // ---- what recoveries ask each other for -------------------------------------------------------------------
+    //
+    // The recovered statements of another method - to compare pasted code with, to read an accessor from, to put
+    // a constructor back - are the same for whoever asks, so they are kept, and kept for every thread
+    // (RecoveryCache). For that they must not depend on who asked first, on the order the methods are recovered
+    // in, or on the thread. One thing could make them: a recovery for another's use asks for others in turn (a
+    // constructor makes an object, whose constructor makes another ...), and that has to end somewhere - two
+    // constructors may each make the other. It ends by depth: the method asked for may ask so many deep
+    // (Depth), what it asks for one less, and so on down to a recovery that is refused whatever it asks for. A
+    // body is then what it is for the depth it has left, and for nothing else.
+    //
+    // Most never get near the end. A body that was recovered with nothing refused below it is the same at every
+    // depth that is at least what it used, and is kept once for all of them; only one that something was
+    // refused to is kept for its depth alone. (Ending at what is under way further up instead - a constructor
+    // is not recovered inside itself - makes a body depend on everything under way when it was asked for: among
+    // many constructors that make each other that is a different body for every way to get there.)
+
+    /// <summary>How many recoveries for the use of another may be under way inside one another.</summary>
+    private static readonly int Depth =
+        int.TryParse(Environment.GetEnvironmentVariable("REWIND_ASK_DEPTH"), out int depth) && depth >= 0 ? depth : 4;
+
+    private sealed class Asking
+    {
+        /// <summary>How deep the recoveries went that this one asked for (0: it asked for none).</summary>
+        public int Used;
+        /// <summary>Whether this one, or one it asked for, was refused something because the depth was used up.</summary>
+        public bool Cut;
+    }
+
+    private readonly List<Asking> _asking = [];
+    /// <summary>How deep recoveries for the use of another may still go from here.</summary>
+    private int _left = Depth;
+
+    /// <summary>Whether no recovery for the use of another is under way: what is made now is made the same anywhere.</summary>
+    internal bool NothingUnderWay => _asking.Count == 0;
+
+    private static void Note(Asking? outer, int used, bool cut)
+    {
+        if (outer == null) return;
+        outer.Used = Math.Max(outer.Used, used + 1);
+        outer.Cut |= cut;
+    }
+
+    /// <summary>
+    /// The statements of a method, for another recovery: the kept ones, else recovered now and kept. Null also
+    /// where the depth is used up. <paramref name="kept"/> null: made anew every time, for the caller to change.
+    /// </summary>
+    private HMethod? Ask<TKey>(IDictionary<(TKey Key, int Left), RecoveryCache.Body>? kept, TKey key, RecoveryStats.Kind kind, Func<HMethod?> recover)
+        where TKey : notnull
+    {
+        Asking? outer = _asking.Count != 0 ? _asking[^1] : null;
+        if (_left == 0)
+        {
+            if (outer != null) outer.Cut = true;
+            return null;
+        }
+        int left = _left - 1; // how deep what is asked for may ask in turn
+        if (kept != null &&
+            ((kept.TryGetValue((key, RecoveryCache.Whole), out RecoveryCache.Body? known) && known.Used <= left) || kept.TryGetValue((key, left), out known)))
+        {
+            Note(outer, known.Used, known.Cut);
+            return known.Statements;
+        }
+        var asking = new Asking();
+        _asking.Add(asking);
+        _left = left;
+        _program.Auxiliary++;
+        HMethod? body = null;
+        long started = RecoveryStats.Begin();
+        try
+        {
+            body = recover();
+        }
+        catch (Exception)
+        {
+            body = null;
+        }
+        finally
+        {
+            RecoveryStats.End(kind, started);
+            _program.Auxiliary--;
+            _left = left + 1;
+            _asking.RemoveAt(_asking.Count - 1);
+            Note(outer, asking.Used, asking.Cut);
+        }
+        if (kept == null) return body;
+        var made = new RecoveryCache.Body(body, asking.Used, asking.Cut);
+        if (RecoveryCache.Check && body != null) made.Text = HirPrinter.Print(body);
+        (TKey, int) at = (key, asking.Cut ? left : RecoveryCache.Whole);
+        if (kept is System.Collections.Concurrent.ConcurrentDictionary<(TKey Key, int Left), RecoveryCache.Body> shared) return shared.GetOrAdd(at, made).Statements;
+        kept[at] = made;
+        return body;
+    }
+
+    /// <summary>
+    /// Bodies for type arguments that name a type parameter: constructors of a generic class, and methods. What
+    /// a type parameter stands for is known only to the recovery under way (RecoverAt): these are kept for that
+    /// one alone.
+    /// </summary>
+    private readonly Dictionary<((MethodDef Constructor, string Arguments) Key, int Left), RecoveryCache.Body> _openConstructors = [];
+    private readonly Dictionary<(MethodInst Key, int Left), RecoveryCache.Body> _openInstances = [];
+
+    private void ForgetOpen()
+    {
+        if (_openConstructors.Count != 0) _openConstructors.Clear();
+        if (_openInstances.Count != 0) _openInstances.Clear();
+    }
+
+    private InlineFolding Inline => _inlineFolding ??= new InlineFolding(this, _program);
 
     /// <summary>
     /// The recovered statements of a constructor, when they are complete and a plain run without branches:
@@ -601,10 +734,10 @@ public sealed class MethodPipeline
     internal HMethod? ConstructorFlow(MethodDef constructor, TypeSig[] classArguments)
     {
         string key = classArguments.Length == 0 ? "" : string.Join(",", classArguments.Select(a => a.Key));
-        if (_constructorBodies.TryGetValue((constructor, key), out HMethod? known)) return known;
-        if (!_recovering.Add(constructor)) return null; // being recovered right now, further up
-        HMethod? body = null;
-        try
+        bool open = false;
+        foreach (TypeSig argument in classArguments) open |= argument.ContainsGenericParameter;
+        IDictionary<((MethodDef Constructor, string Arguments) Key, int Left), RecoveryCache.Body> kept = open ? _openConstructors : Kept.Constructors;
+        return Ask(kept, (constructor, key), RecoveryStats.Kind.Constructor, () =>
         {
             LiftedMethod? lifted = null;
             if (constructor.DeclaringType.GenericParameters.Length == 0)
@@ -630,56 +763,32 @@ public sealed class MethodPipeline
                     }
                 }
             }
-            if (lifted != null)
-            {
-                HMethod h = BuildCore(lifted);
-                if (h.Problems.Count == 0 && h.Blocks.Count != 0 && h.TryRegions.Count == 0 &&
-                    (h.Blocks.Count == 1 ? h.Blocks[0].Statements is [.., HReturn { Value: null }] : !NoConstructorFlows))
-                    body = h;
-            }
-        }
-        catch (Exception)
-        {
-            body = null;
-        }
-        finally
-        {
-            _recovering.Remove(constructor);
-        }
-        return _constructorBodies[(constructor, key)] = body;
+            if (lifted == null) return null;
+            HMethod h = BuildCore(lifted);
+            return h.Problems.Count == 0 && h.Blocks.Count != 0 && h.TryRegions.Count == 0 &&
+                   (h.Blocks.Count == 1 ? h.Blocks[0].Statements is [.., HReturn { Value: null }] : !NoConstructorFlows)
+                ? h
+                : null;
+        });
     }
-
-    private readonly Dictionary<MethodDef, HMethod?> _coreBodies = [];
 
     /// <summary>
     /// The recovered statements of a method as they stand before accessors are put back into them - what code
-    /// pasted from that method into another looks like there. Null when the method has no code of its own or
-    /// was not recovered completely.
+    /// pasted from that method into another looks like there - with a struct parameter that arrives in pieces
+    /// whole again (InlineFolding.WholeParameters). Null when the method has no code of its own or was not
+    /// recovered completely. They are everybody's: not to be changed (see FreshCoreBody).
     /// </summary>
     internal HMethod? CoreBody(MethodDef method)
     {
-        if (_coreBodies.TryGetValue(method, out HMethod? known)) return known;
         if (method.Address == 0 || method.DeclaringType.GenericParameters.Length != 0 || method.GenericParameters.Length != 0) return null;
-        if (!_recovering.Add(method)) return null; // being recovered right now, further up
-        HMethod? body = null;
-        try
+        return Ask(Kept.Methods, method, RecoveryStats.Kind.Body, () =>
         {
             HMethod h = BuildCore(Lift(method));
-            if (h.Problems.Count == 0) body = h;
-        }
-        catch (Exception)
-        {
-            body = null;
-        }
-        finally
-        {
-            _recovering.Remove(method);
-        }
-        return _coreBodies[method] = body;
+            if (h.Problems.Count != 0) return null;
+            if (!method.IsConstructor && method.Name != ".cctor") Inline.WholeParameters(h);
+            return h;
+        });
     }
-
-    private readonly Dictionary<MethodInst, HMethod?> _instanceBodies = [];
-    private readonly HashSet<ulong> _recoveringAt = [];
 
     /// <summary>
     /// CoreBody for one instantiation of a method of a generic class: the statements the code compiled for those
@@ -687,43 +796,29 @@ public sealed class MethodPipeline
     /// </summary>
     internal HMethod? CoreBody(MethodInst inst)
     {
-        if (_instanceBodies.TryGetValue(inst, out HMethod? known)) return known;
-        if (inst.Address == 0 || !_recoveringAt.Add(inst.Address)) return null;
-        HMethod? body = null;
-        try
+        if (inst.Address == 0) return null;
+        bool open = false;
+        foreach (TypeSig argument in inst.ClassArguments) open |= argument.ContainsGenericParameter;
+        foreach (TypeSig argument in inst.MethodArguments) open |= argument.ContainsGenericParameter;
+        IDictionary<(MethodInst Key, int Left), RecoveryCache.Body> kept = open ? _openInstances : Kept.Instances;
+        return Ask(kept, inst, RecoveryStats.Kind.Body, () =>
         {
             HMethod h = BuildCore(Lift(inst.Method, inst.ClassArguments, inst.MethodArguments, inst.Address));
-            if (h.Problems.Count == 0) body = h;
-        }
-        catch (Exception)
-        {
-            body = null;
-        }
-        finally
-        {
-            _recoveringAt.Remove(inst.Address);
-        }
-        return _instanceBodies[inst] = body;
+            if (h.Problems.Count != 0) return null;
+            if (!inst.Method.IsConstructor && inst.Method.Name != ".cctor") Inline.WholeParameters(h);
+            return h;
+        });
     }
 
-    /// <summary>The same statements as CoreBody gives, made anew: the caller's own, to change as it likes.</summary>
+    /// <summary>The same statements as CoreBody gives before a parameter is made whole, made anew: the caller's own, to change as it likes.</summary>
     internal HMethod? FreshCoreBody(MethodDef method)
     {
         if (method.Address == 0 || method.DeclaringType.GenericParameters.Length != 0 || method.GenericParameters.Length != 0) return null;
-        if (!_recovering.Add(method)) return null;
-        try
+        return Ask<MethodDef>(null, method, RecoveryStats.Kind.Fresh, () =>
         {
             HMethod h = BuildCore(Lift(method));
             return h.Problems.Count == 0 ? h : null;
-        }
-        catch (Exception)
-        {
-            return null;
-        }
-        finally
-        {
-            _recovering.Remove(method);
-        }
+        });
     }
 
     /// <summary>Everything up to, but not including, the rewriting of private field accesses into accessor calls.</summary>

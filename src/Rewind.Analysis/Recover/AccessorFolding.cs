@@ -10,7 +10,6 @@ namespace Rewind.Analysis.Recover;
 /// </summary>
 public sealed class AccessorIndex(ProgramAnalysis program)
 {
-    private readonly Dictionary<FieldDef, MethodDef?> _getters = [], _setters = [];
     private MethodPipeline? _pipeline;
     private bool _busy;
 
@@ -19,7 +18,7 @@ public sealed class AccessorIndex(ProgramAnalysis program)
         // Accessors are a handful of instructions (a static one first makes sure its class is initialized);
         // anything longer is not one.
         if (program.Code.Get(inst?.Address ?? method.Address) is not { Instructions: <= 32 }) return null;
-        _pipeline ??= new MethodPipeline(program);
+        _pipeline ??= new MethodPipeline(program, forAccessors: true);
         try
         {
             HMethod h = inst != null ? _pipeline.Recover(inst) : _pipeline.Recover(method);
@@ -70,6 +69,10 @@ public sealed class AccessorIndex(ProgramAnalysis program)
     {
         if (_busy) return null; // asked while recovering an accessor: no answer rather than recursion
         _busy = true;
+        // (What a field's accessor is does not depend on what the asking recovery was doing: a check for a
+        // copy of a method that is under way there is not under way here.)
+        program.Auxiliary++;
+        long started = RecoveryStats.Begin();
         try
         {
             MethodDef? found = null;
@@ -96,6 +99,8 @@ public sealed class AccessorIndex(ProgramAnalysis program)
         }
         finally
         {
+            RecoveryStats.End(RecoveryStats.Kind.Accessor, started);
+            program.Auxiliary--;
             _busy = false;
         }
     }
@@ -126,20 +131,23 @@ public sealed class AccessorIndex(ProgramAnalysis program)
         return null;
     }
 
+    // What a field's accessor is does not depend on who asks: kept for every thread (RecoveryCache). Asked while
+    // an accessor is being recovered there is no answer, whether or not one is known by now - else what that
+    // accessor is recovered as would depend on what happened to be asked before.
     public MethodDef? GetterOf(FieldDef field)
     {
-        if (_getters.TryGetValue(field, out MethodDef? known)) return known;
-        if (IsBackingField(field)) return _getters[field] = AutoAccessor(field, setter: false);
+        if (IsBackingField(field)) return AutoAccessor(field, setter: false);
         if (_busy) return null;
-        return _getters[field] = Find(field, setter: false);
+        if (program.Kept.Getters.TryGetValue(field, out MethodDef? known)) return known;
+        return program.Kept.Getters.GetOrAdd(field, Find(field, setter: false));
     }
 
     public MethodDef? SetterOf(FieldDef field)
     {
-        if (_setters.TryGetValue(field, out MethodDef? known)) return known;
-        if (IsBackingField(field)) return _setters[field] = AutoAccessor(field, setter: true);
+        if (IsBackingField(field)) return AutoAccessor(field, setter: true);
         if (_busy) return null;
-        return _setters[field] = Find(field, setter: true);
+        if (program.Kept.Setters.TryGetValue(field, out MethodDef? known)) return known;
+        return program.Kept.Setters.GetOrAdd(field, Find(field, setter: true));
     }
 }
 
