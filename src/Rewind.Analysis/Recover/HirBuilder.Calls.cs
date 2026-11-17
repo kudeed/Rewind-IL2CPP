@@ -1334,6 +1334,7 @@ public sealed partial class HirBuilder
 
         HExpr? thisExpr = null;
         var args = new HExpr[method.Parameters.Length];
+        MethodDef? stringConstructor = null;
         HExpr? returnLocation = null;
 
         foreach (AbiParam p in abi.Params)
@@ -1362,6 +1363,17 @@ public sealed partial class HirBuilder
                             Problem($"struct receiver location not recovered on {method.DeclaringType.Name}.{method.Name}");
                             thisExpr = Value(node);
                         }
+                    }
+                    else if (!NoNullReceivers && node.IsConstValue(0))
+                    {
+                        // A string constructor: IL2CPP makes each one a method "CreateString" with the same
+                        // arguments, called with no object - the string is what it returns.
+                        if (StringConstructorOf(method) is { } made) stringConstructor = made;
+                        // An instance method handed zero for its object: the code it shares never reads the
+                        // object, and the C++ compiler, seeing that, did not keep which one it was. "null" here
+                        // would throw where the program does not; what it was called on is not known.
+                        else Problem(UnkeptReceiver);
+                        thisExpr = new HConst(null, p.Type);
                     }
                     else
                     {
@@ -1470,6 +1482,12 @@ public sealed partial class HirBuilder
             bool onThis = thisExpr is HArg { Index: -1 };
             bool baseCall = onThis && !ReferenceEquals(method.DeclaringType, _method.DeclaringType);
             virtualCall = !baseCall;
+        }
+
+        if (stringConstructor != null && abi.Return == ReturnKind.Integer)
+        {
+            FinishCall(call, new HNewObject { Constructor = stringConstructor, Arguments = args, Type = _string }, abi.Return, _string, tail);
+            return;
         }
 
         var expr = new HCall
@@ -1659,6 +1677,23 @@ public sealed partial class HirBuilder
     }
 
     private static readonly bool NoPInvokeChoices = Environment.GetEnvironmentVariable("REWIND_NO_PINVOKE_CHOICES") != null;
+    private static readonly bool NoNullReceivers = Environment.GetEnvironmentVariable("REWIND_NO_NULL_RECEIVERS") != null;
+    internal const string UnkeptReceiver = "an instance method called on an object the code did not keep";
+
+    /// <summary>The string constructor a "CreateString" method of System.String stands for: the one that takes the same arguments.</summary>
+    private MethodDef? StringConstructorOf(MethodDef method)
+    {
+        if (method.Name != "CreateString" || _string.Definition is not { } type || !ReferenceEquals(method.DeclaringType, type)) return null;
+        foreach (MethodDef candidate in type.Methods)
+        {
+            if (candidate.Name != ".ctor" || candidate.IsStatic || candidate.Parameters.Length != method.Parameters.Length) continue;
+            bool same = true;
+            for (int i = 0; i < candidate.Parameters.Length && same; i++)
+                same = candidate.Parameters[i].Type.Key == method.Parameters[i].Type.Key;
+            if (same) return candidate;
+        }
+        return null;
+    }
 
     /// <summary>Types the marshaler passes unchanged: numbers, chars, pointers, native ints, enums.</summary>
     private static bool IsPassedAsIs(TypeSig type) => type switch

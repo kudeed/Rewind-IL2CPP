@@ -506,6 +506,39 @@ public sealed class MethodPipeline
         }
     }
 
+    private static readonly bool NoUnkeptFolds = Environment.GetEnvironmentVariable("REWIND_NO_UNKEPT_FOLDS") != null;
+
+    /// <summary>
+    /// An instance method called on an object the code did not keep (see HirBuilder.UnkeptReceiver): the code
+    /// the method shares never reads its object. Where the method's own recovered body is one "return E", and
+    /// E names nothing of the method's own - no argument, not the object, no variable - the call gives E
+    /// whatever it was called on, and is E. The mark goes with the call.
+    /// </summary>
+    private void FoldUnkeptReceivers(HMethod result)
+    {
+        if (NoUnkeptFolds) return;
+        int marked = result.Problems.Count(p => p == HirBuilder.UnkeptReceiver);
+        // (Problems past the 64th are not kept: then it cannot be told which calls are marked.)
+        if (marked == 0 || result.Problems.Count >= 64) return;
+        int folded = 0;
+        HExpr? Map(HExpr e)
+        {
+            if (e is not HCall { This: HConst { Value: null }, Method: { IsStatic: false } method, DeclaringType: null, MethodArguments.Length: 0 } call ||
+                call.Arguments.Any(a => !HirBuilder.IsPure(a)))
+                return null;
+            if (CoreBody(method) is not { Blocks: [{ Statements: [HReturn { Value: { } value }] }] }) return null;
+            bool own = false;
+            FinallyFolding.Visit(value, x => own |= x is HArg or HLocal);
+            if (own) return null;
+            folded++;
+            return HirCopy.Of(value);
+        }
+        foreach (HBlock block in result.Blocks)
+            foreach (HStmt s in block.Statements)
+                EnumeratorLoops.Rewrite(s, Map);
+        for (int i = 0; i < Math.Min(folded, marked); i++) result.Problems.Remove(HirBuilder.UnkeptReceiver);
+    }
+
     private HMethod BuildAll(LiftedMethod lifted)
     {
         // The method asked for: nothing else is being built around it.
@@ -523,6 +556,7 @@ public sealed class MethodPipeline
             _program.OwnTranslation = before;
             _program.NamedVerifier = verifier;
         }
+        FoldUnkeptReceivers(result);
         // A networked property read in the middle of a struct being filled kept the stores apart (its check is a
         // branch): with the read put back they are one run, which may be one struct made in one go.
         if ((_guardedAccessors ??= new GuardedAccessorFolding(this)).Run(result) && !NoStructsAgain) StructFolding.Run(result, _program, this);
