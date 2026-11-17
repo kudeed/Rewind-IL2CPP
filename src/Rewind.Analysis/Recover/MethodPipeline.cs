@@ -935,6 +935,10 @@ public sealed class MethodPipeline
             ConstantTyping.Run(result, _program);
             AddressMerges.Run(result);
         }
+        // A bool's stack slot that still holds another number in the last build: read through the bool, that number
+        // would come out as 0 or 1.
+        if (builder.BoolSlotConflicts.Count != 0 && result.Problems.Count < 64)
+            result.Problems.Add("a number kept in the stack slot of a bool");
         // A call taken to reach no more than one object that turns out to take more - or that is still not
         // known, so that nothing says what it takes: the lifetimes were told apart on a footing that does not hold.
         if (assumed.Count != 0 && !AssumedReachHolds(assumed, fn, builder) && result.Problems.Count < 64)
