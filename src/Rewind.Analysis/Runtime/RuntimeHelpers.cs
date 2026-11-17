@@ -104,6 +104,11 @@ public sealed record HelperInfo(HelperKind Kind, int IntArgs, bool NoReturn, boo
     public int FloatArgs { get; init; }
     public bool IsDouble { get; init; }
     public string MathName { get; init; } = "";
+    /// <summary>
+    /// For a method invoker that returns a struct: the address the struct goes to comes first, before the slot
+    /// ("Invoke(&amp;result, slot, interfaceClass, obj, args...)").
+    /// </summary>
+    public bool BufferFirst { get; init; }
 }
 
 /// <summary>Maps function addresses to the runtime helpers they implement.</summary>

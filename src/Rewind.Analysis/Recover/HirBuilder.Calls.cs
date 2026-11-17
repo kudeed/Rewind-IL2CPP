@@ -1164,6 +1164,7 @@ public sealed partial class HirBuilder
     }
 
     private static readonly bool NoInvokerShapes = Environment.GetEnvironmentVariable("REWIND_NO_INVOKER_SHAPES") != null;
+    private static readonly bool NoBufferInvokers = Environment.GetEnvironmentVariable("REWIND_NO_BUFFER_INVOKERS") != null;
     private static readonly bool NoGenericInvokerShapes = Environment.GetEnvironmentVariable("REWIND_NO_GENERIC_INVOKERS") != null;
     private static readonly bool NoRgctxCalls = Environment.GetEnvironmentVariable("REWIND_NO_RGCTX_CALLS") != null;
     // (Asked from every thread that recovers methods; what a function is does not depend on who asks.)
@@ -1192,9 +1193,12 @@ public sealed partial class HirBuilder
             {
                 [Iced.Intel.Register.RDX] = Iced.Intel.Register.RDX,
                 [Iced.Intel.Register.R8] = Iced.Intel.Register.R8,
+                [Iced.Intel.Register.R9] = Iced.Intel.Register.R9,
             };
             Iced.Intel.Register objectIn = Iced.Intel.Register.None, classIn = Iced.Intel.Register.None;
             bool slot = false, entry = false, offsets = false, through = false, others = false, slow = false, generic = false;
+            // (One that returns a struct is handed the address it goes to first: the slot comes second.)
+            bool slotSecond = false;
             bool first = true;
             foreach (var block in cfg.Blocks)
             {
@@ -1202,6 +1206,7 @@ public sealed partial class HirBuilder
                 {
                     bool load = i.Mnemonic == Iced.Intel.Mnemonic.Mov && i.Op0Kind == Iced.Intel.OpKind.Register && i.Op1Kind == Iced.Intel.OpKind.Memory;
                     if (i.Mnemonic == Iced.Intel.Mnemonic.Movzx && i.Op1Kind == Iced.Intel.OpKind.Register && i.Op1Register == Iced.Intel.Register.CX) slot = true;
+                    if (i.Mnemonic == Iced.Intel.Mnemonic.Movzx && i.Op1Kind == Iced.Intel.OpKind.Register && i.Op1Register == Iced.Intel.Register.DX) slotSecond = true;
                     // The class of the object: read through the register an argument came in, or a copy of it.
                     if (first && load && classIn == Iced.Intel.Register.None && i.MemoryIndex == Iced.Intel.Register.None && i.MemoryDisplacement64 == 0 &&
                         holds.TryGetValue(i.MemoryBase, out Iced.Intel.Register argument))
@@ -1257,6 +1262,13 @@ public sealed partial class HirBuilder
                 else if (objectIn == Iced.Intel.Register.R8 && offsets)
                     found = new HelperInfo(HelperKind.InterfaceInvoker, 0, false, true, "InterfaceInvoker (known by its code)");
             }
+            else if (slotSecond && !slot && through && !others && !generic && !NoBufferInvokers)
+            {
+                if (objectIn == Iced.Intel.Register.R8 && entry && !offsets && !slow)
+                    found = new HelperInfo(HelperKind.VirtualInvoker, 0, false, true, "VirtualInvoker returning a struct (known by its code)") { BufferFirst = true };
+                else if (objectIn == Iced.Intel.Register.R9 && offsets)
+                    found = new HelperInfo(HelperKind.InterfaceInvoker, 0, false, true, "InterfaceInvoker returning a struct (known by its code)") { BufferFirst = true };
+            }
         }
         return InvokerShapes.GetOrAdd(address, found);
     }
@@ -1305,7 +1317,7 @@ public sealed partial class HirBuilder
     /// not ones that something else told.
     /// </summary>
     private void BuildCall(Node call, MethodDef method, TypeSig[] classArgs, TypeSig[] methodArgs, bool isVirtual, bool tail,
-        List<MethodDef>? alternatives, bool skipFirst, Node? receiverOverride = null, int shift = 0, bool listed = false)
+        List<MethodDef>? alternatives, bool skipFirst, Node? receiverOverride = null, int shift = 0, bool listed = false, bool bufferFirst = false)
     {
         MethodAbi abi = _p.Abi.For(method, classArgs, methodArgs);
         bool classTold = false, methodTold = false;
@@ -1369,7 +1381,8 @@ public sealed partial class HirBuilder
 
         foreach (AbiParam p in abi.Params)
         {
-            int position = p.Position + shift;
+            // (Where the invoker is handed the result's address first, that stays where it is.)
+            int position = bufferFirst && p.Role == ParamRole.ReturnBuffer ? p.Position : p.Position + shift;
             switch (p.Role)
             {
                 case ParamRole.MethodInfo:
@@ -2163,27 +2176,31 @@ public sealed partial class HirBuilder
                 return;
             case HelperKind.VirtualInvoker:
             {
-                // Invoke(slot, obj, args...)
-                if (a0 == null || !a0.IsConst || a1 == null) break;
-                HExpr receiver = Value(a1);
+                // Invoke(slot, obj, args...) - or Invoke(&result, slot, obj, args...)
+                bool buffer = helper.BufferFirst;
+                Node? slotNode = buffer ? IntAt(call, 1) : a0, objectNode = buffer ? IntAt(call, 2) : a1;
+                if (slotNode == null || !slotNode.IsConst || objectNode == null) break;
+                HExpr receiver = Value(objectNode);
                 TypeSig? receiverType = receiver.Type;
-                if (_castTypes.TryGetValue(a1, out List<TypeSig>? casts) && casts.Count == 1) receiverType = casts[0];
-                MethodDef? method = FindVirtual(receiverType, (int)a0.UImm);
+                if (_castTypes.TryGetValue(objectNode, out List<TypeSig>? casts) && casts.Count == 1) receiverType = casts[0];
+                MethodDef? method = FindVirtual(receiverType, (int)slotNode.UImm);
                 if (method == null) break;
                 TypeSig[] classArgs = receiverType is GenericInstSig g && ReferenceEquals(g.Definition, method.DeclaringType) ? g.Arguments : [];
-                BuildCall(call, method, classArgs, [], isVirtual: true, tail, null, skipFirst: false, receiverOverride: a1, shift: 1);
+                BuildCall(call, method, classArgs, [], isVirtual: true, tail, null, skipFirst: false, receiverOverride: objectNode, shift: 1, bufferFirst: buffer);
                 return;
             }
             case HelperKind.InterfaceInvoker:
             {
-                // Invoke(slot, interfaceClass, obj, args...)
-                if (a0 == null || !a0.IsConst || a1 == null || a2 == null) break;
-                TypeSig? iface = EvalKlass(a1);
-                int slot = (int)a0.UImm;
+                // Invoke(slot, interfaceClass, obj, args...) - or Invoke(&result, slot, interfaceClass, obj, args...)
+                bool buffer = helper.BufferFirst;
+                Node? slotNode = buffer ? IntAt(call, 1) : a0, classNode = buffer ? IntAt(call, 2) : a1, objectNode = buffer ? IntAt(call, 3) : a2;
+                if (slotNode == null || !slotNode.IsConst || classNode == null || objectNode == null) break;
+                TypeSig? iface = EvalKlass(classNode);
+                int slot = (int)slotNode.UImm;
                 MethodDef? method = iface?.Definition?.Methods.FirstOrDefault(m => m.HasSlot && m.Slot == slot);
                 if (method == null) break;
                 TypeSig[] classArgs = iface is GenericInstSig g ? g.Arguments : [];
-                BuildCall(call, method, classArgs, [], isVirtual: true, tail, null, skipFirst: false, receiverOverride: a2, shift: 2);
+                BuildCall(call, method, classArgs, [], isVirtual: true, tail, null, skipFirst: false, receiverOverride: objectNode, shift: 2, bufferFirst: buffer);
                 return;
             }
             case HelperKind.RgctxData:
