@@ -232,7 +232,8 @@ public static class Decompiler
         return s.Length > 120 ? s[..120] : s.Length == 0 ? "_" : s;
     }
 
-    private static CSharpDecompiler NewDecompiler(string assemblyPath, string assemblyDirectory, LanguageVersion language, bool stateMachines, bool iteratorsOnly = false)
+    private static CSharpDecompiler NewDecompiler(string assemblyPath, string assemblyDirectory, LanguageVersion language, bool stateMachines, bool iteratorsOnly = false,
+        bool closures = false)
     {
         var module = new PEFile(assemblyPath);
         var resolver = new UniversalAssemblyResolver(assemblyPath, false, module.Metadata.DetectTargetFrameworkId());
@@ -247,6 +248,13 @@ public static class Decompiler
         {
             settings.YieldReturn = false;
             if (!iteratorsOnly) settings.AsyncAwait = false;
+        }
+        // Lambdas and local functions as the closure classes the compiler made (see ClosureCheck).
+        if (closures)
+        {
+            settings.AnonymousMethods = false;
+            settings.LocalFunctions = false;
+            settings.ExpressionTrees = false;
         }
         return new CSharpDecompiler(module, resolver, settings);
     }
@@ -279,7 +287,7 @@ public static class Decompiler
             return;
         }
 
-        int errors = 0, iteratorsKept = 0;
+        int errors = 0, iteratorsKept = 0, closuresKept = 0;
         var work = new ConcurrentQueue<(string File, FullTypeName Name)>(types);
         int workers = Math.Max(1, Math.Min(Environment.ProcessorCount, 1 + types.Count / 64));
         var threads = new List<Thread>();
@@ -288,7 +296,8 @@ public static class Decompiler
             var thread = new Thread(() =>
             {
                 CSharpDecompiler decompiler;
-                CSharpDecompiler? machines = null;
+                CSharpDecompiler? machines = null, closures = null;
+                bool machinesUsed = false;
                 // (What DecompileTypeAsString writes with: the formatting of these settings, which NewDecompiler keeps.)
                 CSharpFormattingOptions format = new DecompilerSettings(options.Language).CSharpFormattingOptions;
                 try
@@ -313,8 +322,19 @@ public static class Decompiler
                         {
                             machines ??= NewDecompiler(assemblyPath, assemblyDirectory, options.Language, stateMachines: true, iteratorsOnly: true);
                             tree = machines.DecompileType(item.Name);
+                            machinesUsed = true;
                             Interlocked.Increment(ref iteratorsKept);
                         }
+                        // A closure class named and not written: the type with its closures as classes.
+                        if (!NoClosureCheck && ClosureCheck.NamesMissingClosure(tree))
+                        {
+                            CSharpDecompiler with = machinesUsed
+                                ? NewDecompiler(assemblyPath, assemblyDirectory, options.Language, stateMachines: true, iteratorsOnly: true, closures: true)
+                                : closures ??= NewDecompiler(assemblyPath, assemblyDirectory, options.Language, options.StateMachines, closures: true);
+                            tree = with.DecompileType(item.Name);
+                            Interlocked.Increment(ref closuresKept);
+                        }
+                        machinesUsed = false;
                         var writer = new StringWriter();
                         tree.AcceptVisitor(new CSharpOutputVisitor(writer, format));
                         text = writer.ToString();
@@ -337,6 +357,8 @@ public static class Decompiler
         foreach (Thread t in threads) t.Join();
         if (iteratorsKept != 0)
             log($"note:     {iteratorsKept} types written with their iterators as state machine classes: the C# decompiler's \"yield return\" for them could not advance");
+        if (closuresKept != 0)
+            log($"note:     {closuresKept} types written with their lambdas and local functions as closure classes: a body named a closure class the C# decompiler left out");
         lock (result)
         {
             result.Types += types.Count;
@@ -344,6 +366,7 @@ public static class Decompiler
         }
     }
 
+    private static readonly bool NoClosureCheck = Environment.GetEnvironmentVariable("REWIND_NO_CLOSURE_CHECK") != null;
     private static readonly bool NoIteratorCheck = Environment.GetEnvironmentVariable("REWIND_NO_ITERATOR_CHECK") != null;
 
     private const string FailedMember = "// ILSpy could not decompile this member";
