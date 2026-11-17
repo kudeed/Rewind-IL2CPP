@@ -799,6 +799,41 @@ public sealed partial class HirBuilder
 
     private readonly record struct AddressParts(Node? Base, Sem? BaseSem, long Offset, Node? Index, long Scale);
 
+    private static readonly bool NoChosenFields = Environment.GetEnvironmentVariable("REWIND_NO_CHOSEN_FIELDS") != null;
+
+    /// <summary>
+    /// "c ? o.b : o.a" of two fields side by side: the C++ compiler reads the field at a.Offset + a.Scale * c,
+    /// c being 0 or 1. Where the index is a bool (or a bool turned around), that is the address of one field or
+    /// the other, chosen by it - provided both are fields of one type, each read whole.
+    /// </summary>
+    private Place? ChosenField(HExpr obj, TypeSig type, AddressParts a, int size)
+    {
+        // The index, through the widenings and narrowings that keep a 0 or 1 what it is.
+        Node index = a.Index!;
+        bool turned = false;
+        for (int depth = 0; depth < 8; depth++)
+        {
+            if (index.Op is Op.ZExt or Op.Trunc && index.In[0].Type.IsInt()) index = index.In[0];
+            else if (index.Op == Op.Xor && index.In[1].IsConstValue(1))
+            {
+                turned = !turned;
+                index = index.In[0];
+            }
+            else break;
+        }
+        HExpr? condition = null;
+        if (index.Type == VT.I1) condition = Condition(index);
+        else if (Peek(index) is SVal { Type: var known } && ReferenceEquals(known, _bool)) condition = Value(index);
+        if (condition == null) return null;
+        if (FieldPlace(obj, type, (int)a.Offset, size) is not PLocation first || FieldPlace(obj, type, (int)(a.Offset + a.Scale), size) is not PLocation second)
+            return null;
+        if (first.Type.Key != second.Type.Key || _p.Layouts.SizeOf(first.Type) is not { Known: true } bytes || (size > 0 && bytes.Size != size)) return null;
+        TypeSig reference = _m.Sigs.ByRef(first.Type);
+        HExpr whenOne = new HAddressOf(second.Location) { Type = reference }, whenZero = new HAddressOf(first.Location) { Type = reference };
+        var picked = new HSelect(condition, turned ? whenZero : whenOne, turned ? whenOne : whenZero) { Type = reference };
+        return new PLocation(new HDeref(picked) { Type = first.Type }, first.Type);
+    }
+
     private static Node StripExtension(Node n)
     {
         while (n.Op is Op.SExt or Op.ZExt) n = n.In[0];
@@ -1399,6 +1434,7 @@ public sealed partial class HirBuilder
 
         if (IsReference(type))
         {
+            if (a.Index != null && a.Scale > 0 && !NoChosenFields && ChosenField(e, type, a, size) is { } chosen) return chosen;
             if (a.Index != null) return new PUnknown($"indexed access into {type.DisplayName}");
             if (a.Offset == 0) return new PObjKlass(a.Base!);
             Place direct = FieldPlace(e, type, (int)a.Offset, size);
