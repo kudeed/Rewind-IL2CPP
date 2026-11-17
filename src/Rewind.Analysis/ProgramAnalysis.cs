@@ -221,15 +221,39 @@ public sealed class ProgramAnalysis
         return next > target ? next - target : ulong.MaxValue;
     }
 
+    /// <summary>
+    /// Functions written in the generated code's headers land outside its section, so the section does not
+    /// tell them from the runtime: the accessors Unity 2020 gives every field ("get_x()", "set_x()"), one-line
+    /// helpers like "il2cpp_codegen_add". What can be told without it: a function with no frame and no unwind
+    /// data that is over in a few instructions. Lifted in place it is what it does, whoever it belongs to.
+    /// </summary>
+    private bool IsPlainLeaf(ulong target)
+    {
+        if (Model.Image.SectionAt(target) is not { IsExecutable: true } || RangeOf(target) != null) return false;
+        // (Its neighbours are of the same kind and nothing lists them: where it ends is told by its code alone.)
+        X64Cfg body = X64Cfg.Build(Context, target);
+        if (body.Problems.Count != 0 || body.Blocks.Count is 0 or > 3 || body.Blocks[0].Start != target) return false;
+        int instructions = 0;
+        foreach (RawBlock block in body.Blocks)
+        {
+            if (block.End is not (BlockEnd.Return or BlockEnd.Branch or BlockEnd.Jump or BlockEnd.FallThrough)) return false;
+            foreach (Iced.Intel.Instruction instruction in block.Instructions)
+            {
+                if (instruction.FlowControl is Iced.Intel.FlowControl.Call or Iced.Intel.FlowControl.IndirectCall) return false;
+                instructions++;
+            }
+        }
+        return instructions <= 12 && body.Blocks.Any(b => b.End == BlockEnd.Return);
+    }
+
     public bool ShouldInline(ulong target)
     {
         lock (_inlinable)
         {
             if (_inlinable.TryGetValue(target, out bool known)) return known;
             if (Environment.GetEnvironmentVariable("REWIND_NO_INLINE") == "1") return _inlinable[target] = false;
-            bool result = Model.Image.SectionAt(target) is { Name: "il2cpp", IsExecutable: true } &&
+            bool result = ((Model.Image.SectionAt(target) is { Name: "il2cpp", IsExecutable: true } && SizeBound(target) <= 2048) || IsPlainLeaf(target)) &&
                           !Context.NoReturn.Contains(target) && Helpers.At(target) == null &&
-                          SizeBound(target) <= 2048 &&
                           ExceptionInfo(target) == null && Resolve(target) is { IsManaged: false, Helper: null };
             return _inlinable[target] = result;
         }
