@@ -204,6 +204,24 @@ public static class ExceptionStacks
         var accesses = new Dictionary<Node, Access>();
         Dictionary<Node, List<Node>>? callUses = null;
         var inner = new HashSet<Node>(); // the values in between: indexes, addresses, the count plus one
+
+        // A read that is only handed to calls as a stack argument: the compiler put the stack where arguments
+        // beyond the fourth would go (no call here has any), and a call's possible arguments are read from
+        // there as they stand. Such a read asks nothing of the stack.
+        bool OnlyPassed(Node load)
+        {
+            callUses ??= DeadCode.Uses(fn);
+            if (!callUses.TryGetValue(load, out List<Node>? users)) return false;
+            foreach (Node user in users)
+            {
+                if (user.Op is not (Op.Call or Op.TailCall) || user.Aux is not CallInfo info) return false;
+                for (int i = 0; i < user.In.Length; i++)
+                    if (ReferenceEquals(user.In[i], load) && (i >= info.Slots.Count || info.Slots[i].Kind != ArgSlotKind.Stack))
+                        return false;
+            }
+            return true;
+        }
+
         foreach (Block b in fn.Blocks)
         {
             foreach (Node phi in b.Phis)
@@ -221,6 +239,10 @@ public static class ExceptionStacks
                         if (at + size <= storage || at >= end)
                         {
                             // elsewhere in the frame
+                        }
+                        else if (n.Op == Op.Load && size == 8 && OnlyPassed(n))
+                        {
+                            // not a question to the stack
                         }
                         else if (at == counter && size == 4) accesses[n] = new Access { Node = n, IsStore = n.Op == Op.Store, IsCount = true };
                         // The count zeroed together with the padding after it.
