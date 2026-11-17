@@ -779,7 +779,9 @@ public sealed class AssemblyEmitter
                 : asm.ImageName + ".dll");
             try
             {
-                _assemblies[asm].Write(path);
+                // The same game gives the same files, byte for byte: no time of writing in them, and the module's
+                // id worked out from its contents instead of made up.
+                _assemblies[asm].Write(path, new WriterParameters { DeterministicMvid = true, Timestamp = 0 });
                 written.Add(path);
             }
             catch (Exception e)
