@@ -71,8 +71,8 @@ public sealed partial class HirBuilder
                 return SJunk.Instance;
             }
             case Op.Idiom when (IdiomKind)n.Imm == IdiomKind.LostRegister:
-                Problem("a value kept in a callee-saved register is used after a caught exception");
-                return SJunk.Instance;
+                if (NoLazyLostRegisters) Problem(LostRegisterUsed);
+                return NoLazyLostRegisters ? SJunk.Instance : SLostRegister.Instance;
             case Op.Idiom when (IdiomKind)n.Imm == IdiomKind.CaughtWrapper:
                 // The catch object itself (not the exception read through it) means nothing to the program. It
                 // turns up where a call captured whatever the stack slots held; used for real, it shows as an
@@ -1908,6 +1908,7 @@ public sealed partial class HirBuilder
                 if (!NoPairConflicts && (IsFloat(pair.Low.Type) || IsFloat(pair.High.Type)) && IsFrameAddress(n.In[0], out int pairAt) &&
                     IsWholeNumber(valueNode, IsFloat(pair.Low.Type), IsFloat(pair.High.Type)))
                     FrameConflicts.Add(pairAt);
+                MarkReferenceInPieces(n, valueNode);
                 Sem s = Eval(valueNode);
                 HExpr low, high;
                 if (s is SPair p) (low, high) = (p.Low, p.High);
@@ -1928,6 +1929,7 @@ public sealed partial class HirBuilder
                 return;
             }
             case PParts parts:
+                MarkReferenceInPieces(n, valueNode);
                 StoreParts(parts.Leaves, valueNode, n.Addr);
                 return;
             case PInternal:

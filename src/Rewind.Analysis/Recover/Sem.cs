@@ -190,6 +190,17 @@ internal class SJunk : Sem
 }
 
 /// <summary>
+/// A callee-saved register the protected code changes, as a catch handler sees it: what it held at the call that
+/// raised the exception, which one path into the handler cannot say. Junk like any other until something uses it:
+/// a catch handler saves such registers on entry, and a call captures whatever its stack slots held, without
+/// either meaning anything.
+/// </summary>
+internal sealed class SLostRegister : SJunk
+{
+    public new static readonly SLostRegister Instance = new();
+}
+
+/// <summary>
 /// What shared code hands a method it calls through a constraint ("constrained. T; callvirt Dispose", as a
 /// foreach over a struct enumerator ends): the runtime's record of that method as the type has it. No value
 /// of the program, but it says which type the call is made on.

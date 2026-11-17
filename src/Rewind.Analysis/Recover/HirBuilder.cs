@@ -281,6 +281,8 @@ public sealed partial class HirBuilder
         IsBoolType(e.Type) || e is HConst { Value: false or true or 0 or 1 or 0L or 1L or (byte)0 or (byte)1 };
 
     private static readonly bool NoScalarConflicts = Environment.GetEnvironmentVariable("REWIND_NO_SCALAR_CONFLICTS") != null;
+    private const string LostRegisterUsed = "a value kept in a callee-saved register is used after a caught exception";
+    private static readonly bool NoLazyLostRegisters = Environment.GetEnvironmentVariable("REWIND_NO_LAZY_LOST_REGISTERS") != null;
     private static readonly bool NoBoolConflicts = Environment.GetEnvironmentVariable("REWIND_NO_BOOL_CONFLICTS") != null;
 
     private void CheckFrameVariables()
@@ -1036,6 +1038,9 @@ public sealed partial class HirBuilder
                 return new HTypeExpr(HTypeOp.Box, boxed, new HLocal(FrameVar(f.Offset + _header, boxed)) { Type = boxed }) { Type = _object };
             case SVTable entry when VirtualPointer(entry) is { } virtualPointer:
                 return virtualPointer;
+            case SLostRegister:
+                Problem(LostRegisterUsed);
+                return new HOpaque("undefined") { Type = TypeForBits(n.Type) };
             case SJunk:
                 return new HOpaque("undefined") { Type = TypeForBits(n.Type) };
             default:
