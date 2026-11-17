@@ -277,6 +277,9 @@ public sealed class RuntimeHelpers
                 _ => new HelperInfo(HelperKind.MethodIsStatic, 1, false, true, name),
             };
         }
+        // UnBox(object): the null check and Unbox_internal in one, where the compiler kept it a function (Unity 2020).
+        // Its overload with a class to check against is something else.
+        if (name == "?UnBox@@YAPEAXPEAUIl2CppObject@@@Z") return new HelperInfo(HelperKind.Unbox, 1, false, true, name);
         if (core == "il2cpp_codegen_resolve") return new HelperInfo(HelperKind.ResolvePInvoke, 1, false, true, name);
         if (core is "IsInstClass" or "IsInstSealed") return new HelperInfo(HelperKind.IsInst, 2, false, true, name);
         if (core is "CastclassClass" or "CastclassSealed") return new HelperInfo(HelperKind.CastClass, 2, false, true, name);
