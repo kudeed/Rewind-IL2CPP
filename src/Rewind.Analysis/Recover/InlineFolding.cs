@@ -1113,7 +1113,16 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             for (int round = 0; found && round < 400 && Pass(method, Foreign, TemplatesOf, Usable, true); round++) { }
         }
         for (int round = 0; round < 64 && Constructors(method); round++) { }
+        // A struct made in one go now is read field by field and written back where it is handed on: those stores
+        // put back what was there. Without them, the statements around may be a method's ("list.Add(item)").
+        if (!NoWriteBacksBetween && WriteBacks.Run(method, program))
+        {
+            for (int round = 0; round < 200 && Pass(method, Foreign, TemplatesOf, t => t.Flow != null && Usable(t), true); round++) { }
+            for (int round = 0; round < 400 && Pass(method, Foreign, TemplatesOf, Usable, true); round++) { }
+        }
     }
+
+    private static readonly bool NoWriteBacksBetween = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_WRITE_BACKS") != null;
 
 
     /// <summary>
@@ -1129,6 +1138,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         {
             for (int i = 0; i + 1 < block.Statements.Count; i++)
             {
+                if (StructWrittenWhole(method, block, i, ref counts)) return true;
                 if (block.Statements[i] is not HAssign { Target: HLocal { Variable: var created } target, Value: HTypeExpr { Op: HTypeOp.Allocate or HTypeOp.Default, Target: var type } made }) continue;
                 // (A struct is made the same way, on a variable cleared first: "s = default; s..ctor(...)" is "s = new S(...)".)
                 bool cleared = made.Op == HTypeOp.Default;
@@ -1163,6 +1173,43 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         }
         return false;
     }
+
+    /// <summary>
+    /// A struct's constructor pasted onto a variable without clearing it first (it writes every field): the run
+    /// starts at a store into a field only constructors write (readonly, or the storage of a property) - and
+    /// "s..ctor(...)" is "s = new S(...)".
+    /// </summary>
+    private bool StructWrittenWhole(HMethod method, HBlock block, int i, ref Counts? counts)
+    {
+        if (NoStructFlows || NoWholeWrites) return false;
+        if (block.Statements[i] is not HAssign { Target: HField { Object: HLocal { Variable: var made } local, Field: var field } }) return false;
+        if (field.IsStatic || ((field.Attrs & FieldDef.InitOnly) == 0 && !AccessorIndex.IsBackingField(field))) return false;
+        TypeSig? type = local.Type;
+        if (type is null or GenericInstSig || type.Definition is not { IsValueType: true, IsEnum: false } definition || definition.GenericParameters.Length != 0 ||
+            !ReferenceEquals(field.DeclaringType, definition)) return false;
+        // (The first such store of a run: the one before it is something else.)
+        if (i > 0 && block.Statements[i - 1] is HAssign { Target: HField { Object: HLocal { Variable: var before } } } && ReferenceEquals(before, made)) return false;
+        foreach (MethodDef constructor in definition.Methods)
+        {
+            if (constructor.Name != ".ctor" || constructor.IsStatic || constructor.Address == 0 || ReferenceEquals(constructor, method.Method)) continue;
+            if (!Made(constructor, out Template? template))
+                template = Keep(constructor, program.Code.Get(constructor.Address) is { Instructions: <= 200 } ? MakeFlow(constructor, pipeline.CoreBody(constructor)) : null);
+            if (template == null) continue;
+            counts ??= Counts.Of(method);
+            if (!TryFoldFlow(method, block, i, template, counts)) continue;
+            if (i < block.Statements.Count && block.Statements[i] is HEval { Expression: HCall { This: var receiver } call } eval &&
+                (receiver is HAddressOf { Target: var inner } ? inner : receiver) is HLocal { Variable: var on } && ReferenceEquals(on, made) &&
+                ReferenceEquals(call.Method, constructor) && !call.Arguments.Any(a => ConstructorFolding.Mentions(a, made)))
+                block.Statements[i] = new HAssign(new HLocal(made) { Type = type }, new HNewObject { Constructor = constructor, Arguments = call.Arguments, Type = type })
+                {
+                    Address = eval.Address,
+                };
+            return true;
+        }
+        return false;
+    }
+
+    private static readonly bool NoWholeWrites = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_WHOLE_WRITES") != null;
 
     /// <summary>Folds one place; true when it did (the statements have changed then).</summary>
     private bool Pass(HMethod method, Func<object, bool> gives, Func<TypeDef, TypeSig?, List<Template>> templates, Func<Template, bool> usable, bool inherited)

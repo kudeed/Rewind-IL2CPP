@@ -33,9 +33,10 @@ internal static class WriteBacks
         }
     }
 
-    public static void Run(HMethod method, ProgramAnalysis program)
+    /// <summary>Removes such stores; true when there were any.</summary>
+    public static bool Run(HMethod method, ProgramAnalysis program)
     {
-        if (Disabled) return;
+        if (Disabled) return false;
         // Variables given a value once, and those given the value of a field of a struct variable (read as the
         // field, or through the property it is the storage of).
         var assignments = new Dictionary<HVar, int>();
@@ -56,7 +57,7 @@ internal static class WriteBacks
             read.Field != null ? ReferenceEquals(read.Field, f)
                 : read.Getter != null && ReferenceEquals(read.Getter.DeclaringType, f.DeclaringType) &&
                   (AccessorIndex.AutoPropertyName(f) is { } name ? read.Getter.Name == "get_" + name : ReferenceEquals(program.Accessors.GetterOf(f), read.Getter));
-        if (reads.Count == 0) return;
+        if (reads.Count == 0) return false;
 
         var removed = new List<(HBlock Block, HStmt Statement)>();
         foreach (HBlock block in method.Blocks)
@@ -69,6 +70,7 @@ internal static class WriteBacks
                 removed.Add((block, store));
             }
         foreach (var (block, statement) in removed) block.Statements.Remove(statement);
+        return removed.Count != 0;
     }
 
     /// <summary>A field the source cannot write outside a constructor: readonly, or the storage of a property.</summary>
