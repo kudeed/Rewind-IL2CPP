@@ -139,6 +139,7 @@ public sealed class X64Lifter
             ? X64Cfg.Build(_ctx, start, eh.IpToState.Select(e => e.Address).Append(PrologueEnd(start)), eh.TryBlocks.SelectMany(t => t.Handlers).SelectMany(h => h.Continuations))
             : X64Cfg.Build(_ctx, start);
         _fn = new Function { Address = start, End = cfg.Limit };
+        _deferredConditions.Clear();
         _fn.Problems.AddRange(cfg.Problems);
         _b = new IrBuilder(_fn);
         _ssa = new SsaBuilder(_fn, VarTypes);
@@ -352,6 +353,7 @@ public sealed class X64Lifter
                     _ssa.Seal(s);
         }
         foreach (Block block in _fn.Blocks) _ssa.Seal(block);
+        SettleDeferredConditions();
         _ssa.Finish();
 
         return _fn;
@@ -936,7 +938,78 @@ public sealed class X64Lifter
         Node f = Var(VarFlags);
         if (f.Op == Op.Flags) return ConditionOf(cc, f);
         if (f.Op == Op.Phi && ConditionFromPhi(cc, f) is { } merged) return merged;
-        return Opaque(cc, f);
+        Node opaque = Opaque(cc, f);
+        // At the head of a loop the flags of the way back are not known yet: asked again when they are.
+        if (f.Op == Op.Phi) _deferredConditions.Add((opaque, cc, f, _fn.Problems.Count - 1));
+        return opaque;
+    }
+
+    /// <summary>Conditions on flags that several ways in bring, left open because one of the ways was not lifted yet.</summary>
+    private readonly List<(Node Placeholder, ConditionCode Code, Node Flags, int Problem)> _deferredConditions = [];
+
+    /// <summary>
+    /// The open conditions, once every block is lifted. The compiler tests a loop's condition at its foot and
+    /// lets the head use the same flags for another test ("i &lt; count" signed, then the bounds check
+    /// "i &lt; count" unsigned): at the head the flags come from the compare before the loop and from the one at
+    /// its foot. With both known, the condition is worked out on each way in and merged, like any other.
+    /// </summary>
+    private void SettleDeferredConditions()
+    {
+        if (_deferredConditions.Count == 0) return;
+        var settled = new Dictionary<Node, Node>();
+        var solved = new List<int>();
+        Block savedBlock = _block;
+        foreach (var (placeholder, cc, flags, problem) in _deferredConditions)
+        {
+            Node now = _ssa.Resolve(flags);
+            Block home = placeholder.Block!;
+            int before = _fn.Problems.Count;
+            Node? condition = null;
+            if (now.Op == Op.Flags)
+            {
+                // One compare reaches it after all.
+                _block = home;
+                _b.PositionBefore(home, placeholder);
+                condition = ConditionOf(cc, now);
+                _b.InsertIndex = -1;
+            }
+            else if (now.Op == Op.Phi && !now.Dead)
+            {
+                _b.CurrentAddr = placeholder.Addr;
+                condition = ConditionFromPhi(cc, now);
+            }
+            if (condition == null || _fn.Problems.Count != before)
+            {
+                _fn.Problems.RemoveRange(before, _fn.Problems.Count - before);
+                continue;
+            }
+            settled[placeholder] = condition;
+            solved.Add(problem);
+        }
+        _block = savedBlock;
+        _deferredConditions.Clear();
+        if (settled.Count == 0) return;
+        foreach (Block b in _fn.Blocks)
+        {
+            foreach (Node n in b.Phis)
+                for (int i = 0; i < n.In.Length; i++)
+                    if (settled.TryGetValue(n.In[i], out Node? condition))
+                        n.In[i] = condition;
+            foreach (Node n in b.Nodes)
+                for (int i = 0; i < n.In.Length; i++)
+                    if (settled.TryGetValue(n.In[i], out Node? condition))
+                        n.In[i] = condition;
+            b.Nodes.RemoveAll(n =>
+            {
+                if (!settled.ContainsKey(n)) return false;
+                n.Dead = true;
+                return true;
+            });
+        }
+        solved.Sort();
+        for (int i = solved.Count - 1; i >= 0; i--)
+            if (solved[i] < _fn.Problems.Count)
+                _fn.Problems.RemoveAt(solved[i]);
     }
 
     /// <summary>
