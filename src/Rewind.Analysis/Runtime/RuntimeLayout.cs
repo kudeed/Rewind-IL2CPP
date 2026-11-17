@@ -18,9 +18,44 @@ public sealed class KlassLayout
     /// <summary>Size of one vtable entry: { method pointer, MethodInfo* }.</summary>
     public int VTableEntrySize;
 
-    public bool Verified;
+    /// <summary>
+    /// Unity before 2021.2 guards a static constructor with two tests, "has_cctor &amp;&amp; !cctor_finished": the byte
+    /// that holds the has_cctor bit and the bit's mask. 0 where generated code makes one test only
+    /// ("!cctor_finished_or_no_cctor").
+    /// </summary>
+    public int HasCctorByte, HasCctorMask;
 
-    public static KlassLayout For(int version, int pointerSize)
+    /// <summary>What decided the offsets that differ between Unity versions: the version alone, or the game's own code.</summary>
+    public string Source = "version";
+
+    /// <summary>
+    /// The parts of the record that changed between Unity versions without the metadata version saying so
+    /// (checked against the headers of 2020.3.49, 2021.3.45, 2022.3.62, 6000.0.85, 6000.2.9 and 6000.3.12):
+    /// initializationExceptionGCHandle is 32 bits wide through 2022.3 and a pointer from Unity 6, which moves
+    /// cctor_started and cctor_finished by four bytes; stack_slot_size (2022.3 and later, not 2021.3) moves
+    /// everything behind instance_size by four bytes; naturalAligment (2020.3 and 2021.3, gone in 2022.3) moves the
+    /// flag bits by one.
+    /// </summary>
+    private readonly record struct Shape(bool HandleIsPointer, bool StackSlotSize, bool NaturalAlignment);
+
+    private static Shape ShapeOf(int version, UnityVersion? unity)
+    {
+        if (unity is { } u)
+        {
+            // Where between the checked versions each change happened is not known; it is put at the start of the
+            // newer line here, and Measure corrects it where a game's code says otherwise.
+            bool newer = u.AtLeast(2022, 2);
+            return new Shape(u.Major >= 6000, newer, !newer && version >= MetaVersion.V27_0);
+        }
+        // Without the Unity version, the metadata version alone (31.0 is the format of late 2021.3 builds).
+        bool late = version >= MetaVersion.V31_1 || version == MetaVersion.V29_1;
+        return new Shape(version >= MetaVersion.V35, late, !late && version >= MetaVersion.V27_0);
+    }
+
+    public static KlassLayout For(int version, int pointerSize, UnityVersion? unity = null) =>
+        Build(version, pointerSize, ShapeOf(version, unity));
+
+    private static KlassLayout Build(int version, int pointerSize, Shape shape)
     {
         int p = pointerSize;
         int offset = 0;
@@ -64,13 +99,13 @@ public sealed class KlassLayout
         k.RgctxData = Ptr();
         k.TypeHierarchy = Ptr();
         Ptr();                          // unity_user_data
-        if (version >= MetaVersion.V29_0) Ptr(); else U32(); // initializationExceptionGCHandle
+        if (shape.HandleIsPointer) Ptr(); else U32(); // initializationExceptionGCHandle
         k.CctorStarted = U32();
         k.CctorFinished = U32();
         Field(8, 8);                    // cctor_thread (ALIGN_TYPE(8) size_t)
         Ptr();                          // genericContainerHandle
         k.InstanceSize = U32();
-        if (version >= MetaVersion.V29_0) U32(); // stack_slot_size
+        if (shape.StackSlotSize) U32(); // stack_slot_size
         U32();                          // actualSize
         k.ElementSize = U32();
         U32();                          // native_size
@@ -91,11 +126,125 @@ public sealed class KlassLayout
         U8();                           // genericRecursionDepth
         k.Rank = U8();
         U8();                           // minimumAlignment
-        if (version >= MetaVersion.V24_2) U8(); // packingSize (naturalAligment in some older versions)
+        if (shape.NaturalAlignment) U8(); // naturalAligment
+        if (version >= MetaVersion.V24_2) U8(); // packingSize
         k.Bitflags = U8();
         U8();                           // second bitfield byte
         k.VTable = (offset + p - 1) / p * p;
+        if (version < MetaVersion.V29_0)
+        {
+            // Second flag byte: size_inited, has_finalize, has_cctor, ...
+            k.HasCctorByte = k.Bitflags + 1;
+            k.HasCctorMask = 4;
+        }
         return k;
+    }
+
+    /// <summary>How often one candidate must be read, and how many times as often as the other, to be taken.</summary>
+    private const int MinimumEvidence = 16, EvidenceMargin = 8;
+
+    /// <summary>
+    /// The layout for the game's version, corrected by what the game's own code reads. Generated code tests
+    /// cctor_finished before every use of a class's statics, reads interface_offsets_count and typeHierarchyDepth
+    /// for interface calls and casts, and tests the first flag bit (initialized_and_no_error) before using a
+    /// class it looked up: where the two possible places of such a field are read very unequally often, the one
+    /// the code reads is where the field is. That settles versions whose headers could not be checked, and a
+    /// game whose Unity version is not known.
+    /// </summary>
+    public static KlassLayout Measure(Il2CppModel model, Action<string>? log = null)
+    {
+        NativeImage image = model.Image;
+        int p = image.PointerSize;
+        Shape shape = ShapeOf(model.Version, model.UnityVersion);
+        KlassLayout byVersion = Build(model.Version, p, shape);
+        if (image.Arch != CpuArch.X64) return byVersion;
+
+        // How often each offset near the fields in question is read, by the kind of read.
+        const int Span = 0x200;
+        int[] compared = new int[Span], words = new int[Span], bytes = new int[Span], firstBit = new int[Span];
+        // (offset compared, byte offset, mask) of a bit tested just before a 32-bit compare on the same class.
+        var guards = new Dictionary<(int Compared, int Byte, int Mask), int>();
+
+        foreach (FunctionRange f in image.FunctionTable)
+        {
+            int length = (int)(f.End - f.Start);
+            if (length <= 0 || !image.TrySpan(f.Start, length, out ReadOnlySpan<byte> code)) continue;
+            var decoder = Decoder.Create(64, new ByteArrayCodeReader(code.ToArray()), f.Start);
+            Register testedBase = Register.None;
+            int testedByte = 0, testedMask = 0, sinceTest = int.MaxValue;
+            while (decoder.IP < f.End)
+            {
+                decoder.Decode(out Instruction ins);
+                if (ins.IsInvalid) break;
+                if (sinceTest != int.MaxValue) sinceTest++;
+                if (ins.MemoryBase is Register.None or Register.RSP or Register.RBP or Register.RIP || ins.MemoryIndex != Register.None) continue;
+                if (ins.MemoryDisplacement64 >= Span) continue;
+                int d = (int)ins.MemoryDisplacement64;
+                switch (ins.Mnemonic)
+                {
+                    case Mnemonic.Cmp when ins.Op0Kind == OpKind.Memory && ins.MemorySize is MemorySize.UInt32 or MemorySize.Int32:
+                        compared[d]++;
+                        if (sinceTest <= 3 && ins.MemoryBase == testedBase)
+                        {
+                            var key = (d, testedByte, testedMask);
+                            guards[key] = guards.GetValueOrDefault(key) + 1;
+                        }
+                        break;
+                    case Mnemonic.Test when ins.Op0Kind == OpKind.Memory && ins.MemorySize is MemorySize.UInt8 or MemorySize.Int8 && ins.Op1Kind == OpKind.Immediate8:
+                        if (ins.Immediate8 == 1) firstBit[d]++;
+                        (testedBase, testedByte, testedMask, sinceTest) = (ins.MemoryBase, d, ins.Immediate8, 0);
+                        break;
+                    case Mnemonic.Movzx when ins.Op1Kind == OpKind.Memory && ins.MemorySize is MemorySize.UInt16 or MemorySize.Int16:
+                        words[d]++;
+                        break;
+                    case Mnemonic.Movzx when ins.Op1Kind == OpKind.Memory && ins.MemorySize is MemorySize.UInt8 or MemorySize.Int8:
+                        bytes[d]++;
+                        break;
+                }
+            }
+        }
+
+        static bool Clear(int winner, int loser) => winner >= MinimumEvidence && winner >= EvidenceMargin * Math.Max(1, loser);
+        var notes = new List<string>();
+        bool confirmed = false, changed = false;
+        // One question at a time, each with the answers before it in place: is the field where the layout has it,
+        // or where it would be with the one thing changed?
+        Shape Settle(Shape current, Shape other, Func<KlassLayout, int> reads, string what, Func<KlassLayout, int> at)
+        {
+            KlassLayout here = Build(model.Version, p, current), there = Build(model.Version, p, other);
+            int readsHere = reads(here), readsThere = reads(there);
+            if (Clear(readsThere, readsHere))
+            {
+                changed = true;
+                notes.Add($"{what} at 0x{at(there):X} (read {readsThere} times, 0x{at(here):X} {readsHere} times)");
+                return other;
+            }
+            if (Clear(readsHere, readsThere)) confirmed = true;
+            notes.Add($"{what} at 0x{at(here):X} (read {readsHere} times, 0x{at(there):X} {readsThere} times)");
+            return current;
+        }
+        shape = Settle(shape, shape with { HandleIsPointer = !shape.HandleIsPointer }, k => compared[k.CctorFinished], "cctor_finished", k => k.CctorFinished);
+        shape = Settle(shape, shape with { StackSlotSize = !shape.StackSlotSize }, k => words[k.InterfaceOffsetsCount] + bytes[k.TypeHierarchyDepth],
+            "interface_offsets_count", k => k.InterfaceOffsetsCount);
+        shape = Settle(shape, shape with { NaturalAlignment = !shape.NaturalAlignment }, k => firstBit[k.Bitflags], "flag bits", k => k.Bitflags);
+        KlassLayout layout = Build(model.Version, p, shape);
+        if (changed) layout.Source = "the game's code (not as the version's layout has it)";
+        else if (confirmed) layout.Source = "the version's layout, confirmed by the game's code";
+
+        // The has_cctor test: the bit tested right before cctor_finished nearly every time, or no such test at all.
+        int finished = compared[layout.CctorFinished];
+        if (finished >= MinimumEvidence)
+        {
+            var guard = guards.Where(g => g.Key.Compared == layout.CctorFinished).OrderByDescending(g => g.Value).FirstOrDefault();
+            if (guard.Value >= MinimumEvidence && guard.Value * 2 >= finished)
+            {
+                (layout.HasCctorByte, layout.HasCctorMask) = (guard.Key.Byte, guard.Key.Mask);
+                notes.Add($"has_cctor bit 0x{guard.Key.Mask:X} at 0x{guard.Key.Byte:X} (tested before cctor_finished {guard.Value} times)");
+            }
+            else (layout.HasCctorByte, layout.HasCctorMask) = (0, 0);
+        }
+        log?.Invoke($"class record layout from {layout.Source}: {string.Join("; ", notes)}");
+        return layout;
     }
 }
 

@@ -387,7 +387,7 @@ public sealed class ProgramAnalysis
         Replicated = new ReplicatedLayout(model);
         Abi = new Win64Abi(model, Layouts);
         Defaults = DefaultsTable.Locate(model);
-        Klass = KlassLayout.For(model.Version, model.Image.PointerSize);
+        Klass = KlassLayout.Measure(model);
         foreach (var (address, info) in helpers.ByAddress)
             if (info.NoReturn)
                 Context.NoReturn.Add(address);

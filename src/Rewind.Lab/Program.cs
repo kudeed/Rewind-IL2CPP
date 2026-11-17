@@ -62,6 +62,7 @@ internal static class Program
                 "code" => CodeLab.Run(LoadModel(args[1]), args[2], args[3..]),
                 "sig-apply" => SigLab.Apply(args[1], LoadModel(args[2]), args.Length > 3 ? args[3] : null),
                 "sig-near" => SigLab.Near(args[1], LoadModel(args[2]), args[3..]),
+                "klass-probe" => KlassLab.Probe(LoadModel(args[1])),
                 _ => Fail($"unknown command '{args[0]}'"),
             };
         }
