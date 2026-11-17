@@ -139,6 +139,16 @@ public sealed partial class HirBuilder
     public bool FrameTypesRefined { get; private set; }
 
     /// <summary>
+    /// Merged code pointers of virtual methods, each way in picking another method, that are then called: per
+    /// merged value, the method of each way in. The next build makes the merged value the number of the method
+    /// and calls the one it names (see EmitDispatch).
+    /// </summary>
+    public Dictionary<Node, MethodDef[]> DispatchPhis { get; } = [];
+    public bool DispatchRefined { get; private set; }
+    private readonly Dictionary<Node, (HVar Which, MethodDef[] Ways, MethodDef[] Distinct)> _dispatch = [];
+    private static readonly bool NoMergedDispatch = Environment.GetEnvironmentVariable("REWIND_NO_MERGED_DISPATCH") != null;
+
+    /// <summary>
     /// Every byte of stack memory must belong to one variable. Two variables that cover the same bytes mean
     /// the method was translated with two views of one piece of memory - a write through one would be
     /// invisible through the other - so the result cannot be trusted and is marked.
@@ -182,6 +192,28 @@ public sealed partial class HirBuilder
                 Problem($"a {value.Type.ShortName} stored where a {target.Type.ShortName} is");
                 if (target is HLocal { Variable: var v } && offsetOf.TryGetValue(v, out int at)) FrameConflicts.Add(at);
             }
+        // The same for a call handed one struct where it takes another (a Vector3 where a Quaternion is taken).
+        if (!NoArgumentConflicts)
+            foreach (HBlock block in _h.Blocks)
+                foreach (HStmt s in block.Statements)
+                    FinallyFolding.Visit(s, e =>
+                    {
+                        if (e is not HCall call || call.Method.Parameters.Length != call.Arguments.Length) return;
+                        TypeSig[] classArgs = call.DeclaringType is GenericInstSig g ? g.Arguments : [];
+                        for (int i = 0; i < call.Arguments.Length; i++)
+                        {
+                            TypeSig declared = call.Method.Parameters[i].Type;
+                            TypeSig wanted = _m.Sigs.Substitute(declared is ByRefSig r ? r.ElementType : declared, classArgs, call.MethodArguments);
+                            HExpr given = call.Arguments[i];
+                            TypeSig? passed = given.Type is ByRefSig byRef ? byRef.ElementType : given.Type;
+                            if (Open(wanted) || !IsStruct(wanted) || !IsStruct(passed) || wanted.Key == passed!.Key) continue;
+                            // (One C# converts on its own, with the same bytes: a Span where a ReadOnlySpan is taken.)
+                            if (SameBytesConversion(passed, wanted)) continue;
+                            Problem($"a {passed.ShortName} handed where a {wanted.ShortName} is taken");
+                            HExpr place = given is HAddressOf { Target: var t } ? t : given;
+                            if (place is HLocal { Variable: var v } && offsetOf.TryGetValue(v, out int at)) FrameConflicts.Add(at);
+                        }
+                    });
         if (NoScalarConflicts) return;
         // The same with a reference kept where a small number is, or a number where a reference is: the
         // compiler used one slot for two variables, one after the other. (Nothing is reported: where the two
@@ -242,6 +274,17 @@ public sealed partial class HirBuilder
             RefinedFrameTypes[offset] = voted;
             FrameTypesRefined = true;
         }
+        // Stack memory copied out as one struct type, and only one: that struct, in the next build.
+        foreach (var (start, votes) in _copyVotes)
+        {
+            if (votes.Count != 1 || _frameTypes.ContainsKey(start) || RefinedFrameTypes.ContainsKey(start)) continue;
+            TypeSig copied = votes.First();
+            int end = start + _p.Layouts.SizeOf(copied).Size;
+            // (Not where a struct already known covers some of those bytes from elsewhere.)
+            if (_frameTypes.Any(kv => kv.Key < end && start < kv.Key + Math.Max(1, _p.Layouts.SizeOf(kv.Value).Size) && IsStructType(kv.Value))) continue;
+            RefinedFrameTypes[start] = copied;
+            FrameTypesRefined = true;
+        }
         if (DropInnerTypes(RefinedFrameTypes) && RefinedFrameTypes.Count == 0) FrameTypesRefined = false;
     }
 
@@ -259,8 +302,11 @@ public sealed partial class HirBuilder
     }
 
     public HirBuilder(ProgramAnalysis program, LiftedMethod lifted, IReadOnlyDictionary<Node, TypeSig>? knownPhiTypes = null,
-        IReadOnlyDictionary<int, TypeSig>? knownFrameTypes = null)
+        IReadOnlyDictionary<int, TypeSig>? knownFrameTypes = null, IReadOnlyDictionary<Node, MethodDef[]>? knownDispatch = null)
     {
+        if (knownDispatch != null)
+            foreach (var (phi, ways) in knownDispatch)
+                DispatchPhis[phi] = ways;
         if (knownFrameTypes != null)
             foreach (var (offset, type) in knownFrameTypes)
             {
@@ -372,6 +418,34 @@ public sealed partial class HirBuilder
     private readonly Dictionary<Node, (HBlock Block, HAssign Assign)> _lookedAt = [];
     private static readonly bool NoHeldTemps = Environment.GetEnvironmentVariable("REWIND_NO_HELD_TEMPS") != null;
     private static readonly bool NoParamHalves = Environment.GetEnvironmentVariable("REWIND_NO_PARAM_HALVES") != null;
+    private static readonly bool NoRefParamHalves = Environment.GetEnvironmentVariable("REWIND_NO_REF_PARAM_HALVES") != null;
+    private static readonly bool NoStaticRefs = Environment.GetEnvironmentVariable("REWIND_NO_STATIC_REFS") != null;
+    private static readonly bool NoArgumentConflicts = Environment.GetEnvironmentVariable("REWIND_NO_ARGUMENT_CONFLICTS") != null;
+    private static readonly bool NoWideSwitches = Environment.GetEnvironmentVariable("REWIND_NO_WIDE_SWITCHES") != null;
+
+    /// <summary>
+    /// Whether C# turns one struct into the other by itself (an implicit operator of either type) and the two are
+    /// the same size: handing over the one where the other is taken is then what the source did.
+    /// </summary>
+    private bool SameBytesConversion(TypeSig from, TypeSig to)
+    {
+        if (_p.Layouts.SizeOf(from) is not { Known: true } a || _p.Layouts.SizeOf(to) is not { Known: true } b || a.Size != b.Size) return false;
+        TypeSig[] Args(TypeSig t) => t is GenericInstSig g ? g.Arguments : [];
+        foreach (TypeSig owner in new[] { from, to })
+            if (owner.Definition is { } definition)
+                foreach (MethodDef m in definition.Methods)
+                {
+                    if (m.Name != "op_Implicit" || !m.IsStatic || m.Parameters.Length != 1) continue;
+                    TypeSig parameter = _m.Sigs.Substitute(m.Parameters[0].Type, Args(owner), []);
+                    TypeSig result = _m.Sigs.Substitute(m.ReturnType, Args(owner), []);
+                    if (parameter.Key == from.Key && result.Key == to.Key) return true;
+                }
+        return false;
+    }
+
+    /// <summary>A reference argument read in halves: the expression its halves are halves of, and back.</summary>
+    private readonly Dictionary<SRef, HExpr> _refHalfMarks = [];
+    private readonly Dictionary<HExpr, SRef> _halvedRefs = [];
 
     /// <summary>Is something still held for the value: it was looked at and has not been used since?</summary>
     private bool Held(Node n) => _heldProblems.ContainsKey(n) || _heldUnder.ContainsKey(n) || _heldPhiReads.ContainsKey(n);
@@ -665,6 +739,19 @@ public sealed partial class HirBuilder
                         _sem[slot] = new SHalf(whole8, part == 4, null);
                         continue;
                     }
+                    // A struct handed over as the address of a copy, or a by-reference argument: an address, eight
+                    // bytes, that the code reads four at a time. The two halves joined again are the reference.
+                    if (!byValueStruct && !NoParamHalves && !NoRefParamHalves && size == 4 && part is 0 or 4 && sem is SRef reference)
+                    {
+                        if (!_refHalfMarks.TryGetValue(reference, out HExpr? mark))
+                        {
+                            mark = new HAddressOf(reference.Location) { Type = _m.Sigs.ByRef(reference.Type) };
+                            _refHalfMarks[reference] = mark;
+                            _halvedRefs[mark] = reference;
+                        }
+                        _sem[slot] = new SHalf(mark, part == 4, null);
+                        continue;
+                    }
                     if (part == 0) _sem[slot] = sem;
                 }
             }
@@ -893,7 +980,7 @@ public sealed partial class HirBuilder
             {
                 // Half of a 64-bit quantity used on its own: a genuine bit-level operation. (Half of a
                 // reference is no number C# could make of it.)
-                if (IsReference(h.Whole.Type)) Problem("half of a reference used on its own");
+                if (IsReference(h.Whole.Type) || h.Whole.Type is ByRefSig) Problem("half of a reference used on its own");
                 HExpr bits = IsFloat(h.Whole.Type) ? FloatBits(h.Whole) : h.Whole;
                 if (h.High) bits = new HBinary(HBinaryOp.Shr, bits, new HConst(32, _int)) { Type = _long };
                 return new HConv(HConvKind.I4, bits) { Type = _int };
@@ -923,6 +1010,16 @@ public sealed partial class HirBuilder
         foreach (Node phi in b.Phis)
         {
             if (phi.Dead || phi.Type == VT.Flags) continue;
+            // A merged code pointer of virtual methods: the number of the one each way in picks.
+            if (!NoMergedDispatch && DispatchPhis.TryGetValue(phi, out MethodDef[]? ways))
+            {
+                HVar which = _h.NewLocal(_int, "which");
+                _phiVar[phi] = which;
+                _phiOfVar[which] = phi;
+                _sem[phi] = new SVal(new HLocal(which) { Type = _int });
+                _dispatch[phi] = (which, ways, ways.Distinct().ToArray());
+                continue;
+            }
             if (_framePhis.TryGetValue(phi, out int frameAt))
             {
                 _sem[phi] = new SFrame(frameAt);
@@ -985,8 +1082,27 @@ public sealed partial class HirBuilder
                 copies.Add(new HAssign(new HLocal(variable) { Type = variable.Type }, Coerce(new HConst(0L, _long), variable.Type)));
                 continue;
             }
-            // A reference variable (see DeclarePhis): on this way in it refers to this stack object.
-            if (_mergedAddresses.Contains(phi) && variable.Type is ByRefSig { ElementType: var element } && IsFrameAddress(input, out int objectAt) &&
+            // A reference variable that on this way in refers to a static field at the very start of its class's
+            // statics ("Vector3.zero" inlined to the address of Vector3.zeroVector): the field.
+            if (!NoStaticRefs && variable.Type is ByRefSig { ElementType: var staticElement } && Peek(input) is SStatics &&
+                _p.Layouts.SizeOf(staticElement) is { Known: true, Size: > 0 } staticSize &&
+                ResolvePlace(input, staticSize.Size) is PLocation { Location: HField { Object: null } staticField } staticPlace &&
+                staticPlace.Type.Key == staticElement.Key)
+            {
+                copies.Add(new HAssign(new HLocal(variable) { Type = variable.Type }, new HAddressOf(staticField) { Type = variable.Type }));
+                continue;
+            }
+            // The number of the method this way in picks (see DeclarePhis).
+            if (_dispatch.TryGetValue(phi, out var dispatch))
+            {
+                int number = Array.IndexOf(dispatch.Distinct, dispatch.Ways[index]);
+                copies.Add(new HAssign(new HLocal(variable) { Type = _int }, new HConst(number, _int)));
+                continue;
+            }
+            // A reference variable (see DeclarePhis): on this way in it refers to this stack object. (Also where
+            // other ways in give it something else, a field's address: the variable is then known as a reference
+            // from the first build on.)
+            if ((_mergedAddresses.Contains(phi) || !NoMixedMerges) && variable.Type is ByRefSig { ElementType: var element } && IsFrameAddress(input, out int objectAt) &&
                 MergedPlace(objectAt, element) is { } referred)
             {
                 copies.Add(new HAssign(new HLocal(variable) { Type = variable.Type }, new HAddressOf(referred) { Type = variable.Type }));
@@ -1460,7 +1576,13 @@ public sealed partial class HirBuilder
             }
             case Op.Switch:
             {
-                HExpr value = Value(term.In[0]);
+                // A jump table is indexed by a 64-bit copy of the 32-bit value ("movsxd rax, ecx"): the switch is on
+                // the value itself, which is what it was in C#. (The C# decompiler follows an iterator's state into
+                // a switch on the state, but not through a copy made wider: it then takes the state for an ordinary
+                // variable, drops the writes that advance it, and the iterator yields its first item for ever.)
+                Node index = term.In[0];
+                if (!NoWideSwitches && index.Op is Op.SExt or Op.ZExt && index.In[0].Type == VT.I32) index = index.In[0];
+                HExpr value = Value(index);
                 var targets = new HBlock[b.Succs.Count];
                 for (int i = 0; i < targets.Length; i++) targets[i] = Edge(i);
                 // The native table only covers in-range values; the range check before it supplies the default.

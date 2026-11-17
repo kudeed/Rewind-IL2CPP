@@ -175,9 +175,17 @@ public sealed partial class HirBuilder
                     // (One call reached from several paths, each with a stack object of its own to hand over:
                     // the address is merged, and each of the objects is what the call takes there.)
                     List<int>? merged = null;
+                    bool mixed = false;
                     if (!IsFrameAddress(call.In[i], out int offset))
                     {
-                        if (NoMergedAddresses || !MergedAddresses || (merged = MergedFrameAddresses(call.In[i])) == null) continue;
+                        if (NoMergedAddresses || !MergedAddresses) continue;
+                        if ((merged = MergedFrameAddresses(call.In[i])) == null)
+                        {
+                            // (Stack memory on some ways in, something else on others, a field say, or the same
+                            // stack memory on every way: the stack memory is what the call takes there all the same.)
+                            if (NoMixedMerges || (merged = FrameAddressesAmong(call.In[i])) == null) continue;
+                            mixed = true;
+                        }
                         offset = merged[0];
                     }
                     ArgSlot slot = info.Slots[i];
@@ -232,7 +240,12 @@ public sealed partial class HirBuilder
                         }
                     }
                     if (type == null || Open(type) || !Nameable(type)) continue;
-                    if (merged == null) _frameTypes.TryAdd(offset, type);
+                    if (merged == null)
+                    {
+                        // (One call takes a struct there, another a different struct: the memory holds one object,
+                        // then another - a Vector3 for one call, a Quaternion for the next. Each its own lifetime.)
+                        _frameTypes.TryAdd(offset, type);
+                    }
                     else
                     {
                         foreach (int at in merged)
@@ -240,6 +253,7 @@ public sealed partial class HirBuilder
                             // (Known as something else already: the memory is used for two things, one after the other.)
                             if (!_frameTypes.TryAdd(at, type) && _frameTypes[at].Key != type.Key) FrameConflicts.Add(at);
                         }
+                        if (mixed) continue;
                         Node phi = call.In[i];
                         _addressPhis[phi] = _addressPhis.TryGetValue(phi, out TypeSig? other) && (other == null || other.Key != type.Key) ? null : type;
                     }
@@ -271,6 +285,22 @@ public sealed partial class HirBuilder
             offsets.Add(at);
         }
         return offsets.Distinct().Count() > 1 ? offsets : null;
+    }
+
+    private static readonly bool NoMixedMerges = Environment.GetEnvironmentVariable("REWIND_NO_MIXED_MERGES") != null;
+
+    /// <summary>
+    /// The stack offsets among a merged value's ways in, when some of them are stack addresses and the others
+    /// something else (a field's address), or when they are all the same stack address.
+    /// </summary>
+    private List<int>? FrameAddressesAmong(Node n)
+    {
+        if (n.Op != Op.Phi || n.In.Length < 2 || n.In.Length > 8) return null;
+        var offsets = new List<int>(n.In.Length);
+        foreach (Node input in n.In)
+            if (IsFrameAddress(input, out int at) && !offsets.Contains(at))
+                offsets.Add(at);
+        return offsets.Count != 0 ? offsets : null;
     }
 
     /// <summary>The type a merged stack address points to, when every object it may be the address of is known as that.</summary>
@@ -1547,6 +1577,66 @@ public sealed partial class HirBuilder
     }
 
     /// <summary>
+    /// The method each way into a merged code pointer picks, when every way in takes a virtual method's code from
+    /// the object's class (or an interface's), and the methods take the same arguments and return the same type.
+    /// </summary>
+    private MethodDef[]? MergedVirtualTargets(Node phi)
+    {
+        if (phi.In.Length < 2 || phi.In.Length > 16) return null;
+        var ways = new MethodDef[phi.In.Length];
+        for (int i = 0; i < phi.In.Length; i++)
+        {
+            MethodDef? method = null;
+            Sem s = Peek(phi.In[i]);
+            if (s is SVTable { MethodInfo: false, Interface: { } iface } it)
+                method = iface.Definition?.Methods.FirstOrDefault(m => m.HasSlot && m.Slot == it.Slot);
+            else if (s is SVTable { MethodInfo: false } vt)
+            {
+                TypeSig? receiverType = Peek(vt.Object) is SVal { Type: { } t } ? t : null;
+                if (_castTypes.TryGetValue(vt.Object, out List<TypeSig>? casts) && casts.Count == 1) receiverType = casts[0];
+                if (receiverType != null) method = FindVirtual(Declared(receiverType), vt.Slot);
+            }
+            if (method == null || method.IsStatic || method.GenericParameters.Length != 0 || method.DeclaringType.GenericParameters.Length != 0) return null;
+            ways[i] = method;
+        }
+        MethodDef first = ways[0];
+        foreach (MethodDef m in ways)
+            if (m.Parameters.Length != first.Parameters.Length || m.ReturnType.Key != first.ReturnType.Key ||
+                m.Parameters.Zip(first.Parameters).Any(p => p.First.Type.Key != p.Second.Type.Key))
+                return null;
+        return ways;
+    }
+
+    /// <summary>
+    /// The call of a merged code pointer whose ways in each picked a virtual method: a branch (or a switch) on the
+    /// number of the method, each arm calling its method with the call's arguments, all meeting again after it.
+    /// </summary>
+    private void EmitDispatch(Node call, HVar which, MethodDef[] methods, bool tail)
+    {
+        // The number is read here: the copies into it stay (see SettlePhis).
+        _phiRead.Add(call.In[0]);
+        int scope = _cur.Scope;
+        HBlock NewBlock()
+        {
+            var block = new HBlock { Id = _h.Blocks.Count, Scope = scope };
+            _h.Blocks.Add(block);
+            return block;
+        }
+        HBlock[] arms = methods.Select(_ => NewBlock()).ToArray();
+        HBlock? join = tail ? null : NewBlock();
+        var chosen = new HLocal(which) { Type = _int };
+        if (arms.Length == 2) Emit(new HBranch(new HCompare(HCompareOp.Eq, chosen, new HConst(0, _int)) { Type = _bool }, arms[0], arms[1]), call.Addr);
+        else Emit(new HSwitch(chosen, arms[..^1], arms[^1]), call.Addr);
+        for (int j = 0; j < arms.Length; j++)
+        {
+            _cur = arms[j];
+            BuildCall(call, methods[j], [], [], isVirtual: true, tail, null, skipFirst: false);
+            if (join != null) Emit(new HJump(join), call.Addr);
+        }
+        if (join != null) _cur = join;
+    }
+
+    /// <summary>
     /// "ldvirtftn": a virtual slot of an object's class read as a value - what a delegate made from a virtual
     /// method ("new Action(this.OnChanged)") is constructed with.
     /// </summary>
@@ -1575,6 +1665,30 @@ public sealed partial class HirBuilder
     private void EmitIndirectCall(Node call, bool tail)
     {
         Node targetNode = call.In[0];
+        // The code of one virtual method or another, by the way in, then called: the compiler merged the calls
+        // of "if (dying) HandleDie(); else HandleRevive();" into one.
+        if (!NoMergedDispatch && targetNode.Op == Op.Phi)
+        {
+            if (_dispatch.TryGetValue(targetNode, out var known))
+            {
+                EmitDispatch(call, known.Which, known.Distinct, tail);
+                return;
+            }
+            if (MergedVirtualTargets(targetNode) is { } ways)
+            {
+                if (ways.Distinct().Count() == 1)
+                {
+                    BuildCall(call, ways[0], [], [], isVirtual: true, tail, null, skipFirst: false);
+                    return;
+                }
+                // (The calls return nothing that is used: one result made of several calls' is not built yet.)
+                if (!Projections(call).Values.Any(IsUsed))
+                {
+                    DispatchPhis[targetNode] = ways;
+                    DispatchRefined = true;
+                }
+            }
+        }
         Sem target = Eval(targetNode);
 
         if (target is SNativeCode native)

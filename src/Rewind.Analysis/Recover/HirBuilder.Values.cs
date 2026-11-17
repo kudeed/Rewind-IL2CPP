@@ -202,7 +202,8 @@ public sealed partial class HirBuilder
             FieldSlot slot = layout.Fields[0];
             inner = new HField { Object = inner, Field = slot.Field, DeclaringType = inner.Type, Type = slot.Type };
             if (IsStructType(slot.Type)) continue;
-            return slot.Type is PrimitiveSig && !IsFloat(slot.Type) && BitsOf(slot.Type) == bits ? inner : e;
+            // (A narrower field read into a wider register - a ushort struct loaded with movzx - is still the field.)
+            return slot.Type is PrimitiveSig && !IsFloat(slot.Type) && (BitsOf(slot.Type) == bits || (!NoNarrowScalars && BitsOf(slot.Type) < bits)) ? inner : e;
         }
         return e;
     }
@@ -705,6 +706,13 @@ public sealed partial class HirBuilder
                 FieldSlot? slot = _p.Layouts.FieldAt(e.Type, 0);
                 if (slot is { } fs && fs.Offset == 0 && fs.Size * 8 == to)
                     return new SVal(new HField { Object = e, Field = fs.Field, DeclaringType = e.Type, Type = fs.Type });
+                // A struct that is one wider number: its low bytes are that number's ("(byte)delta" is (byte)delta.packed).
+                if (!NoNarrowScalars && ScalarOf(e, 64) is { } scalar && !ReferenceEquals(scalar, e))
+                {
+                    e = scalar;
+                    known = BitsOf(e.Type);
+                    if (known != 0 && known <= to) return new SVal(e);
+                }
             }
             if (known == 0 && inner.Type == VT.I64 && to == 32 && e.Type == null) return v; // untyped 32-bit value in a 64-bit register
             // The low bytes of a float or double are part of its bits, not the number converted.
@@ -762,7 +770,7 @@ public sealed partial class HirBuilder
     {
         Sem hi = Eval(n.In[0]), lo = Eval(n.In[1]);
         if (hi is SHalf { High: true } h && lo is SHalf { High: false } l && ReferenceEquals(h.Whole, l.Whole))
-            return new SVal(h.Whole);
+            return _halvedRefs.TryGetValue(h.Whole, out SRef? reference) ? reference : new SVal(h.Whole);
         if (hi is SVal hv && lo is SVal lv)
         {
             // Two 4-byte values side by side. Whether they are one 64-bit number or a pair of fields depends on
@@ -1016,6 +1024,11 @@ public sealed partial class HirBuilder
                 // The bytes between a struct's fields hold nothing: writing them (the compiler zeroes or copies
                 // them along with the fields) is no part of the program.
                 if (size > 0 && IsPadding(type, remaining, size)) return new PInternal("padding");
+                // Padding and then whole fields (a zeroing write that starts in the gap after a bool): the fields,
+                // each taking its bytes of the value; the padding's bytes are nothing.
+                var covered = new List<Part>();
+                if (!NoPaddedParts && size > 0 && Leaves(current, type, remaining, size, 0, covered) && covered.Count != 0)
+                    return new PParts(covered, size) { Owner = current, OwnerType = type, Offset = remaining };
                 return new PUnknown($"no field at offset 0x{remaining:X} of {type.DisplayName}");
             }
             // A union: several fields share these bytes. The one of exactly this place and size is the one meant
@@ -1148,6 +1161,44 @@ public sealed partial class HirBuilder
         }
         string why = $"access of {size} bytes spans fields of {type.DisplayName}";
         return IsStructType(type) && size > 0 ? new PChunk(owner, type, offset, size, why) : new PUnknown(why);
+    }
+
+    private static readonly bool NoScaledIndexes = Environment.GetEnvironmentVariable("REWIND_NO_SCALED_INDEXES") != null;
+    private static readonly bool NoNarrowScalars = Environment.GetEnvironmentVariable("REWIND_NO_NARROW_SCALARS") != null;
+
+    /// <summary>
+    /// The index in elements of an array access whose scale is not the element size. A scale that is a multiple
+    /// of it: "a[i * 6 + k]" of an int array, the 6 folded into the scale (24). A smaller scale: the index was
+    /// multiplied already ("i * 12", or "i &lt;&lt; 4"), by enough to make whole elements. Null otherwise.
+    /// </summary>
+    private HExpr? ScaledIndex(Node index, long scale, long elementSize)
+    {
+        HExpr Times(HExpr e, long k) => k == 1 ? e : new HBinary(HBinaryOp.Mul, e, new HConst((int)k, _int)) { Type = _int };
+        if (scale > elementSize && scale % elementSize == 0)
+            return Times(IntValue(StripExtension(index)), scale / elementSize);
+        if (scale < elementSize && Multiple(StripExtension(index)) is ({ } x, var factor) && factor > 0 && factor * scale % elementSize == 0)
+            return Times(IntValue(StripExtension(x)), factor * scale / elementSize);
+        return null;
+    }
+
+    /// <summary>
+    /// A value that is another times a constant: "x * c", "x &lt;&lt; s", and the sums "lea" makes of them
+    /// ("x + x * 2" is x * 3).
+    /// </summary>
+    private static (Node? Of, long Factor) Multiple(Node n)
+    {
+        static (Node?, long) Simple(Node m) =>
+            m.Op == Op.Mul && m.In[1].IsConst ? (m.In[0], IrBuilder.SImm(m.In[1]))
+            : m.Op == Op.Shl && m.In[1].IsConst && m.In[1].Imm < 31 ? (m.In[0], 1L << (int)m.In[1].Imm)
+            : (null, 0);
+        if (Simple(n) is ({ } x, var k)) return (x, k);
+        if (n.Op == Op.Add)
+        {
+            if (ReferenceEquals(n.In[0], n.In[1])) return (n.In[0], 2);
+            for (int side = 0; side < 2; side++)
+                if (Simple(n.In[side]) is ({ } y, var c) && ReferenceEquals(y, n.In[1 - side])) return (y, c + 1);
+        }
+        return (null, 0);
     }
 
     private HExpr IndexValue(Node index, long constant)
@@ -1377,7 +1428,9 @@ public sealed partial class HirBuilder
                 long inside;
                 if (a.Index != null)
                 {
-                    if (a.Scale != elementSize) return new PUnknown($"array index scale {a.Scale} does not match element size {elementSize}");
+                    HExpr? scaled = null;
+                    if (a.Scale != elementSize && (NoScaledIndexes || (scaled = ScaledIndex(a.Index, a.Scale, elementSize)) == null))
+                        return new PUnknown($"array index scale {a.Scale} does not match element size {elementSize}");
                     // "array[i - 1]" has a displacement below the first element: round toward the element it is in.
                     long whole = Math.DivRem(rel, elementSize, out inside);
                     if (inside < 0)
@@ -1385,7 +1438,9 @@ public sealed partial class HirBuilder
                         inside += elementSize;
                         whole--;
                     }
-                    index = IndexValue(a.Index, whole);
+                    index = scaled == null ? IndexValue(a.Index, whole)
+                        : whole == 0 ? scaled
+                        : new HBinary(HBinaryOp.Add, scaled, new HConst((int)whole, _int)) { Type = _int };
                 }
                 else
                 {
@@ -1812,6 +1867,15 @@ public sealed partial class HirBuilder
             Eval(valueNode) is SKlass { Type.IsValueType: true })
             FrameConflicts.Add(reused);
         Place place = ResolvePlace(n.In[0], size);
+        // Bytes of untyped stack memory copied into bytes of a struct: the stack memory is a copy of that struct
+        // (a struct built on the stack field by field, then copied out eight bytes at a time).
+        // (Only from the struct's first bytes: where just a later part of it was put together on the stack, the
+        // stack memory before that part is something else.)
+        if (!NoCopyTypes && valueNode.Op == Op.Load && IsFrameAddress(valueNode.In[0], out int copiedFrom) && !IsFrameAddress(n.In[0], out _))
+        {
+            if (place is PChunk { Offset: 0 } destination) VoteCopyType(copiedFrom, destination.OwnerType);
+            else if (place is PParts { OwnerType: { } owner, Leaves.Count: > 1, Offset: 0 }) VoteCopyType(copiedFrom, owner);
+        }
         // A caught exception put into a typed stack struct that has no place for one: the slot it waits in until
         // the clean-up code has run and it is thrown again, in bytes that held another local before.
         if (size == 8 && IsFrameAddress(n.In[0], out int keptAt) && FrameObjectAt(keptAt) is not null &&
@@ -2063,6 +2127,19 @@ public sealed partial class HirBuilder
         TypeSig vote = type != null && (IsReference(type) || wholeStruct) && !Open(type) && Nameable(type) ? type : _long;
         if (!_frameVotes.TryGetValue(offset, out HashSet<TypeSig>? votes)) _frameVotes[offset] = votes = [];
         votes.Add(vote);
+    }
+
+    private static readonly bool NoCopyTypes = Environment.GetEnvironmentVariable("REWIND_NO_COPY_TYPES") != null;
+    private static readonly bool NoPaddedParts = Environment.GetEnvironmentVariable("REWIND_NO_PADDED_PARTS") != null;
+
+    /// <summary>Stack offset to the struct types the memory there was copied out as (see EmitStore).</summary>
+    private readonly Dictionary<int, HashSet<TypeSig>> _copyVotes = [];
+
+    private void VoteCopyType(int start, TypeSig type)
+    {
+        if (!IsStructType(type) || Open(type) || !Nameable(type) || _frameTypes.ContainsKey(start)) return;
+        if (!_copyVotes.TryGetValue(start, out HashSet<TypeSig>? votes)) _copyVotes[start] = votes = [];
+        votes.Add(type);
     }
 
     private static readonly bool NoWidePairs = Environment.GetEnvironmentVariable("REWIND_NO_WIDE_PAIRS") != null;

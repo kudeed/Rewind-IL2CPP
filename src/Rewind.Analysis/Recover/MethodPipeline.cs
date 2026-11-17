@@ -952,6 +952,7 @@ public sealed class MethodPipeline
         DeadStores.Run(result);
         EnumeratorLoops.Run(result, _program);
         if (LateMoves.Run(result)) StructConstruction.Run(result);
+        SwitchRanges.Run(result);
         return result;
     }
 
@@ -999,9 +1000,9 @@ public sealed class MethodPipeline
         HMethod result = builder.Build();
         // Types of merged values and of stack objects are discovered while building; when any was, build
         // again knowing them.
-        for (int round = 0; round < 4 && (builder.PhiTypesRefined || builder.FrameTypesRefined); round++)
+        for (int round = 0; round < 4 && (builder.PhiTypesRefined || builder.FrameTypesRefined || builder.DispatchRefined); round++)
         {
-            builder = new HirBuilder(_program, lifted, builder.PhiTypes, builder.RefinedFrameTypes) { MergedAddresses = mergedAddresses };
+            builder = new HirBuilder(_program, lifted, builder.PhiTypes, builder.RefinedFrameTypes, builder.DispatchPhis) { MergedAddresses = mergedAddresses };
             result = builder.Build();
         }
         // Each build may learn types the next one starts from. Still learning after the last one means this
