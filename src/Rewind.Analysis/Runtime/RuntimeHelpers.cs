@@ -192,8 +192,10 @@ public sealed class RuntimeHelpers
             {
                 HelperInfo? info = Classify(name);
                 if (info == null) continue;
-                chosen = info;
-                break;
+                // The linker keeps one copy of functions with identical code. Where the two metadata initializers
+                // are one function (Unity 2020), it is the one whose result the code uses: the other returns nothing.
+                if (chosen == null || (chosen.Kind == HelperKind.MetadataInit && info.Kind == HelperKind.MetadataInitInline)) chosen = info;
+                if (chosen.Kind != HelperKind.MetadataInit) break;
             }
             if (chosen != null) helpers._byAddress[address] = chosen;
         }
