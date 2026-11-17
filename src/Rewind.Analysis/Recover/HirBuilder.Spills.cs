@@ -12,12 +12,19 @@ public sealed partial class HirBuilder
     private readonly Dictionary<Node, int> _spillLoads = [];
     /// <summary>
     /// The same for a parked reference that is not a stack address: the "this" of a struct method, a by-reference
-    /// parameter, the return buffer (values whose meaning is fixed on entry). Load -> the value that was parked.
+    /// parameter, the return buffer, the method's own descriptor (values whose meaning is fixed on entry).
+    /// Load -> the value that was parked.
     /// </summary>
     private readonly Dictionary<Node, Node> _refLoads = [];
 
-    /// <summary>A value that is a reference to a location from the start (bound in BindParameters), so safe to ask about before translation.</summary>
-    private bool IsBoundReference(Node n) => _sem.TryGetValue(n, out Sem? s) && s is SRef;
+    private static readonly bool NoParkedDescriptors = Environment.GetEnvironmentVariable("REWIND_NO_PARKED_DESCRIPTORS") != null;
+
+    /// <summary>
+    /// A value that is a reference to a location from the start (bound in BindParameters), so safe to ask about
+    /// before translation. The method's own descriptor is one too: code of a generic class that has a try
+    /// statement keeps it in the frame, and reads what it calls on its type arguments through the copy.
+    /// </summary>
+    private bool IsBoundReference(Node n) => _sem.TryGetValue(n, out Sem? s) && (s is SRef || (s is SMethod && !NoParkedDescriptors));
 
     private const long ReferenceTargets = 1L << 40;
 
@@ -174,10 +181,46 @@ public sealed partial class HirBuilder
 
     private enum DefKind { Spill, Other }
 
+    private readonly Dictionary<ulong, bool> _emptyFunctions = [];
+
+    /// <summary>A function that does nothing: its code is a lone "ret", the code of every empty method of the program.</summary>
+    private bool EmptyFunction(ulong address)
+    {
+        if (address == 0) return false;
+        if (_emptyFunctions.TryGetValue(address, out bool known)) return known;
+        X64Cfg cfg = X64Cfg.Build(_p.Context, address);
+        bool empty = cfg.Blocks.Count == 1 && cfg.Blocks[0].Instructions.Count != 0 && cfg.Blocks[0].Instructions[^1].Mnemonic == Iced.Intel.Mnemonic.Ret;
+        for (int i = 0; empty && i < cfg.Blocks[0].Instructions.Count - 1; i++)
+            empty = cfg.Blocks[0].Instructions[i].Mnemonic == Iced.Intel.Mnemonic.Nop;
+        return _emptyFunctions[address] = empty;
+    }
+
+    /// <summary>How many bytes follow stack offset <paramref name="at"/> in the stack object it lies in (256 when it lies in none).</summary>
+    private int RestOfObject(int at)
+    {
+        if (!NoParkedDescriptors)
+            foreach (Rewind.Analysis.Passes.FrameObject o in _l.Frame)
+                if (at >= o.Offset && at < o.Offset + o.Size)
+                    return o.Offset + o.Size - at;
+        return 256;
+    }
+
     private void PlanSlot(int slot)
     {
         int end = slot + 8;
         bool Overlaps(int start, int size) => start < end && slot < start + size;
+
+        // The method's own descriptor, kept where the compiler keeps a register argument (one of the four places
+        // above the return address) with nothing else ever stored there: the program cannot name that place,
+        // so no call writes it - whatever addresses lie where a call of unknown shape might take arguments
+        // (the compiler keeps "&method" among its locals, for the code of a finally block).
+        bool descriptorHome = !NoParkedDescriptors && slot is >= 8 and < 40;
+        if (descriptorHome)
+            foreach (Block b in _fn.Blocks)
+                foreach (Node n in b.Nodes)
+                    if (!n.Dead && n.Op == Op.Store && StackOffsetOf(n.In[0], 0) is int to && Overlaps(to, n.In[1].Type.Bytes()) &&
+                        !(to == slot && n.In[1].Type == VT.I64 && _sem.TryGetValue(n.In[1], out Sem? kept) && kept is SMethod))
+                        descriptorHome = false;
 
         // Definitions and uses of the slot, in block order.
         // Targets: a stack offset, or (from ReferenceTargets on) the id of a bound reference value.
@@ -213,11 +256,15 @@ public sealed partial class HirBuilder
                     list.Add((n, false, DefKind.Other, 0));
                 else if (n.Op is Op.Call or Op.TailCall)
                 {
+                    if (descriptorHome) continue;
+                    // A function that does nothing writes nothing, whatever the registers hold as it is called.
+                    if (!NoParkedDescriptors && n.Aux is CallInfo { Indirect: false, Target: var called } && EmptyFunction(called)) continue;
                     // A call handed a stack address may write the object there: all of it when its type is known,
-                    // else anything at and after the address.
+                    // else what follows the address in the stack object it lies in (the frame was told apart
+                    // into objects on that understanding), else anything at and after the address.
                     foreach (Node input in n.In)
                         if (StackOffsetOf(input, 0) is int arg && arg <= slot &&
-                            slot < arg + (_frameTypes.TryGetValue(arg, out TypeSig? pointee) ? Math.Max(1, _p.Layouts.SizeOf(pointee).Size) : 256))
+                            slot < arg + (_frameTypes.TryGetValue(arg, out TypeSig? pointee) ? Math.Max(1, _p.Layouts.SizeOf(pointee).Size) : RestOfObject(arg)))
                         {
                             list.Add((n, true, DefKind.Other, 0));
                             break;

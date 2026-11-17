@@ -173,7 +173,17 @@ internal sealed class SHierarchyEntry(Node obj, TypeSig type) : Sem
 }
 
 /// <summary>A value with no managed meaning (undefined register contents, the hidden MethodInfo argument).</summary>
-internal sealed class SJunk : Sem
+internal class SJunk : Sem
 {
     public static readonly SJunk Instance = new();
+}
+
+/// <summary>
+/// What shared code hands a method it calls through a constraint ("constrained. T; callvirt Dispose", as a
+/// foreach over a struct enumerator ends): the runtime's record of that method as the type has it. No value
+/// of the program, but it says which type the call is made on.
+/// </summary>
+internal sealed class SConstrained(TypeSig on) : SJunk
+{
+    public TypeSig On = on;
 }

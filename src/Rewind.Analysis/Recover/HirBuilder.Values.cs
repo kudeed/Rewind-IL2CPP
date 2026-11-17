@@ -1123,6 +1123,8 @@ public sealed partial class HirBuilder
         return place;
     }
 
+    private static readonly bool NoConstrainedDescriptors = Environment.GetEnvironmentVariable("REWIND_NO_CONSTRAINED_DESCRIPTORS") != null;
+
     /// <summary>What entry <paramref name="index"/> of a runtime generic context holds, for the context's type arguments.</summary>
     private Sem RgctxValue(SRgctx context, int index)
     {
@@ -1142,6 +1144,8 @@ public sealed partial class HirBuilder
                 return new SType(type);
             case Rewind.Runtime.RgctxKind.Array when Inflate(item.Type) is { } element:
                 return new SKlass(_m.Sigs.SzArray(element));
+            case Rewind.Runtime.RgctxKind.Constrained when !NoConstrainedDescriptors && Inflate(item.Type) is { } on:
+                return new SConstrained(on);
             case Rewind.Runtime.RgctxKind.Method when item.Method is { } open:
             {
                 var classArguments = new TypeSig[open.ClassArguments.Length];
