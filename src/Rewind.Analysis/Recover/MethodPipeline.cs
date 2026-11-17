@@ -324,6 +324,7 @@ public sealed class MethodPipeline
             if (BlockCopies.Extend(fn)) DeadCode.Run(fn);
             CheckShape(fn, "block copies");
         }
+        if (Environment.GetEnvironmentVariable("REWIND_NO_LEAVE_TARGETS") == null && LeaveTargets.Run(fn)) _normalizer.Cleanup(fn);
         if (Environment.GetEnvironmentVariable("REWIND_NO_EXCEPTION_STACKS") == null && ExceptionStacks.Run(fn, _program.Helpers)) _normalizer.Cleanup(fn);
         CheckShape(fn, "exception stacks");
         Dictionary<int, int> boxes = InPlaceBoxes(fn);
