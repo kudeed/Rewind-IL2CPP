@@ -28,37 +28,113 @@ internal static class GapCover
         return key;
     }
 
+    private static string Digest(string text) =>
+        Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(text)), 0, 8);
+
     public static int Run(Il2CppModel model, string symbolsPath, string? assemblyFilter)
     {
         ProgramAnalysis program = LiftLab.MakeProgram(model, symbolsPath);
-        var pipeline = new MethodPipeline(program);
         var perMethod = new List<HashSet<string>>();
         int total = 0, clean = 0, crashed = 0;
         // REWIND_GAP_LIST=<file>: every method with what blocks it, to compare two rounds method by method.
         string? listPath = Environment.GetEnvironmentVariable("REWIND_GAP_LIST");
         List<string>? listed = listPath != null ? [] : null;
+        // REWIND_GAP_DIGEST=<file>: every method with a digest of what it was recovered as. Two rounds that give
+        // the same file gave the same code for every method.
+        string? digestPath = Environment.GetEnvironmentVariable("REWIND_GAP_DIGEST");
+        var methods = new List<MethodDef>();
         foreach (MethodDef method in model.Methods)
         {
             if (method.Address == 0) continue;
             if (assemblyFilter != null && method.DeclaringType.Assembly.Name != assemblyFilter) continue;
             if (method.DeclaringType.GenericParameters.Length != 0 || method.GenericParameters.Length != 0) continue;
             if (!Rewind.Output.AssemblyEmitter.HasIlBody(method)) continue;
+            methods.Add(method);
+        }
+        // REWIND_GAP_ORDER=reverse, or a number to shuffle by: the order the methods are recovered in. What a
+        // method is recovered as must not depend on it (the lists are written in the methods' own order).
+        int[] order = Enumerable.Range(0, methods.Count).ToArray();
+        string? orderName = Environment.GetEnvironmentVariable("REWIND_GAP_ORDER");
+        if (orderName == "reverse") Array.Reverse(order);
+        else if (int.TryParse(orderName, out int seed)) new Random(seed).Shuffle(order);
+        var problems = new List<string>?[methods.Count];
+        var crashes = new string?[methods.Count];
+        var digests = new string?[methods.Count];
+        var shown = new HashSet<ulong>();
+        foreach (string address in (Environment.GetEnvironmentVariable("REWIND_GAP_SHOW") ?? "").Split(';', StringSplitOptions.RemoveEmptyEntries))
+            shown.Add(Convert.ToUInt64(address.Trim(), 16));
+        // (On REWIND_THREADS threads, one per processor when it is not set.)
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        bool progress = Environment.GetEnvironmentVariable("REWIND_GAP_PROGRESS") != null;
+        // (With REWIND_GAP_PROGRESS also: the methods that have been under way for a long time, now and then.)
+        var underWay = new System.Collections.Concurrent.ConcurrentDictionary<int, (int Method, long Started)>();
+        using var slow = progress
+            ? new Timer(_ =>
+            {
+                foreach (var (thread, (method, started)) in underWay)
+                {
+                    double seconds = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalSeconds;
+                    if (seconds >= 15) Console.Error.WriteLine($"  under way for {seconds:F0} s on thread {thread}: 0x{methods[method].Address:X} {methods[method].FullName}");
+                }
+            }, null, 20000, 20000)
+            : null;
+        RecoveryThreads.Run(program, methods.Count, 0,
+            (pipeline, k) =>
+            {
+                if (progress) underWay[Environment.CurrentManagedThreadId] = (order[k], System.Diagnostics.Stopwatch.GetTimestamp());
+                try
+                {
+                    HMethod h = pipeline.Recover(methods[order[k]]);
+                    string? text = digestPath != null ? HirPrinter.Print(h) + "\n" + string.Join("\n", h.Problems) : null;
+                    // REWIND_GAP_SHOW=<address>;<address>: what those methods were recovered as, next to the digests.
+                    if (text != null && shown.Contains(methods[order[k]].Address)) File.WriteAllText($"{digestPath}.0x{methods[order[k]].Address:X}.txt", text);
+                    return (Problems: h.Problems.Distinct().ToList(), Digest: text != null ? Digest(text) : null, Crash: (string?)null);
+                }
+                catch (Exception e)
+                {
+                    return (Problems: (List<string>?)null, Digest: (string?)null, Crash: e.GetType().Name);
+                }
+                finally
+                {
+                    if (progress) underWay.TryRemove(Environment.CurrentManagedThreadId, out _);
+                }
+            },
+            (k, r) =>
+            {
+                (problems[order[k]], digests[order[k]], crashes[order[k]]) = (r.Problems, r.Digest, r.Crash);
+                // REWIND_GAP_PROGRESS: how far it is, every few thousand methods.
+                if (progress && (k + 1) % 5000 == 0) Console.Error.WriteLine($"{k + 1} of {methods.Count} methods after {watch.Elapsed.TotalSeconds:F0} s");
+            });
+        Console.Error.WriteLine($"recovered on {Math.Min(RecoveryThreads.Default, Math.Max(1, methods.Count))} threads in {watch.Elapsed.TotalSeconds:F0} s; " +
+                                $"peak memory {System.Diagnostics.Process.GetCurrentProcess().PeakWorkingSet64 >> 20} MB");
+        if (RecoveryStats.On) Console.Error.WriteLine(RecoveryStats.Report() + $"; threads stood still for {RecoveryThreads.Waited:F0} s; garbage collections {GC.CollectionCount(0)}/{GC.CollectionCount(1)}/{GC.CollectionCount(2)}, {GC.GetTotalPauseDuration().TotalSeconds:F0} s paused");
+        if (Environment.GetEnvironmentVariable("REWIND_CHECK_KEPT") != null)
+        {
+            var (kept, changed) = program.CheckKept();
+            Console.Error.WriteLine($"kept bodies: {kept}; changed after they were kept: {changed.Count}");
+            foreach (string name in changed.Take(40)) Console.Error.WriteLine("  changed: " + name);
+        }
+        var digestLines = digestPath != null ? new List<string>() : null;
+        for (int i = 0; i < methods.Count; i++)
+        {
+            MethodDef method = methods[i];
             total++;
-            try
+            digestLines?.Add($"0x{method.Address:X}\t{method.FullName}\t{digests[i] ?? "crash " + crashes[i]}");
+            if (problems[i] is { } found)
             {
-                HMethod h = pipeline.Recover(method);
-                listed?.Add($"0x{method.Address:X}\t{method.FullName}\t{(h.Problems.Count == 0 ? "complete" : string.Join(" | ", h.Problems.Distinct().Take(4)))}");
-                if (h.Problems.Count == 0) { clean++; continue; }
-                perMethod.Add(h.Problems.Select(Kind).ToHashSet());
+                listed?.Add($"0x{method.Address:X}\t{method.FullName}\t{(found.Count == 0 ? "complete" : string.Join(" | ", found.Take(4)))}");
+                if (found.Count == 0) { clean++; continue; }
+                perMethod.Add(found.Select(Kind).ToHashSet());
             }
-            catch (Exception e)
+            else
             {
-                listed?.Add($"0x{method.Address:X}\t{method.FullName}\tcrash {e.GetType().Name}");
+                listed?.Add($"0x{method.Address:X}\t{method.FullName}\tcrash {crashes[i]}");
                 crashed++;
                 perMethod.Add(["crash"]);
             }
         }
         if (listPath != null) File.WriteAllLines(listPath, listed!);
+        if (digestPath != null) File.WriteAllLines(digestPath, digestLines!);
         Console.WriteLine($"{total} methods: {clean} complete ({100.0 * clean / Math.Max(1, total):F1}%), {perMethod.Count} blocked, {crashed} crashed");
 
         var fixedKinds = new HashSet<string>();
