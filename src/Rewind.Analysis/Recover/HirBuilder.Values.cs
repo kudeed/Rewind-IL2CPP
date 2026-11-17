@@ -800,6 +800,8 @@ public sealed partial class HirBuilder
     private sealed record PLocation(HExpr Location, TypeSig Type) : Place;
     private sealed record PPair(HExpr Low, HExpr High) : Place;
     private sealed record PArrayLength(HExpr Array) : Place;
+    /// <summary>One of two fields of different classes, chosen by a test: a value to read ("c ? (Renderer)a : b"), no place to write.</summary>
+    private sealed record PChosenValue(HExpr Value) : Place;
     private sealed record PObjKlass(Node Object) : Place;
     private sealed record PStatics(TypeSig Type) : Place;
     private sealed record PVTable(Node Object, int Slot, bool MethodInfo) : Place;
@@ -848,15 +850,38 @@ public sealed partial class HirBuilder
         }
         HExpr? condition = null;
         if (index.Type == VT.I1) condition = Condition(index);
-        else if (Peek(index) is SVal { Type: var known } && ReferenceEquals(known, _bool)) condition = Value(index);
+        else if (Peek(index) is SVal { Type: var known } && (ReferenceEquals(known, _bool) || known is PrimitiveSig { Element: Il2CppTypeEnum.Boolean })) condition = Value(index);
         if (condition == null) return null;
         if (FieldPlace(obj, type, (int)a.Offset, size) is not PLocation first || FieldPlace(obj, type, (int)(a.Offset + a.Scale), size) is not PLocation second)
             return null;
-        if (first.Type.Key != second.Type.Key || _p.Layouts.SizeOf(first.Type) is not { Known: true } bytes || (size > 0 && bytes.Size != size)) return null;
+        if (first.Type.Key != second.Type.Key)
+        {
+            // Two references of different classes ("skinned ? skinnedRenderer : meshRenderer"): read as the class
+            // both are.
+            if (NoChosenReferences || !IsReference(first.Type) || !IsReference(second.Type) || size != _p.Model.Image.PointerSize ||
+                CommonBase(first.Type, second.Type) is not { } common) return null;
+            HExpr one = turned ? first.Location : second.Location, zero = turned ? second.Location : first.Location;
+            return new PChosenValue(new HSelect(condition, one, zero) { Type = common });
+        }
+        if (_p.Layouts.SizeOf(first.Type) is not { Known: true } bytes || (size > 0 && bytes.Size != size)) return null;
         TypeSig reference = _m.Sigs.ByRef(first.Type);
         HExpr whenOne = new HAddressOf(second.Location) { Type = reference }, whenZero = new HAddressOf(first.Location) { Type = reference };
         var picked = new HSelect(condition, turned ? whenZero : whenOne, turned ? whenOne : whenZero) { Type = reference };
         return new PLocation(new HDeref(picked) { Type = first.Type }, first.Type);
+    }
+
+    private static readonly bool NoChosenReferences = Environment.GetEnvironmentVariable("REWIND_NO_CHOSEN_REFERENCES") != null;
+
+    /// <summary>The nearest class both classes derive from (object at the latest); null for anything but two classes.</summary>
+    private TypeSig? CommonBase(TypeSig a, TypeSig b)
+    {
+        if (a.Definition is not { IsValueType: false, IsInterface: false } || b.Definition is not { IsValueType: false, IsInterface: false }) return null;
+        if (a is GenericInstSig || b is GenericInstSig) return null;
+        var ancestors = new List<string>();
+        for (TypeSig? t = a; t != null && ancestors.Count < 64; t = t.Definition?.BaseType) ancestors.Add(t.Key);
+        for (TypeSig? t = b; t != null && ancestors.Count < 128; t = t.Definition?.BaseType)
+            if (ancestors.Contains(t.Key)) return t;
+        return _object;
     }
 
     private static Node StripExtension(Node n)
@@ -1733,6 +1758,8 @@ public sealed partial class HirBuilder
                 return new SParts(parts.Leaves, parts.Size);
             case PArrayLength len:
                 return new SVal(new HArrayLength(len.Array) { Type = _int });
+            case PChosenValue chosen:
+                return new SVal(chosen.Value);
             case PObjKlass ok:
                 return new SObjKlass(ok.Object);
             case PStatics st:
