@@ -14,6 +14,14 @@ namespace Rewind.Analysis.Passes;
 /// </summary>
 public static class ParkedAddresses
 {
+    private static readonly bool Tracing = Environment.GetEnvironmentVariable("REWIND_PARK_TRACE") != null;
+    private static readonly bool NoPartialParks = Environment.GetEnvironmentVariable("REWIND_NO_PARTIAL_PARKS") != null;
+
+    private static void Trace(string text)
+    {
+        if (Tracing) Console.WriteLine("  [park] " + text);
+    }
+
     private enum Kind { Park, Other }
 
     /// <summary>
@@ -167,6 +175,7 @@ public static class ParkedAddresses
         if (parked.Count == 0) return false;
 
         var resolved = new Dictionary<Node, int>();
+        bool ambiguous = false;
         foreach (var (b, list) in events)
         {
             HashSet<Node?> reaching = In(b);
@@ -188,11 +197,18 @@ public static class ParkedAddresses
                     if (target != null && target != t) ok = false;
                     target = t;
                 }
-                if (!ok || target == null) return false; // ambiguous: leave the slot as it is
+                if (!ok || target == null)
+                {
+                    // Ambiguous: this read stays a read (and the slot keeps its writes); the others are still known.
+                    Trace($"slot {slot}: read at 0x{e.Node.Addr:X} sees {string.Join(", ", reaching.Select(d => d == null ? "entry" : d.Op + "@0x" + d.Addr.ToString("X")))}");
+                    if (NoPartialParks) return false;
+                    ambiguous = true;
+                    continue;
+                }
                 resolved[e.Node] = target.Value;
             }
         }
-        if (resolved.Count == 0 && reachable) return false;
+        if (resolved.Count == 0 && (reachable || ambiguous)) return false;
 
         // The reads become the address itself.
         var replace = new Dictionary<Node, Node>();
@@ -219,8 +235,8 @@ public static class ParkedAddresses
                         if (replace.TryGetValue(n.In[i], out Node? r)) n.In[i] = r;
             }
         // With nothing left that could read them, the parking writes do nothing.
-        if (!reachable)
+        if (!reachable && !ambiguous)
             foreach (Node store in parked.Keys) store.Dead = true;
-        return replace.Count != 0 || !reachable;
+        return replace.Count != 0 || (!reachable && !ambiguous);
     }
 }
