@@ -543,6 +543,12 @@ public sealed class BodyEmitter
                 return;
             }
             Value(e);
+            // The address of a local handed over as an unmanaged pointer: "&local" (ldloca, conv.u).
+            if (target is PointerSig && (e is HAddressOf || e.Type is ByRefSig))
+            {
+                _il.Emit(OpCodes.Conv_U);
+                return;
+            }
             // A T handed on as something else - an object, the class or interface it is declared to be - is
             // boxed, which leaves a reference what it is; something else handed on as a T is taken out likewise.
             if (Own(e.Type) is { } from)

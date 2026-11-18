@@ -140,6 +140,53 @@ public sealed class KlassLayout
         return k;
     }
 
+    /// <summary>
+    /// The same reads in A64 code: a 32-bit field tested for zero ("ldr w, [klass, #d]; cbz/cbnz"), a flag byte's
+    /// bit tested ("ldrb w, [klass, #d]; tbz/tbnz w, #bit"), 16-bit and byte fields read.
+    /// </summary>
+    private static void CountArm64(NativeImage image, int span, int[] compared, int[] words, int[] bytes, int[] firstBit,
+        Dictionary<(int Compared, int Byte, int Mask), int> guards)
+    {
+        foreach (FunctionRange f in image.FunctionTable)
+        {
+            // What was loaded into each register lately: (base register, offset, size, where).
+            var loaded = new (byte Base, int Offset, int Size, ulong At)[32];
+            byte testedBase = 255;
+            int testedByte = 0, testedMask = 0;
+            ulong testedAt = 0;
+            for (ulong at = f.Start; at + 4 <= f.End && image.IsMapped(at, 4); at += 4)
+            {
+                Arm64.A64Instruction ins = Arm64.A64Decoder.Decode(image.U32(at), at);
+                if (ins.IsInvalid) break;
+                if (ins.Op == Arm64.A64Op.Ldr && !ins.Vector && !ins.Signed && ins.Mode == Arm64.A64Mode.Offset && ins.Rd < 31 &&
+                    ins.Rn < 31 && ins.Imm is >= 0 && ins.Imm < span)
+                {
+                    int d = (int)ins.Imm;
+                    if (ins.Size == 2) words[d]++;
+                    if (ins.Size == 1) bytes[d]++;
+                    loaded[ins.Rd] = (ins.Rn, d, ins.Size, at);
+                    continue;
+                }
+                if (ins.Op is Arm64.A64Op.Cbz or Arm64.A64Op.Cbnz && ins.Rd < 31 && loaded[ins.Rd] is { Size: 4, At: not 0 } word && at - word.At <= 8)
+                {
+                    compared[word.Offset]++;
+                    if (testedBase == word.Base && at - testedAt <= 16)
+                    {
+                        var key = (word.Offset, testedByte, testedMask);
+                        guards[key] = guards.GetValueOrDefault(key) + 1;
+                    }
+                }
+                if (ins.Op is Arm64.A64Op.Tbz or Arm64.A64Op.Tbnz && ins.Rd < 31 && loaded[ins.Rd] is { Size: 1, At: not 0 } flag && at - flag.At <= 8 && ins.Imm < 8)
+                {
+                    if (ins.Imm == 0) firstBit[flag.Offset]++;
+                    (testedBase, testedByte, testedMask, testedAt) = (flag.Base, flag.Offset, 1 << (int)ins.Imm, at);
+                }
+                for (byte r = 0; r < 31; r++)
+                    if (loaded[r].At != 0 && Arm64.A64Cfg.Writes(ins, r)) loaded[r] = default;
+            }
+        }
+    }
+
     /// <summary>How often one candidate must be read, and how many times as often as the other, to be taken.</summary>
     private const int MinimumEvidence = 16, EvidenceMargin = 8;
 
@@ -157,7 +204,7 @@ public sealed class KlassLayout
         int p = image.PointerSize;
         Shape shape = ShapeOf(model.Version, model.UnityVersion);
         KlassLayout byVersion = Build(model.Version, p, shape);
-        if (image.Arch != CpuArch.X64) return byVersion;
+        if (image.Arch is not (CpuArch.X64 or CpuArch.Arm64)) return byVersion;
 
         // How often each offset near the fields in question is read, by the kind of read.
         const int Span = 0x200;
@@ -165,7 +212,8 @@ public sealed class KlassLayout
         // (offset compared, byte offset, mask) of a bit tested just before a 32-bit compare on the same class.
         var guards = new Dictionary<(int Compared, int Byte, int Mask), int>();
 
-        foreach (FunctionRange f in image.FunctionTable)
+        if (image.Arch == CpuArch.Arm64) CountArm64(image, Span, compared, words, bytes, firstBit, guards);
+        else foreach (FunctionRange f in image.FunctionTable)
         {
             int length = (int)(f.End - f.Start);
             if (length <= 0 || !image.TrySpan(f.Start, length, out ReadOnlySpan<byte> code)) continue;

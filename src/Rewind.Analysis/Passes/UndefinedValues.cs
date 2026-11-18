@@ -13,7 +13,12 @@ namespace Rewind.Analysis.Passes;
 public static class UndefinedValues
 {
     /// <param name="isLeftover">True for an entry value (a Param node) that the calling convention gives no meaning.</param>
-    public static bool Run(Function fn, Func<Node, bool> isLeftover)
+    /// <param name="deadArguments">
+    /// Also a leftover handed to a call in an argument register: the compiler, seeing all of a program's calls
+    /// of a function at once (clang's link-time optimization), stops setting an argument the function never
+    /// reads, and the register keeps whatever it held. Any value is right there too: zero is passed.
+    /// </param>
+    public static bool Run(Function fn, Func<Node, bool> isLeftover, bool deadArguments = false)
     {
         var known = new Dictionary<Node, bool>();
         bool Leftover(Node n, int depth = 0)
@@ -59,6 +64,15 @@ public static class UndefinedValues
                 if (n.Dead) continue;
                 switch (n.Op)
                 {
+                    case Op.Call or Op.TailCall when deadArguments && n.Aux is CallInfo info:
+                        for (int i = 0; i < n.In.Length && i < info.Slots.Count; i++)
+                        {
+                            if (info.Slots[i].Kind is not (ArgSlotKind.IntReg or ArgSlotKind.FloatReg) || n.In[i].IsConst || !Leftover(n.In[i])) continue;
+                            Node zero = fn.NewNode(Op.Const, n.In[i].Type, null);
+                            n.In[i] = zero;
+                            changed = true;
+                        }
+                        break;
                     case Op.Store when Leftover(n.In[1]) && OnStack(n.In[0]):
                         n.Dead = true;
                         changed = true;

@@ -14,9 +14,9 @@ internal static class KlassLab
     public static int Probe(Il2CppModel model)
     {
         NativeImage image = model.Image;
-        if (image.Arch != CpuArch.X64)
+        if (image.Arch is not (CpuArch.X64 or CpuArch.Arm64))
         {
-            Console.WriteLine("x64 only");
+            Console.WriteLine("x64 and ARM64 only");
             return 2;
         }
         KlassLayout byVersion = KlassLayout.For(model.Version, image.PointerSize, model.UnityVersion);

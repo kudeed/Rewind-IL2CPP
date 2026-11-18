@@ -22,7 +22,7 @@ public sealed class InlineCopy
 /// passes a method descriptor in exactly the position where that method would expect its own thereby names
 /// the function it calls. This finds those witnesses.
 /// </summary>
-public static class InlineCopyFinder
+public static partial class InlineCopyFinder
 {
     private static readonly Register[] ArgumentRegisters = [Register.RCX, Register.RDX, Register.R8, Register.R9];
     private const ushort AggressiveInlining = 0x100;
@@ -32,6 +32,7 @@ public static class InlineCopyFinder
         var result = new Dictionary<ulong, InlineCopy>();
         Il2CppModel model = program.Model;
         NativeImage image = model.Image;
+        if (image.Arch == CpuArch.Arm64) return Choose(VotesArm64(program));
         if (image.Arch != CpuArch.X64) return result;
 
         var votes = new Dictionary<ulong, Dictionary<MethodDef, List<MethodInst?>>>();
@@ -111,6 +112,13 @@ public static class InlineCopyFinder
             }
         }
 
+        return Choose(votes);
+    }
+
+    /// <summary>The method the callers of each function agree they are calling (four in five of them at least).</summary>
+    private static Dictionary<ulong, InlineCopy> Choose(Dictionary<ulong, Dictionary<MethodDef, List<MethodInst?>>> votes)
+    {
+        var result = new Dictionary<ulong, InlineCopy>();
         foreach (var (target, byMethod) in votes)
         {
             int total = byMethod.Values.Sum(v => v.Count);

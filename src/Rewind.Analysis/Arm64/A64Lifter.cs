@@ -586,9 +586,18 @@ public sealed partial class A64Lifter : IMachineLifter
         if (value != null) SetR(i.Rn, true, value);
     }
 
+    /// <summary>
+    /// What the stack protector keeps in the thread's guard slot (bionic's TLS_SLOT_STACK_GUARD, at the thread
+    /// pointer + 0x28). The code only stores it in the frame and compares it there again before returning: as
+    /// one value of its own, that comparison is known to hold and the call of __stack_chk_fail goes.
+    /// </summary>
+    private const long StackGuard = 0x5354414B47554152;
+
     /// <summary>Loads from memory, folding reads of read-only image data into constants.</summary>
     private Node LoadAt(Node address, VT type)
     {
+        if (type == VT.I64 && address.Op == Op.Add && address.In[0] is { Op: Op.Param, Imm: VarTpidr } && address.In[1].IsConstValue(0x28))
+            return C(VT.I64, StackGuard);
         if (address.IsConst)
         {
             ulong va = (ulong)address.Imm;
@@ -917,6 +926,11 @@ public sealed partial class A64Lifter : IMachineLifter
             }
             case A64Op.AndImm when !i.SetFlags && LowBits(i.Imm, bits) is int keep:
                 SetR(i.Rd, i.Is64, LowPart(R(i.Rn, i.Is64), keep, t));
+                return;
+            case A64Op.OrrImm when i.Is64 && StackOffset(R(i.Rn, true)) is long offset && i.Imm is > 0 and < 16 && ((offset & 15) & i.Imm) == 0:
+                // "orr x0, x8, #8" on a stack address: the stack pointer is 16-byte aligned on entry, so the bits
+                // set are clear in the address - an addition, which is how the address is used.
+                SetR(i.Rd, true, _b.Add(R(i.Rn, true), C(VT.I64, i.Imm)));
                 return;
             case A64Op.AndImm or A64Op.OrrImm or A64Op.EorImm:
             {
@@ -1437,6 +1451,15 @@ public sealed partial class A64Lifter : IMachineLifter
         A64Rounding.Nearest or A64Rounding.Current or A64Rounding.CurrentExact => "Round",
         _ => null,
     };
+
+    /// <summary>The offset from the entry stack pointer of a value that is the entry stack pointer plus a constant.</summary>
+    private long? StackOffset(Node n)
+    {
+        if (!_fn.Params.TryGetValue(VarSp, out Node? sp0)) return null;
+        if (ReferenceEquals(n, sp0)) return 0;
+        if (n.Op == Op.Add && ReferenceEquals(n.In[0], sp0) && n.In[1].IsConst) return n.In[1].Imm;
+        return null;
+    }
 
     private Node FZero(VT type)
     {
