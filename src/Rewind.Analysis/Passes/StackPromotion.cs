@@ -144,7 +144,7 @@ public static class StackPromotion
     public static List<FrameObject> Run(Function fn, Func<Node, int, int>? escapeExtent = null, IReadOnlyDictionary<int, int>? stackArguments = null, Func<Node, int, bool>? lowHalfOnly = null)
     {
         var frameObjects = new List<FrameObject>();
-        if (!fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0)) return frameObjects;
+        if (!fn.Params.TryGetValue(fn.Regs.StackPointer, out Node? sp0)) return frameObjects;
         if (Environment.GetEnvironmentVariable("REWIND_NO_SMALL_ARGUMENTS") == null) ForwardSmallArguments(fn, sp0);
 
         bool IsStackAddress(Node n, out int offset)

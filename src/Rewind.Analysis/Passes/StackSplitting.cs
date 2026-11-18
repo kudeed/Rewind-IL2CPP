@@ -177,7 +177,7 @@ public static class StackSplitting
         // A handler is entered from anywhere in its region: it sees what the region's blocks wrote, each write.
         var handlerOf = new Dictionary<Block, int>();
         foreach (var (gate, region) in fn.TryGates()) handlerOf[gate.Succs[0]] = region;
-        if (!fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0)) return 0;
+        if (!fn.Params.TryGetValue(fn.Regs.StackPointer, out Node? sp0)) return 0;
         bool IsStackAddress(Node n, out int offset)
         {
             offset = 0;

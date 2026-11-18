@@ -49,7 +49,7 @@ public sealed partial class HirBuilder
     private int? StackOffsetOf(Node n, int depth)
     {
         if (depth > 8) return null;
-        if (_fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0) && ReferenceEquals(n, sp0)) return 0;
+        if (_fn.Params.TryGetValue(_fn.Regs.StackPointer, out Node? sp0) && ReferenceEquals(n, sp0)) return 0;
         if (n.Op == Op.Add && n.In.Length == 2)
         {
             if (n.In[1].IsConst && StackOffsetOf(n.In[0], depth + 1) is int a) return a + (int)IrBuilder.SImm(n.In[1]);
@@ -776,11 +776,11 @@ public sealed partial class HirBuilder
                     break;
             }
 
-            if (p.Position < Win64Abi.RegisterSlots)
+            if (!_fn.Regs.IsStackPosition(p.Position))
             {
                 if (p.Pass == PassKind.Float)
                 {
-                    int lane0 = X64Lifter.VarXmm + p.Position * 4;
+                    int lane0 = _fn.Regs.FloatLane(_fn.Regs.FloatRegisterOf(p.Position), 0);
                     HExpr whole = ((SVal)sem).Expr;
                     if (p.IsDouble)
                     {
@@ -789,12 +789,12 @@ public sealed partial class HirBuilder
                     }
                     else if (_fn.Params.TryGetValue(lane0, out Node? lane)) _sem[lane] = sem;
                 }
-                else if (_fn.Params.TryGetValue(X64Lifter.IntArgRegs[p.Position], out Node? reg)) _sem[reg] = sem;
+                else if (_fn.Regs.IntRegisterOf(p.Position) is int ir and >= 0 && _fn.Params.TryGetValue(_fn.Regs.IntArgs[ir], out Node? reg)) _sem[reg] = sem;
             }
             else
             {
-                // Stack arguments sit above the return address and the 32-byte home area.
-                int offset = 8 + 8 * p.Position;
+                // Stack arguments sit above the return address and the 32-byte home area (Win64), at the entry stack pointer (AArch64).
+                int offset = _fn.Regs.StackOffsetOf(p.Position);
                 bool byValueStruct = sem is SVal { Expr: { } whole } && p.Pass != PassKind.Indirect && p.Type is { IsValueType: true } &&
                                      p.Type is not PrimitiveSig && p.Type.Definition is { IsEnum: false };
                 for (int part = 0; part < 8; part++)

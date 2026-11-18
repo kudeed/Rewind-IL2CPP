@@ -42,7 +42,7 @@ public sealed partial class HirBuilder
 
     private Sem ParamSem(Node n)
     {
-        if (n.Imm == X64Lifter.VarRsp) return new SFrame(0);
+        if (n.Imm == _fn.Regs.StackPointer) return new SFrame(0);
         return SJunk.Instance; // a register the calling convention gives no meaning on entry
     }
 

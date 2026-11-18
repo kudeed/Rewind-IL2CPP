@@ -26,7 +26,7 @@ public sealed class ProgramAnalysis
     public LayoutCalculator Layouts { get; }
     /// <summary>What lies where in the replicated memory of networked objects (Photon Fusion).</summary>
     public ReplicatedLayout Replicated { get; }
-    public Win64Abi Abi { get; }
+    public CallingConvention Abi { get; }
     public DefaultsTable Defaults { get; }
     public KlassLayout Klass { get; }
 
@@ -445,7 +445,7 @@ public sealed class ProgramAnalysis
         Context.InlineProvider = ShouldInline;
         Layouts = new LayoutCalculator(model);
         Replicated = new ReplicatedLayout(model);
-        Abi = new Win64Abi(model, Layouts);
+        Abi = CallingConvention.Of(model, Layouts);
         Defaults = DefaultsTable.Locate(model);
         Klass = KlassLayout.Measure(model);
         foreach (var (address, info) in helpers.ByAddress)
@@ -479,7 +479,7 @@ public sealed class ProgramAnalysis
         Context.InlineProvider = ShouldInline;
         Layouts = new LayoutCalculator(Model);
         Replicated = new ReplicatedLayout(Model);
-        Abi = new Win64Abi(Model, Layouts);
+        Abi = CallingConvention.Of(Model, Layouts);
         Defaults = source.Defaults;
         Klass = source.Klass;
         ForwardedMethods = source.ForwardedMethods;
@@ -534,7 +534,7 @@ public sealed class ProgramAnalysis
         }
     }
 
-    public X64Lifter NewLifter() => new(Context);
+    public IMachineLifter NewLifter() => Model.Image.Arch == Rewind.Binary.CpuArch.Arm64 ? new Arm64.A64Lifter(Context) : new X64Lifter(Context);
 
     public CallTarget Resolve(ulong address)
     {
@@ -612,8 +612,9 @@ public sealed class ProgramAnalysis
         return null;
     });
 
-    private static CallShape ShapeFrom(MethodAbi abi)
+    private CallShape ShapeFrom(MethodAbi abi)
     {
+        if (!Abi.Regs.SharedPositions) return SlotsFrom(abi, Abi.Regs);
         int count = abi.Params.Count;
         var shape = new CallShape
         {
@@ -634,12 +635,52 @@ public sealed class ProgramAnalysis
         ReturnKind.Void => CallReturn.Void,
         ReturnKind.Float => CallReturn.Float,
         ReturnKind.Double => CallReturn.Double,
+        ReturnKind.FloatAggregate => abi.ReturnIsDouble ? CallReturn.Double : CallReturn.Float,
+        // (AArch64 hands the buffer over in x8, which is no argument position, and returns nothing in x0.)
+        ReturnKind.Buffer when abi.ReturnBuffer is { Position: 8 } => CallReturn.Void,
         _ => CallReturn.Integer,
     };
+
+    /// <summary>The call slots of a method under a convention that counts register kinds separately (AArch64).</summary>
+    internal static CallShape SlotsFrom(MethodAbi abi, RegisterModel regs)
+    {
+        var slots = new List<ArgSlot>();
+        foreach (AbiParam p in abi.Params)
+        {
+            int registers = p.Pass is PassKind.IntegerPair or PassKind.FloatAggregate ? p.Count : 1;
+            if (regs.IsStackPosition(p.Position))
+            {
+                int first = regs.StackSlotOf(p.Position);
+                int count = p.Pass == PassKind.FloatAggregate || p.Pass == PassKind.IntegerPair ? (p.Size + 7) / 8 : 1;
+                for (int k = 0; k < count; k++) slots.Add(new ArgSlot(ArgSlotKind.Stack, first + k));
+                continue;
+            }
+            if (p.Pass is PassKind.Float or PassKind.FloatAggregate)
+            {
+                int v = regs.FloatRegisterOf(p.Position);
+                for (int k = 0; k < registers; k++)
+                {
+                    slots.Add(new ArgSlot(ArgSlotKind.FloatReg, (v + k) * 4));
+                    if (p.IsDouble) slots.Add(new ArgSlot(ArgSlotKind.FloatReg, (v + k) * 4 + 1));
+                }
+                continue;
+            }
+            int r = regs.IntRegisterOf(p.Position);
+            for (int k = 0; k < registers; k++) slots.Add(new ArgSlot(ArgSlotKind.IntReg, r + k));
+        }
+        return new CallShape
+        {
+            Count = abi.Params.Count, IsFloat = new bool[4], IsDouble = new bool[4], Returns = ReturnFrom(abi), Slots = slots,
+            IntResults = abi.Return == ReturnKind.StructInRegisterPair ? 2 : 1,
+            FloatResults = abi.Return == ReturnKind.FloatAggregate ? abi.ReturnCount : 1,
+        };
+    }
 
     private static bool SameShape(CallShape a, CallShape b)
     {
         if (a.Count != b.Count) return false;
+        if (a.Slots != null || b.Slots != null)
+            return a.Slots != null && b.Slots != null && a.Slots.SequenceEqual(b.Slots) && a.IntResults == b.IntResults && a.FloatResults == b.FloatResults;
         for (int i = 0; i < Math.Min(4, a.Count); i++)
             if (a.IsFloat[i] != b.IsFloat[i] || a.IsDouble[i] != b.IsDouble[i])
                 return false;
@@ -710,9 +751,40 @@ public sealed class ProgramAnalysis
             if (conflict) shape = null;
             // The implementation of an internal call takes no trailing MethodInfo.
             else if (shape != null && target.Forwarded && shape.Count > 0)
-                shape = new CallShape { Count = shape.Count - 1, IsFloat = shape.IsFloat, IsDouble = shape.IsDouble, Returns = shape.Returns };
+                shape = new CallShape
+                {
+                    Count = shape.Count - 1, IsFloat = shape.IsFloat, IsDouble = shape.IsDouble, Returns = shape.Returns,
+                    Slots = shape.Slots?.Take(shape.Slots.Count - 1).ToList(), IntResults = shape.IntResults, FloatResults = shape.FloatResults,
+                };
         }
+        if (shape != null && shape.Slots == null && !Abi.Regs.SharedPositions) shape = SeparateCounters(shape);
         _shapes[address] = shape;
         return shape;
+    }
+
+    /// <summary>
+    /// A shape made in one sequence of positions (a support function's C signature) for a convention that
+    /// counts integer and floating-point registers separately: the slots each argument takes there.
+    /// </summary>
+    private CallShape SeparateCounters(CallShape shape)
+    {
+        RegisterModel regs = Abi.Regs;
+        var slots = new List<ArgSlot>();
+        int ints = 0, floats = 0, stack = 0;
+        for (int i = 0; i < shape.Count; i++)
+        {
+            bool isFloat = i < shape.IsFloat.Length && shape.IsFloat[i];
+            bool isDouble = i < shape.IsDouble.Length && shape.IsDouble[i];
+            if (isFloat && floats < 8)
+            {
+                slots.Add(new ArgSlot(ArgSlotKind.FloatReg, floats * 4));
+                if (isDouble) slots.Add(new ArgSlot(ArgSlotKind.FloatReg, floats * 4 + 1));
+                floats++;
+            }
+            else if (!isFloat && ints < 8) slots.Add(new ArgSlot(ArgSlotKind.IntReg, ints++));
+            else slots.Add(new ArgSlot(ArgSlotKind.Stack, stack++));
+        }
+        _ = regs;
+        return new CallShape { Count = shape.Count, IsFloat = shape.IsFloat, IsDouble = shape.IsDouble, Returns = shape.Returns, Slots = slots };
     }
 }

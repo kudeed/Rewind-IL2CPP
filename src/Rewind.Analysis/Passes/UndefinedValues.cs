@@ -33,7 +33,7 @@ public static class UndefinedValues
             return answer;
         }
 
-        if (!fn.Params.TryGetValue(X64.X64Lifter.VarRsp, out Node? sp0)) return false;
+        if (!fn.Params.TryGetValue(fn.Regs.StackPointer, out Node? sp0)) return false;
         bool OnStack(Node address)
         {
             for (int depth = 0; depth < 4; depth++)

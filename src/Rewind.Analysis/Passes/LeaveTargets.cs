@@ -28,7 +28,7 @@ public static class LeaveTargets
 
     public static bool Run(Function fn)
     {
-        if (fn.TryRegions.Count == 0 || !fn.Params.ContainsKey(X64Lifter.VarRsp)) return false;
+        if (fn.TryRegions.Count == 0 || !fn.Params.ContainsKey(fn.Regs.StackPointer)) return false;
         bool changed = false;
         foreach (int counter in Counters(fn))
         {
@@ -125,7 +125,7 @@ public static class LeaveTargets
     /// <summary>The frame slots that count a stack of numbers: what indexes a read of an int from the frame.</summary>
     private static List<int> Counters(Function fn)
     {
-        Node sp0 = fn.Params[X64Lifter.VarRsp];
+        Node sp0 = fn.Params[fn.Regs.StackPointer];
         var counters = new List<int>();
         foreach (Block b in fn.Blocks)
             foreach (Node n in b.Nodes)
@@ -736,7 +736,7 @@ public static class LeaveTargets
 
     private static bool Resolve(Function fn, int counter)
     {
-        Node sp0 = fn.Params[X64Lifter.VarRsp];
+        Node sp0 = fn.Params[fn.Regs.StackPointer];
         var refused = new HashSet<(Block, Block)>();
         int most = fn.Blocks.Count + MaxAdded;
         for (int guard = 0; guard < 4 * MaxSplits; guard++)

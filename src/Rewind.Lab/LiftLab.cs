@@ -15,7 +15,7 @@ internal static class LiftLab
     {
         Dictionary<ulong, List<string>>? symbols = symbolsPath != null ? CallStats.LoadSymbols(model.Image, symbolsPath) : null;
         var context = new ModelCodeContext(model);
-        var lifter = new X64Lifter(context);
+        IMachineLifter lifter = model.Image.Arch == Rewind.Binary.CpuArch.Arm64 ? new Rewind.Analysis.Arm64.A64Lifter(context) : new X64Lifter(context);
         int shown = 0;
         foreach (MethodDef method in model.Methods)
         {
@@ -366,7 +366,7 @@ internal static class LiftLab
             foreach (var (address, info) in program.Helpers.ByAddress) symbols[address] = [info.Kind.ToString()];
         }
         Console.WriteLine($"helpers: {program.Helpers.ByAddress.Count}, default class slots: {program.Defaults.Slots.Count}");
-        X64Lifter lifter = program.NewLifter();
+        IMachineLifter lifter = program.NewLifter();
         var normalizer = new Rewind.Analysis.Recover.Normalizer(program);
         int shown = 0;
         foreach (MethodDef method in model.Methods)
@@ -406,7 +406,7 @@ internal static class LiftLab
     public static int Stats(Il2CppModel model)
     {
         var context = new ModelCodeContext(model);
-        var lifter = new X64Lifter(context);
+        IMachineLifter lifter = model.Image.Arch == Rewind.Binary.CpuArch.Arm64 ? new Rewind.Analysis.Arm64.A64Lifter(context) : new X64Lifter(context);
         var addresses = new HashSet<ulong>(model.MethodsByAddress.Keys);
         addresses.UnionWith(model.InstsByAddress.Keys);
 
@@ -443,7 +443,7 @@ internal static class LiftLab
         Console.WriteLine($"lifted {total} functions in {sw.ElapsedMilliseconds} ms: {clean} without problems ({100.0 * clean / Math.Max(1, total):F2}%), {crashed} crashed");
         Console.WriteLine($"{blocks:N0} blocks, {nodes:N0} nodes");
         Console.WriteLine("unsupported instructions:");
-        foreach (var (mnemonic, count) in lifter.Unsupported.OrderByDescending(kv => kv.Value).Take(60))
+        foreach (var (mnemonic, count) in lifter.UnsupportedCounts.OrderByDescending(kv => kv.Value).Take(60))
             Console.WriteLine($"  {count,8}  {mnemonic}");
         Console.WriteLine("problem kinds:");
         foreach (var (kind, count) in problemKinds.OrderByDescending(kv => kv.Value).Take(40))

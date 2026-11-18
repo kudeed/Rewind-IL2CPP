@@ -245,8 +245,8 @@ public sealed class RuntimeHelpers
         }
         else if (core.StartsWith("_Z", StringComparison.Ordinal))
         {
-            int paren = core.Length;
-            core = core[..paren];
+            // Itanium: the qualified name, innermost first like MSVC's ("Invoke@VirtualFuncInvoker0").
+            core = ItaniumNames.Core(core) ?? core;
         }
 
         // Invoker templates: Invoke@?$InterfaceFuncInvoker0@... (MSVC) or InterfaceFuncInvoker0<...>::Invoke (Itanium).

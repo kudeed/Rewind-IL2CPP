@@ -22,15 +22,16 @@ public sealed partial class HirBuilder
     }
 
     /// <summary>The value passed in argument position <paramref name="position"/> when it is an integer/pointer.</summary>
-    private static Node? IntAt(Node call, int position) =>
-        position < Win64Abi.RegisterSlots ? Input(call, ArgSlotKind.IntReg, position) : Input(call, ArgSlotKind.Stack, position - Win64Abi.RegisterSlots);
+    private Node? IntAt(Node call, int position) =>
+        _fn.Regs.IsStackPosition(position) ? Input(call, ArgSlotKind.Stack, _fn.Regs.StackSlotOf(position))
+        : _fn.Regs.IntRegisterOf(position) is int r and >= 0 ? Input(call, ArgSlotKind.IntReg, r) : null;
 
     private HExpr FloatAt(Node call, int position, bool isDouble)
     {
         TypeSig type = isDouble ? _double : _float;
-        if (position >= Win64Abi.RegisterSlots)
+        if (_fn.Regs.IsStackPosition(position))
         {
-            Node? slot = Input(call, ArgSlotKind.Stack, position - Win64Abi.RegisterSlots);
+            Node? slot = Input(call, ArgSlotKind.Stack, _fn.Regs.StackSlotOf(position));
             if (slot == null) return Missing(type);
             // A float occupies the low half of its stack slot. What fills the rest - what the slot held before,
             // or the widening of a value read as 32 bits - is not part of it and is not looked at.
@@ -44,10 +45,11 @@ public sealed partial class HirBuilder
             if (s is SVal v) return AsFloat(v.Expr, type);
             return AsFloat(Value(slot), type);
         }
-        Node? lo = Input(call, ArgSlotKind.FloatReg, position * 4);
+        int register = _fn.Regs.FloatRegisterOf(position);
+        Node? lo = Input(call, ArgSlotKind.FloatReg, register * 4);
         if (lo == null) return Missing(type);
         if (!isDouble) return AsFloat(FloatValue(lo), type);
-        Node? hi = Input(call, ArgSlotKind.FloatReg, position * 4 + 1);
+        Node? hi = Input(call, ArgSlotKind.FloatReg, register * 4 + 1);
         if (Eval(lo) is SHalf { High: false } l && hi != null && Eval(hi) is SHalf { High: true } h && ReferenceEquals(l.Whole, h.Whole))
             return l.Whole;
         if (Eval(lo) is SVal { Expr: HConst { Value: int low } } && hi != null && Eval(hi) is SVal { Expr: HConst { Value: int high } })
@@ -92,7 +94,7 @@ public sealed partial class HirBuilder
     private bool IsFrameAddress(Node n, out int offset)
     {
         offset = 0;
-        if (!_fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0)) return false;
+        if (!_fn.Params.TryGetValue(_fn.Regs.StackPointer, out Node? sp0)) return false;
         if (ReferenceEquals(n, sp0)) return true;
         if (n.Op == Op.Add && ReferenceEquals(n.In[0], sp0) && n.In[1].IsConst)
         {
@@ -189,7 +191,7 @@ public sealed partial class HirBuilder
                         offset = merged[0];
                     }
                     ArgSlot slot = info.Slots[i];
-                    int position = slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + Win64Abi.RegisterSlots : -1;
+                    int position = slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + _fn.Regs.FirstStackPosition : -1;
                     if (position < 0) continue;
                     TypeSig? type = null;
                     if (!info.Indirect)
@@ -521,7 +523,7 @@ public sealed partial class HirBuilder
         // itself.)
         bool own = _p.OwnTranslation && _p.Translations == 1;
         if (!own && !_p.CheckingCopies) return null;
-        for (int position = 0; position < Win64Abi.RegisterSlots; position++)
+        for (int position = 0; position < _fn.Regs.IntArgs.Length; position++)
         {
             if (IntAt(call, position) is not { } handed || Peek(handed) is not SMethod named) continue;
             MethodAbi abi = named.Inst != null ? _p.Abi.For(named.Inst) : _p.Abi.For(named.Method, [], []);

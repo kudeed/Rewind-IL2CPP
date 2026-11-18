@@ -24,7 +24,7 @@ public sealed class LiftedMethod
 public sealed class MethodPipeline
 {
     private readonly ProgramAnalysis _program;
-    private readonly X64Lifter _lifter;
+    private readonly IMachineLifter _lifter;
     private readonly Normalizer _normalizer;
 
     public MethodPipeline(ProgramAnalysis program) : this(program, forAccessors: false)
@@ -360,7 +360,7 @@ public sealed class MethodPipeline
         }
         CheckShape(fn, "parked addresses");
         ParkedAddresses.Canonicalize(fn);
-        Dictionary<int, int>? stackArguments = StackArguments(abi);
+        Dictionary<int, int>? stackArguments = StackArguments(abi, fn.Regs);
         List<FrameObject> frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, boxes), stackArguments);
         DeadCode.Run(fn);
         // A promoted slot that held a stack address turns what was read through it into direct stack accesses:
@@ -433,21 +433,21 @@ public sealed class MethodPipeline
     }
 
     /// <summary>The arguments a method is handed on the stack: where (from the entry stack pointer), and how many bytes of the slot they are.</summary>
-    private static Dictionary<int, int>? StackArguments(MethodAbi abi)
+    private static Dictionary<int, int>? StackArguments(MethodAbi abi, RegisterModel regs)
     {
         if (!abi.Known) return null;
         Dictionary<int, int>? result = null;
         foreach (AbiParam p in abi.Params)
         {
-            if (p.Role != ParamRole.Argument || p.Position < Win64Abi.RegisterSlots) continue;
+            if (p.Role != ParamRole.Argument || !regs.IsStackPosition(p.Position)) continue;
             int bytes = p.Pass switch
             {
                 PassKind.Indirect => 8,
                 PassKind.Float => p.IsDouble ? 8 : 4,
                 _ => p.Size is 1 or 2 or 4 or 8 ? p.Size : 8,
             };
-            // (Above the return address and the four slots kept for the arguments that come in registers.)
-            (result ??= [])[8 + 8 * p.Position] = bytes;
+            // (Win64: above the return address and the four slots kept for the arguments that come in registers.)
+            (result ??= [])[regs.StackOffsetOf(p.Position)] = bytes;
         }
         return result;
     }
@@ -907,7 +907,7 @@ public sealed class MethodPipeline
                 int extent = EscapeExtent(call, input, fn, boxes, current);
                 if (extent > 0 || extent == StackPromotion.NotTaken || NoAssumedReach || call.Aux is not CallInfo { Indirect: true } ||
                     current.ChosenCalls.ContainsKey(call)) return extent;
-                if (!fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0) || StackOffset(sp0, call.In[input]) is not int at) return extent;
+                if (!fn.Params.TryGetValue(fn.Regs.StackPointer, out Node? sp0) || StackOffset(sp0, call.In[input]) is not int at) return extent;
                 int reach = current.ReachThrough(at);
                 if (reach <= 0) return extent;
                 assumed.Add((call, input, reach));
@@ -919,7 +919,7 @@ public sealed class MethodPipeline
                 break;
             Dictionary<int, int> after = InPlaceBoxes(fn);
             ParkedAddresses.Canonicalize(fn);
-            lifted.Frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, after, current), StackArguments(lifted.Abi),
+            lifted.Frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, after, current), StackArguments(lifted.Abi, fn.Regs),
                 (call, input) => TakesLowHalf(current, call, input));
             DeadCode.Run(fn);
             _normalizer.Cleanup(fn);
@@ -1181,7 +1181,7 @@ public sealed class MethodPipeline
     private Dictionary<int, int> InPlaceBoxes(Function fn)
     {
         var boxes = new Dictionary<int, int>();
-        if (!fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0)) return boxes;
+        if (!fn.Params.TryGetValue(fn.Regs.StackPointer, out Node? sp0)) return boxes;
         int header = 2 * _program.Model.Image.PointerSize;
         foreach (Block b in fn.Blocks)
             foreach (Node n in b.Nodes)
@@ -1265,23 +1265,32 @@ public sealed class MethodPipeline
         {
             if (fn.Params.TryGetValue(variable, out Node? entry)) leftovers.Add(entry);
         }
-        Add(0);   // rax
-        Add(10);  // r10
-        Add(11);  // r11
+        RegisterModel regs = fn.Regs;
+        if (regs.SharedPositions)
+        {
+            Add(0);   // rax
+            Add(10);  // r10
+            Add(11);  // r11
+        }
+        else
+        {
+            for (int r = 9; r <= 18; r++) Add(r); // x9-x18: scratch
+            Add(30);                              // the link register: the return address, never a value
+        }
         // What the caller left in a register this method must preserve means nothing to the method itself: it
         // is only saved and put back. Writing one byte of such a register ("mov bl, [rcx+18h]") keeps the caller's
         // other seven, which no one reads.
         if (!NoSavedLeftovers)
-            foreach (int saved in X64Lifter.CalleeSaved)
-                if (saved != X64Lifter.VarRsp)
+            foreach (int saved in regs.CalleeSaved)
+                if (saved != regs.StackPointer)
                     Add(saved);
         if (abi.Known)
         {
             var taken = new HashSet<int>();
             foreach (AbiParam p in abi.Params)
-                if (p.Pass != PassKind.Float) taken.Add(p.Position);
-            for (int position = 0; position < X64Lifter.IntArgRegs.Length; position++)
-                if (!taken.Contains(position)) Add(X64Lifter.IntArgRegs[position]);
+                if (p.Pass != PassKind.Float && regs.IntRegisterOf(p.Position) is int r and >= 0) taken.Add(r);
+            for (int position = 0; position < regs.IntArgs.Length; position++)
+                if (!taken.Contains(position)) Add(regs.IntArgs[position]);
         }
         return leftovers.Contains;
     }
@@ -1301,7 +1310,7 @@ public sealed class MethodPipeline
     private int EscapeExtent(Node call, int inputIndex, Function fn, Dictionary<int, int> boxes)
     {
         int extent = EscapeExtent(call, inputIndex, out bool asObject);
-        if (extent > 0 || !asObject || boxes.Count == 0 || !fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0)) return extent;
+        if (extent > 0 || !asObject || boxes.Count == 0 || !fn.Params.TryGetValue(fn.Regs.StackPointer, out Node? sp0)) return extent;
         // A stack address where an object is expected: the value boxed in place there.
         return StackOffset(sp0, call.In[inputIndex]) is int at && boxes.TryGetValue(at, out int box) ? box : -1;
     }
@@ -1413,7 +1422,7 @@ public sealed class MethodPipeline
         if (size > 0) return size;
         bool asObject = p.Role is ParamRole.This or ParamRole.Argument && p.Pass == PassKind.Integer &&
                         p.Type is { IsValueType: false } and not ByRefSig and not PointerSig && !p.Type.ContainsGenericParameter;
-        if (asObject && fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0) && StackOffset(sp0, call.In[inputIndex]) is int at &&
+        if (asObject && fn.Params.TryGetValue(fn.Regs.StackPointer, out Node? sp0) && StackOffset(sp0, call.In[inputIndex]) is int at &&
             boxes.TryGetValue(at, out int box))
             return box;
         return -1;

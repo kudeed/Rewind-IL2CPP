@@ -40,8 +40,8 @@ public static class HelperDiscovery
     {
         var context = new ModelCodeContext(model);
         NativeImage image = model.Image;
-        if (image.Arch != CpuArch.X64)
-            return new DiscoveredHelpers(new RuntimeHelpers(), context, "none (machine code analysis supports x64 only so far)", 0, false);
+        if (image.Arch is not (CpuArch.X64 or CpuArch.Arm64))
+            return new DiscoveredHelpers(new RuntimeHelpers(), context, "none (machine code analysis supports x64 and ARM64 only so far)", 0, false);
 
         context.DiscoverCallTargets();
         var index = new CodeIndex(context);
@@ -82,6 +82,14 @@ public static class HelperDiscovery
             if (exact && kinds >= 20) break;
         }
         if (best == null) return new DiscoveredHelpers(new RuntimeHelpers(), context, "none (no signature library for this platform)", 0, false);
+        // Imported C library functions (memcpy, sinf, ...) are called through stubs that name them.
+        if (image is ElfImage elf)
+        {
+            foreach (var (stub, name) in elf.ImportStubs)
+                if (best.Helpers.At(stub) == null && RuntimeHelpers.Classify(name) is { } imported)
+                    best.Helpers.Add(stub, imported);
+            best = best with { Kinds = best.Helpers.ByAddress.Values.Select(i => i.Kind).Distinct().Count() };
+        }
         // What no library recognized, the compiled methods may show by the way they call it.
         if (HelperRoles.Identify(model, context, index, best.Helpers) is { } found)
         {

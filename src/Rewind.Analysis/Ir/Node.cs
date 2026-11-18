@@ -104,6 +104,8 @@ public enum IdiomKind
 public static class CallResult
 {
     public const int IntReturn = 0, FloatLane0 = 1, FloatLane1 = 2, FloatLane2 = 3, FloatLane3 = 4;
+    /// <summary>AArch64: the second integer return register (x1), and lanes 0-1 of v1-v3 (HFA members).</summary>
+    public const int IntReturn2 = 5, Float1Lane0 = 6, Float1Lane1 = 7, Float2Lane0 = 8, Float2Lane1 = 9, Float3Lane0 = 10, Float3Lane1 = 11;
 }
 
 /// <summary>Extra data attached to a Call or TailCall node.</summary>
@@ -242,6 +244,8 @@ public sealed class Function
 
     public static bool IsTryEntry(Node n) => n.Op == Op.Idiom && n.Imm == (long)IdiomKind.TryEntry && n.Aux is int;
     public Block Entry => Blocks[0];
+    /// <summary>How the lifter numbered the registers (Params keys) and where the calling convention puts arguments.</summary>
+    public RegisterModel Regs = RegisterModel.Win64;
     public int NextId;
     public List<string> Problems = [];
 
