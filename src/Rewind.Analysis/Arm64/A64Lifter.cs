@@ -770,7 +770,7 @@ public sealed partial class A64Lifter : IMachineLifter
 
     private void Unknown(in A64Instruction i, string? what = null)
     {
-        string key = what ?? i.Op.ToString();
+        string key = what ?? (i.Op == A64Op.Vector ? "Vector: " + A64Decoder.VectorClass(i.Word) : i.Op.ToString());
         _unsupported[key] = _unsupported.GetValueOrDefault(key) + 1;
         throw new NotSupportedException($"instruction not modelled (0x{i.Word:X8})");
     }

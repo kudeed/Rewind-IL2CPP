@@ -52,6 +52,19 @@ public sealed class RegisterModel
     /// <summary>Stack slot index (CallInfo slot index) of a stack position.</summary>
     public int StackSlotOf(int position) => position - FirstStackPosition;
 
+    /// <summary>The position of an integer register or stack slot a call argument came from (-1 for others).</summary>
+    public int IntPositionOfSlot(ArgSlot slot) => slot.Kind switch
+    {
+        ArgSlotKind.IntReg => slot.Index,
+        ArgSlotKind.Stack => FirstStackPosition + slot.Index,
+        _ => -1,
+    };
+
+    /// <summary>The position of a call argument's slot, floating-point registers included (-1 for the target).</summary>
+    public int PositionOfSlot(ArgSlot slot) => slot.Kind == ArgSlotKind.FloatReg
+        ? (SharedPositions ? slot.Index / 4 : FirstFloatPosition + slot.Index / 4)
+        : IntPositionOfSlot(slot);
+
     /// <summary>Offset from the entry stack pointer of a stack position's slot.</summary>
     public int StackOffsetOf(int position) => StackArgBase + 8 * (position - FirstStackPosition);
 

@@ -1123,7 +1123,7 @@ public sealed class MethodPipeline
         {
             if (!ReferenceEquals(call.In[i], value)) continue;
             ArgSlot slot = info.Slots[i];
-            int position = slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + 4 : -1;
+            int position = _program.Abi.Regs.IntPositionOfSlot(slot);
             if (position < 0) return 64;
             void Consider(MethodAbi abi)
             {
@@ -1160,7 +1160,7 @@ public sealed class MethodPipeline
         if (BlockCopies.Access(call, inputIndex, _program.Helpers, out _, out bool blockReads, out _)) return !blockReads;
         if (call.Aux is not CallInfo info || info.Indirect || info.Intrinsic != null || inputIndex >= info.Slots.Count) return false;
         ArgSlot slot = info.Slots[inputIndex];
-        int position = slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + 4 : -1;
+        int position = _program.Abi.Regs.IntPositionOfSlot(slot);
         if (position < 0) return false;
         CallTarget target = _program.Resolve(info.Target);
         if (target.Helper != null || !target.IsManaged) return false;
@@ -1267,6 +1267,7 @@ public sealed class MethodPipeline
                 if (!target.IsManaged || target.Helper != null || target.Forwarded) continue;
                 var integer = new HashSet<int>();
                 var floating = new HashSet<int>();
+                var exact = new HashSet<ArgSlot>();
                 bool unknown = false;
                 void Consider(MethodAbi abi)
                 {
@@ -1275,6 +1276,8 @@ public sealed class MethodPipeline
                         unknown = true;
                         return;
                     }
+                    // (Where integer and floating-point registers are counted apart, the slots each parameter takes.)
+                    if (!fn.Regs.SharedPositions && ProgramAnalysis.SlotsFrom(abi, fn.Regs).Slots is { } taken) exact.UnionWith(taken);
                     foreach (AbiParam p in abi.Params) (p.Pass == PassKind.Float ? floating : integer).Add(p.Position);
                 }
                 foreach (MethodDef m in target.Methods) Consider(_program.Abi.For(m, [], []));
@@ -1286,7 +1289,7 @@ public sealed class MethodPipeline
                 for (int i = 0; i < call.In.Length; i++)
                 {
                     ArgSlot slot = info.Slots[i];
-                    bool taken = slot.Kind switch
+                    bool taken = !fn.Regs.SharedPositions ? slot.Kind == ArgSlotKind.Target || exact.Contains(slot) : slot.Kind switch
                     {
                         ArgSlotKind.IntReg => integer.Contains(slot.Index),
                         ArgSlotKind.Stack => integer.Contains(slot.Index + 4) || floating.Contains(slot.Index + 4),
@@ -1375,14 +1378,14 @@ public sealed class MethodPipeline
     /// exact where the call's target alone names several methods sharing one body. False when the call was not
     /// resolved that way; a null parameter means the method takes nothing in that position.
     /// </summary>
-    private static bool Chosen(HirBuilder built, Node call, int inputIndex, out MethodDef method, out MethodAbi abi, out AbiParam? parameter)
+    private bool Chosen(HirBuilder built, Node call, int inputIndex, out MethodDef method, out MethodAbi abi, out AbiParam? parameter)
     {
         method = null!;
         abi = null!;
         parameter = null;
         if (!built.ChosenCalls.TryGetValue(call, out var chosen) || call.Aux is not CallInfo info || inputIndex >= info.Slots.Count) return false;
         ArgSlot slot = info.Slots[inputIndex];
-        int position = slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + 4 : -1;
+        int position = _program.Abi.Regs.IntPositionOfSlot(slot);
         if (position < 0) return false;
         method = chosen.Method;
         abi = chosen.Abi;
@@ -1395,7 +1398,7 @@ public sealed class MethodPipeline
         return true;
     }
 
-    private static int Position(ArgSlot slot) => slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + 4 : -1;
+    private int Position(ArgSlot slot) => _program.Abi.Regs.IntPositionOfSlot(slot);
 
     /// <summary>The call takes a value of four bytes or fewer in that input (an int, a float, a small struct): the bottom half of the slot.</summary>
     private bool TakesLowHalf(HirBuilder built, Node call, int inputIndex)
@@ -1455,7 +1458,7 @@ public sealed class MethodPipeline
             if (!NoUntakenInputs && built.ChosenCalls.TryGetValue(call, out var chosen) && call.Aux is CallInfo info && inputIndex < info.Slots.Count)
             {
                 ArgSlot slot = info.Slots[inputIndex];
-                int position = slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + 4 : -1;
+                int position = _program.Abi.Regs.IntPositionOfSlot(slot);
                 int last = -1;
                 foreach (AbiParam taken in chosen.Abi.Params)
                     if (chosen.Shift == 0 || taken.Role != ParamRole.MethodInfo)
@@ -1496,7 +1499,7 @@ public sealed class MethodPipeline
         if (call.Aux is not CallInfo info || info.Indirect || info.Intrinsic != null) return -1;
         if (inputIndex >= info.Slots.Count) return -1;
         ArgSlot slot = info.Slots[inputIndex];
-        int position = slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + 4 : -1;
+        int position = _program.Abi.Regs.IntPositionOfSlot(slot);
         if (position < 0) return -1;
 
         CallTarget target = _program.Resolve(info.Target);

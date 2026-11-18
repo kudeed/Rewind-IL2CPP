@@ -265,6 +265,7 @@ public sealed class DefaultsTable
     {
         var table = new DefaultsTable();
         NativeImage image = model.Image;
+        if (image.Arch == CpuArch.Arm64) return LocateArm64(model, table);
         if (image.Arch != CpuArch.X64) return table;
 
         var managed = new HashSet<ulong>(model.MethodsByAddress.Keys);
@@ -314,6 +315,65 @@ public sealed class DefaultsTable
             }
         }
         _ = managed;
+        return table;
+    }
+
+    /// <summary>
+    /// The same for AArch64: "adrp/add x1, namespace; adrp/add x2, name; bl Class::FromName; str x0, [base, #slot]",
+    /// with the addresses the registers hold followed through ADRP, ADD and loads from the GOT.
+    /// </summary>
+    private static DefaultsTable LocateArm64(Il2CppModel model, DefaultsTable table)
+    {
+        NativeImage image = model.Image;
+        foreach (ImageSection section in image.Sections)
+        {
+            if (!section.IsExecutable || section.Name == "il2cpp" || !image.IsMapped(section.Va)) continue;
+            var constant = new ulong?[32];
+            string? pendingNs = null, pendingName = null;
+            int sinceCall = int.MaxValue;
+            for (ulong at = section.Va; at + 4 <= section.End && image.IsMapped(at, 4); at += 4)
+            {
+                Arm64.A64Instruction ins = Arm64.A64Decoder.Decode(image.U32(at), at);
+                if (sinceCall != int.MaxValue) sinceCall++;
+                switch (ins.Op)
+                {
+                    case Arm64.A64Op.Adrp or Arm64.A64Op.Adr:
+                        constant[ins.Rd] = ins.Target;
+                        continue;
+                    case Arm64.A64Op.AddImm when !ins.SetFlags && ins.Rn < 31 && ins.Rd < 31 && constant[ins.Rn] is ulong page:
+                        constant[ins.Rd] = page + (ulong)ins.Imm;
+                        continue;
+                    case Arm64.A64Op.Ldr when !ins.Vector && ins.Size == 8 && ins.Mode == Arm64.A64Mode.Offset && ins.Rn < 31 && ins.Rd < 31 &&
+                                               constant[ins.Rn] is ulong got && image.IsReadOnlyAfterLoad(got + (ulong)ins.Imm):
+                        constant[ins.Rd] = image.U64(got + (ulong)ins.Imm);
+                        continue;
+                    case Arm64.A64Op.Bl or Arm64.A64Op.Blr:
+                    {
+                        string? ns = constant[1] is ulong n ? ReadIdentifier(image, n) : null;
+                        string? name = constant[2] is ulong m ? ReadIdentifier(image, m) : null;
+                        (pendingNs, pendingName) = (ns, name);
+                        sinceCall = 0;
+                        for (int r = 0; r <= 18; r++) constant[r] = null;
+                        constant[30] = null;
+                        continue;
+                    }
+                    case Arm64.A64Op.Str when !ins.Vector && ins.Size == 8 && ins.Rd == 0 && ins.Mode == Arm64.A64Mode.Offset && ins.Rn < 31 &&
+                                               constant[ins.Rn] is ulong baseAddress && sinceCall <= 3 && pendingNs != null && pendingName != null:
+                    {
+                        TypeDef? type = model.FindType(pendingNs.Length == 0 ? pendingName : pendingNs + "." + pendingName);
+                        ulong slot = baseAddress + (ulong)ins.Imm;
+                        if (type != null && image.SectionAt(slot) is { IsWritable: true }) table.Slots.TryAdd(slot, type);
+                        pendingNs = pendingName = null;
+                        continue;
+                    }
+                    case Arm64.A64Op.B or Arm64.A64Op.Br or Arm64.A64Op.Ret:
+                        Array.Clear(constant);
+                        continue;
+                }
+                for (byte r = 0; r < 31; r++)
+                    if (constant[r] != null && Arm64.A64Cfg.Writes(ins, r)) constant[r] = null;
+            }
+        }
         return table;
     }
 

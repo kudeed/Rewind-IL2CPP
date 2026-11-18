@@ -909,7 +909,8 @@ public sealed partial class Normalizer(ProgramAnalysis program)
                     // point register of its position, by its type. The other register of a position holds leftovers.
                     bool IsFloating(int position) => position >= 1 && position <= method.Parameters.Length &&
                         method.Parameters[position - 1].Type is PrimitiveSig { Element: Rewind.Runtime.Il2CppTypeEnum.R4 or Rewind.Runtime.Il2CppTypeEnum.R8 };
-                    bool compared = a.Kind switch
+                    // (Where integer and floating-point registers are counted apart, every slot is compared.)
+                    bool compared = !_fn.Regs.SharedPositions ? a.Kind != ArgSlotKind.Target : a.Kind switch
                     {
                         ArgSlotKind.IntReg => a.Index < positions && !IsFloating(a.Index),
                         ArgSlotKind.FloatReg => a.Index / 4 < positions && IsFloating(a.Index / 4),

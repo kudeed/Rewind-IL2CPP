@@ -732,6 +732,28 @@ public static class A64Decoder
         };
     }
 
+    /// <summary>Which class of SIMD instruction an encoding the decoder leaves as <see cref="A64Op.Vector"/> is (for statistics).</summary>
+    public static string VectorClass(uint w)
+    {
+        if ((w & 0xBF000000) == 0x0C000000 || (w & 0xBF000000) == 0x0D000000) return (Bit(w, 22) ? "ld" : "st") + (Bit(w, 24) ? " single structure" : " multiple structures");
+        if ((w & 0x9F200400) == 0x0E200400) return $"three same U{Bits(w, 29, 29)} size{Bits(w, 23, 22)} op{Bits(w, 15, 11):X}";
+        if ((w & 0x9F3E0C00) == 0x0E200800) return $"two-reg misc U{Bits(w, 29, 29)} size{Bits(w, 23, 22)} op{Bits(w, 16, 12):X}";
+        if ((w & 0x9F3E0C00) == 0x0E300800) return $"across lanes U{Bits(w, 29, 29)} op{Bits(w, 16, 12):X}";
+        if ((w & 0xBF208C00) == 0x0E000800) return $"permute op{Bits(w, 14, 12)}";
+        if ((w & 0xBF208400) == 0x2E000000) return "ext";
+        if ((w & 0xBF208C00) == 0x0E000000) return "table lookup";
+        if ((w & 0x9F800400) == 0x0F000400) return $"shift by immediate U{Bits(w, 29, 29)} op{Bits(w, 15, 11):X}";
+        if ((w & 0x9F200400) == 0x0E200000) return $"three different U{Bits(w, 29, 29)} op{Bits(w, 15, 12):X}";
+        if ((w & 0x9F000400) == 0x0F000000) return $"by element U{Bits(w, 29, 29)} op{Bits(w, 15, 12):X}";
+        if ((w & 0xDF3E0C00) == 0x5E300800) return $"scalar pairwise U{Bits(w, 29, 29)} op{Bits(w, 16, 12):X}";
+        if ((w & 0xDF200400) == 0x5E200400) return $"scalar three same U{Bits(w, 29, 29)} op{Bits(w, 15, 11):X}";
+        if ((w & 0xDF3E0C00) == 0x5E200800) return $"scalar two-reg misc U{Bits(w, 29, 29)} op{Bits(w, 16, 12):X}";
+        if ((w & 0xDF800400) == 0x5F000400) return $"scalar shift by immediate U{Bits(w, 29, 29)} op{Bits(w, 15, 11):X}";
+        if ((w & 0xDF000400) == 0x5F000000) return $"scalar by element op{Bits(w, 15, 12):X}";
+        if ((w & 0x9FF80400) == 0x0F000400) return "modified immediate (orr/bic)";
+        return $"other 0x{w:X8}";
+    }
+
     private static void Advanced(uint w, ref A64Instruction i)
     {
         bool q = Bit(w, 30);
