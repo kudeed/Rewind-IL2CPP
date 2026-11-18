@@ -317,6 +317,10 @@ public sealed class A64Cfg
         if (reg >= 31) return false;
         switch (i.Op)
         {
+            case A64Op.St1Lane:
+                return i.Mode == A64Mode.PostIndex && i.Rn == reg;
+            case A64Op.Ld1Lane or A64Op.Ld1R:
+                return i.Mode == A64Mode.PostIndex && i.Rn == reg;
             case A64Op.Str or A64Op.Stp or A64Op.Stlr or A64Op.Prfm or A64Op.Nop or A64Op.Barrier or A64Op.B or A64Op.BCond or A64Op.Cbz or A64Op.Cbnz
                 or A64Op.Tbz or A64Op.Tbnz or A64Op.Br or A64Op.Ret or A64Op.Brk or A64Op.Udf or A64Op.Hlt or A64Op.Clrex or A64Op.Msr:
                 return (i.Op is A64Op.Str or A64Op.Stp && i.Mode is A64Mode.PreIndex or A64Mode.PostIndex && i.Rn == reg);
@@ -339,5 +343,6 @@ public sealed class A64Cfg
         or A64Op.FAbs or A64Op.FNeg or A64Op.FSqrt or A64Op.FCvt or A64Op.FRint or A64Op.FAdd or A64Op.FSub or A64Op.FMul or A64Op.FDiv
         or A64Op.FMax or A64Op.FMin or A64Op.FMaxNm or A64Op.FMinNm or A64Op.FNMul or A64Op.FMAdd or A64Op.FMSub or A64Op.FNMAdd or A64Op.FNMSub
         or A64Op.FCsel or A64Op.Scvtf or A64Op.Ucvtf or A64Op.Movi or A64Op.VMov or A64Op.Dup or A64Op.DupScalar or A64Op.DupGp or A64Op.Ins
-        or A64Op.InsGp or A64Op.VAnd or A64Op.VOrr or A64Op.VEor or A64Op.VBic or A64Op.VFAdd or A64Op.VFSub or A64Op.VFMul or A64Op.VFDiv or A64Op.Vector;
+        or A64Op.InsGp or A64Op.VAnd or A64Op.VOrr or A64Op.VEor or A64Op.VBic or A64Op.VFAdd or A64Op.VFSub or A64Op.VFMul or A64Op.VFDiv or A64Op.Vector
+        or A64Op.VecOp or A64Op.Ld1Lane or A64Op.Ld1R;
 }

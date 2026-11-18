@@ -267,6 +267,19 @@ public sealed partial class A64Lifter
                 }
         }
 
+        // Code reached neither from the entry nor from a landing pad - the ways the settled tests leave - is gone.
+        var live = new HashSet<Block>();
+        var walk = new Stack<Block>();
+        walk.Push(_fn.Blocks[0]);
+        for (int t = 0; t < count; t++) walk.Push(blockAt[pads[primary[t]]]);
+        while (walk.Count > 0)
+        {
+            Block b = walk.Pop();
+            if (dropped.Contains(b) || !live.Add(b)) continue;
+            foreach (Block s in b.Succs) walk.Push(s);
+        }
+        foreach (Block b in _fn.Blocks)
+            if (!live.Contains(b)) dropped.Add(b);
         var parentBlocks = _fn.Blocks.Where(b => !dropped.Contains(b)).ToList();
 
         // The handlers: from each landing pad up to where it ends the catch.

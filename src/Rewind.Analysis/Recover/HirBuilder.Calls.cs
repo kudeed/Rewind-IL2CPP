@@ -587,6 +587,22 @@ public sealed partial class HirBuilder
     private void EmitIntrinsic(Node call, CallInfo info)
     {
         if (TryEmitBlockOp(call)) return;
+        // A rounding the machine does in one instruction (AArch64's FRINT*): the Math method of that name.
+        if (info.Intrinsic!.StartsWith("math.", StringComparison.Ordinal) && call.In.Length == 1 && call.Type is VT.F32 or VT.F64)
+        {
+            bool isDouble = call.Type == VT.F64;
+            HExpr operand = AsFloat(FloatValue(call.In[0]), isDouble ? _double : _float);
+            HExpr rounded = MathCall(info.Intrinsic[5..], isDouble, operand);
+            if (!IsUsed(call)) Emit(new HEval(rounded), call.Addr);
+            else if (_materialize.Contains(call))
+            {
+                HVar t = Temp(isDouble ? _double : _float, call.Type);
+                Emit(new HAssign(new HLocal(t) { Type = t.Type }, rounded), call.Addr);
+                _sem[call] = new SVal(new HLocal(t) { Type = t.Type });
+            }
+            else _sem[call] = new SVal(rounded);
+            return;
+        }
         HExpr[] args = call.In.Select(Value).ToArray();
         var expr = new HOpaque(info.Intrinsic!, args) { Type = TypeForBits(call.Type) };
         if (info.Intrinsic == "memory_barrier") return; // volatile access marker

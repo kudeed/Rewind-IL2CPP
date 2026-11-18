@@ -5,7 +5,7 @@ namespace Rewind.Analysis.Arm64;
 /// system hints and barriers, scalar floating point and the SIMD moves compilers use for copies and scalars;
 /// anything else valid comes out as <see cref="A64Op.Unknown"/> or <see cref="A64Op.Vector"/>.
 /// </summary>
-public static class A64Decoder
+public static partial class A64Decoder
 {
     private static uint Bits(uint w, int hi, int lo) => (w >> lo) & ((1u << (hi - lo + 1)) - 1);
     private static bool Bit(uint w, int b) => ((w >> b) & 1) != 0;
@@ -347,7 +347,11 @@ public static class A64Decoder
         bool registerOffset = (w & 0x3B200C00) == 0x38200800;
         if (!unsignedOffset && !other && !registerOffset)
         {
-            if ((w & 0xBF000000) == 0x0C000000 || (w & 0xBF000000) == 0x0D000000) i.Op = A64Op.Vector; // SIMD structure loads/stores
+            if ((w & 0xBF000000) == 0x0C000000 || (w & 0xBF000000) == 0x0D000000)
+            {
+                // SIMD structure loads/stores
+                if (!DecodeStructure(w, ref i)) i.Op = A64Op.Vector;
+            }
             return;
         }
         uint kind = Bits(w, 23, 22);
@@ -802,6 +806,7 @@ public static class A64Decoder
             i.Imm2 = q ? 1 : 0;
             return;
         }
+        if (DecodeVec(w, ref i)) return;
         if ((w & 0xFFE0FC00) == 0x5E000400)
         {
             // DUP (element), scalar: "mov s0, v1.s[1]"

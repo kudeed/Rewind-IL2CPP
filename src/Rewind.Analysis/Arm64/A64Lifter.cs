@@ -1140,13 +1140,35 @@ public sealed partial class A64Lifter : IMachineLifter
             case A64Op.FCvtToInt:
             {
                 if (i.FpSize == 2) Unknown(i, "FCvtToInt (half)");
-                if ((A64Rounding)i.Imm != A64Rounding.Zero) Unknown(i, "FCvtToInt (" + (A64Rounding)i.Imm + ")");
                 Node a = Fp(i.Rn, i.FpSize);
+                // Converting with a rounding of its own: rounding to an integral value first, then the conversion.
+                if ((A64Rounding)i.Imm != A64Rounding.Zero)
+                {
+                    if (RoundingName((A64Rounding)i.Imm) is not { } rounding) Unknown(i, "FCvtToInt (" + (A64Rounding)i.Imm + ")");
+                    else a = Intrinsic("math." + rounding, a.Type, a);
+                }
                 SetR(i.Rd, i.Is64, _b.Raw(i.Signed ? Op.FToSInt : Op.FToUInt, t, a));
+                return;
+            }
+            case A64Op.FRint:
+            {
+                if (i.FpSize == 2 || RoundingName((A64Rounding)i.Imm) is not { } rounding)
+                {
+                    Unknown(i, "FRint (" + (A64Rounding)i.Imm + ")");
+                    return;
+                }
+                Node a = Fp(i.Rn, i.FpSize);
+                SetFp(i.Rd, Intrinsic("math." + rounding, a.Type, a));
                 return;
             }
 
             // ---- SIMD
+            case A64Op.VecOp:
+                LiftVec(i);
+                return;
+            case A64Op.Ld1Lane or A64Op.St1Lane or A64Op.Ld1R:
+                LiftLaneAccess(i);
+                return;
             case A64Op.Movi:
             {
                 ulong pattern = i.Target;
@@ -1204,59 +1226,26 @@ public sealed partial class A64Lifter : IMachineLifter
             }
             case A64Op.DupScalar:
             {
-                if (i.ElemSize == 4) SetScalarBits(i.Rd, Lane(i.Rn, (int)i.Imm), 4);
-                else if (i.ElemSize == 8) SetScalarBits(i.Rd, Qword(i.Rn, (int)i.Imm), 8);
-                else Unknown(i, "DupScalar (small)");
+                Node e = Elem(i.Rn, i.ElemSize, (int)i.Imm);
+                SetScalarBits(i.Rd, i.ElemSize < 4 ? _b.ZExt(e, VT.I32) : e, i.ElemSize == 8 ? 8 : 4);
                 return;
             }
-            case A64Op.Dup:
+            case A64Op.Dup or A64Op.DupGp:
             {
                 bool q = (i.Imm2 & 1) != 0;
-                if (i.ElemSize == 4)
-                {
-                    Node e = Lane(i.Rn, (int)i.Imm);
-                    for (int lane = 0; lane < 4; lane++) SetLane(i.Rd, lane, !q && lane >= 2 ? ZeroLane() : e);
-                }
-                else if (i.ElemSize == 8 && q)
-                {
-                    Node e = Qword(i.Rn, (int)i.Imm);
-                    SetQword(i.Rd, 0, e);
-                    SetQword(i.Rd, 1, e);
-                }
-                else Unknown(i, "Dup (small)");
-                return;
-            }
-            case A64Op.DupGp:
-            {
-                bool q = (i.Imm2 & 1) != 0;
-                if (i.ElemSize == 4)
-                {
-                    Node e = R(i.Rn, false);
-                    for (int lane = 0; lane < 4; lane++) SetLane(i.Rd, lane, !q && lane >= 2 ? ZeroLane() : e);
-                }
-                else if (i.ElemSize == 8 && q)
-                {
-                    Node e = X(i.Rn);
-                    SetQword(i.Rd, 0, e);
-                    SetQword(i.Rd, 1, e);
-                }
-                else Unknown(i, "DupGp (small)");
+                if (i.ElemSize == 8 && !q) { Unknown(i, i.Op + " (64-bit, 8 bytes)"); return; }
+                Node e = i.Op == A64Op.Dup ? Elem(i.Rn, i.ElemSize, (int)i.Imm) : _b.Trunc(X(i.Rn), ElemType(i.ElemSize));
+                var all = new Node?[(q ? 16 : 8) / i.ElemSize];
+                for (int k = 0; k < all.Length; k++) all[k] = e;
+                SetElems(i.Rd, i.ElemSize, all);
                 return;
             }
             case A64Op.Ins:
-            {
-                if (i.ElemSize == 4) SetLane(i.Rd, (int)i.Imm, Lane(i.Rn, (int)i.Imm2));
-                else if (i.ElemSize == 8) SetQword(i.Rd, (int)i.Imm, Qword(i.Rn, (int)i.Imm2));
-                else Unknown(i, "Ins (small)");
+                SetElem(i.Rd, i.ElemSize, (int)i.Imm, Elem(i.Rn, i.ElemSize, (int)i.Imm2));
                 return;
-            }
             case A64Op.InsGp:
-            {
-                if (i.ElemSize == 4) SetLane(i.Rd, (int)i.Imm, R(i.Rn, false));
-                else if (i.ElemSize == 8) SetQword(i.Rd, (int)i.Imm, X(i.Rn));
-                else Unknown(i, "InsGp (small)");
+                SetElem(i.Rd, i.ElemSize, (int)i.Imm, i.ElemSize == 8 ? X(i.Rn) : _b.Trunc(X(i.Rn), ElemType(i.ElemSize)));
                 return;
-            }
             case A64Op.Umov or A64Op.Smov:
             {
                 Node e;
@@ -1319,6 +1308,20 @@ public sealed partial class A64Lifter : IMachineLifter
         }
         return null;
     }
+
+    /// <summary>
+    /// The System.Math method a rounding to an integral value is: down, up, toward zero, or to the nearest with
+    /// halves to even (Math.Round, and what the current mode is in managed code). Halves away from zero has no
+    /// one-argument method.
+    /// </summary>
+    private static string? RoundingName(A64Rounding rounding) => rounding switch
+    {
+        A64Rounding.MinusInfinity => "Floor",
+        A64Rounding.PlusInfinity => "Ceiling",
+        A64Rounding.Zero => "Truncate",
+        A64Rounding.Nearest or A64Rounding.Current or A64Rounding.CurrentExact => "Round",
+        _ => null,
+    };
 
     private Node FZero(VT type)
     {

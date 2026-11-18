@@ -70,6 +70,10 @@ public enum A64Op : byte
     VAnd, VOrr, VEor, VBic,
     /// <summary>Element-wise float arithmetic on vectors (ElemSize 4 or 8).</summary>
     VFAdd, VFSub, VFMul, VFDiv,
+    /// <summary>An element-wise or rearranging SIMD operation: Imm is its <see cref="VecKind"/>.</summary>
+    VecOp,
+    /// <summary>LD1/ST1 of element Amount (ElemSize bytes); LD1R, the element loaded into every element.</summary>
+    Ld1Lane, St1Lane, Ld1R,
     /// <summary>Some other SIMD operation.</summary>
     Vector,
 }

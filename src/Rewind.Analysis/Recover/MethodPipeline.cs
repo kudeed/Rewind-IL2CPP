@@ -374,7 +374,8 @@ public sealed class MethodPipeline
         CheckShape(fn, "stack promotion");
         if (LoopValues.Run(fn, ArgumentBits)) _normalizer.Cleanup(fn);
         CheckShape(fn, "loop values");
-        if (Environment.GetEnvironmentVariable("REWIND_NO_CLASS_SPLIT") == null && ClassMerges.Run(fn, IsClassOrMethodSlot)) _normalizer.Cleanup(fn);
+        if (Environment.GetEnvironmentVariable("REWIND_NO_CLASS_SPLIT") == null && ClassMerges.Run(fn, IsClassOrMethodSlot,
+                fn.Regs.SharedPositions ? null : slot => _program.Model.ResolveUsageSlot(slot) != null)) _normalizer.Cleanup(fn);
         CheckShape(fn, "class merges");
         if (Environment.GetEnvironmentVariable("REWIND_NO_WIDENED_CONSTANTS") == null) FoldWidenedConstants(fn);
         return new LiftedMethod
