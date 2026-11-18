@@ -231,20 +231,20 @@ numbers don't say how well it recognizes the runtime of other Android builds.
 
 | What was checked | Android ARM64 | The same project for Windows x64 |
 | --- | --- | --- |
-| Complete bodies, the project's own assembly | 497 of 516 (96.3%) | 504 of 516 (97.7%) |
-| Complete bodies, whole game | 122,435 of 130,615 (93.7%) | 124,779 of 132,027 (94.5%) |
-| Behavior check: comparable methods that behave exactly like the original | 159 of 179 | 157 of 179 |
+| Complete bodies, the project's own assembly | 500 of 516 (96.9%) | 505 of 516 (97.9%) |
+| Complete bodies, whole game | 123,493 of 130,615 (94.5%) | 126,678 of 132,027 (95.9%) |
+| Behavior check: comparable methods that behave exactly like the original | 159 of 179 | 160 of 179 |
 
 Most of what is left on ARM64 the x64 build has as well (fully shared generic code, code inlined from other
-classes). On top of that come `try` blocks nested in ways the ARM64 exception planner doesn't take apart yet,
-IL2CPP's private copies of small methods that clang compiled differently from the method itself (so they are
-not recognized as copies), and stack buffers handed around as pointers.
+classes). On top of that come stack buffers handed around as pointers, small private copies of methods that refer
+to nothing of their own (so nothing tells which method they copy), and calls whose object clang stopped passing
+because the method never reads it.
 
 ## What it can't do yet
 
-- ARM64 (Android) bodies come out less complete than x64 ones so far (the numbers are under "Android
-  (ARM64)" above). On ARM64, `try` blocks nested in some ways and some SIMD instructions are marked as gaps.
-  32-bit ARM and x86 builds get complete types and signatures but placeholder bodies.
+- ARM64 (Android) bodies come out a little less complete than x64 ones so far (the numbers are under "Android
+  (ARM64)" above). On ARM64, some SIMD instructions and stack buffers handed around as pointers are marked as
+  gaps. 32-bit ARM and x86 builds get complete types and signatures but placeholder bodies.
 - Generic methods, and methods of generic types, are recovered from the code their instantiations over
   reference types share. A definition that is only compiled for value types still gets a placeholder body.
   Where the shared code doesn't say which instantiation a call is to, the call is marked as a gap.
