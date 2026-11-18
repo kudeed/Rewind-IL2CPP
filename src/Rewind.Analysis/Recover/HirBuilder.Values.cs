@@ -1219,7 +1219,61 @@ public sealed partial class HirBuilder
             return Times(IntValue(StripExtension(index)), scale / elementSize);
         if (scale < elementSize && Multiple(StripExtension(index)) is ({ } x, var factor) && factor > 0 && factor * scale % elementSize == 0)
             return Times(IntValue(StripExtension(x)), factor * scale / elementSize);
+        // An index the compiler keeps already multiplied (a loop counter stepping by 3 for 12-byte elements,
+        // an offset stepping by the element size): always a multiple of what it is missing, so the element
+        // index is that exact quotient.
+        if (scale > 0 && scale < elementSize && !NoProvenMultiples)
+        {
+            long g = Gcd(scale, elementSize), missing = elementSize / g;
+            if (missing > 1 && missing < 1 << 20 && AlwaysMultiple(index, missing, [], 0))
+            {
+                var quotient = new HBinary(HBinaryOp.Div, IntValue(StripExtension(index)), new HConst((int)missing, _int)) { Type = _int };
+                return Times(quotient, scale / g);
+            }
+        }
         return null;
+    }
+
+    private static readonly bool NoProvenMultiples = Environment.GetEnvironmentVariable("REWIND_NO_PROVEN_MULTIPLES") != null;
+
+    /// <summary>
+    /// Whether <paramref name="n"/> is a multiple of <paramref name="k"/> however it is reached: constants,
+    /// products and shifts with a multiple, sums and differences of multiples, and selects and phis of them (a
+    /// phi met again on its own cycle is taken to be one; every way into the cycle must then show it).
+    /// </summary>
+    private static bool AlwaysMultiple(Node n, long k, HashSet<Node> assumed, int depth)
+    {
+        if (depth > 24) return false;
+        if (n.IsConst) return IrBuilder.SImm(n) % k == 0;
+        if (Multiple(n) is ({ } of, var factor) && factor != 0 && (factor % k == 0 || AlwaysMultiple(of, k / Gcd(k, factor), assumed, depth + 1)))
+            return true;
+        switch (n.Op)
+        {
+            case Op.ZExt or Op.SExt or Op.Neg:
+                return AlwaysMultiple(n.In[0], k, assumed, depth + 1);
+            case Op.Add or Op.Sub:
+                return AlwaysMultiple(n.In[0], k, assumed, depth + 1) && AlwaysMultiple(n.In[1], k, assumed, depth + 1);
+            case Op.Mul:
+                return AlwaysMultiple(n.In[0], k, assumed, depth + 1) || AlwaysMultiple(n.In[1], k, assumed, depth + 1);
+            case Op.Select:
+                return AlwaysMultiple(n.In[1], k, assumed, depth + 1) && AlwaysMultiple(n.In[2], k, assumed, depth + 1);
+            case Op.Phi:
+            {
+                if (assumed.Contains(n)) return true;
+                // (What is shown while this phi is assumed rests on it: if it fails, so does all of that.)
+                var before = new HashSet<Node>(assumed);
+                assumed.Add(n);
+                foreach (Node input in n.In)
+                    if (!AlwaysMultiple(input, k, assumed, depth + 1))
+                    {
+                        assumed.IntersectWith(before);
+                        return false;
+                    }
+                return true;
+            }
+            default:
+                return false;
+        }
     }
 
     /// <summary>

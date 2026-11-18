@@ -333,6 +333,7 @@ public sealed class MethodPipeline
         TrimReturns(fn, abi);
         NormalizeResult normalization = _normalizer.Run(fn);
         CheckShape(fn, "normalizing");
+        if (Environment.GetEnvironmentVariable("REWIND_NO_CONSTANT_DIVISIONS") == null && ConstantDivisions.Run(fn)) DeadCode.Run(fn);
         if (Environment.GetEnvironmentVariable("REWIND_NO_ARG_TRIM") == null && TrimCallArguments(fn))
         {
             DeadCode.Run(fn);
