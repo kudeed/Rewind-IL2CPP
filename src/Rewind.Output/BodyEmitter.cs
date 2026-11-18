@@ -1016,6 +1016,17 @@ public sealed class BodyEmitter
                 case HTypeOp.SizeOf:
                     _il.Emit(OpCodes.Sizeof, type);
                     return;
+                case HTypeOp.StackAlloc:
+                    // "stackalloc T[n]": the byte count, unsigned native, then localloc (zeroed: the body says localsinit).
+                    Value(t.Operand!);
+                    _il.Emit(OpCodes.Conv_U);
+                    if (Bits(t.Target) is int bits and > 8)
+                    {
+                        _il.Emit(OpCodes.Sizeof, type);
+                        _il.Emit(OpCodes.Mul_Ovf_Un);
+                    }
+                    _il.Emit(OpCodes.Localloc);
+                    return;
                 case HTypeOp.Allocate:
                     if (_owner.RawAllocator == null || _owner.TypeFromHandle == null)
                         throw new CannotEmit("the class library has no way to allocate an object without a constructor");

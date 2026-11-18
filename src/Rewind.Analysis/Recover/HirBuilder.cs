@@ -716,6 +716,7 @@ public sealed partial class HirBuilder
         FindFakeBoxes();
         InferFrameTypes();
         PlanRawCells();
+        PlanStackBuffers();
         DecideMaterialization();
 
         var cfg = new Cfg(_fn);
@@ -733,6 +734,7 @@ public sealed partial class HirBuilder
         RefinePhiStructs();
         RefineFrameTypes();
         foreach (PendingCopy copy in _pendingCopies) Problem($"only part of a {copy.Type.ShortName} was copied");
+        DeclareStackBuffers();
         CheckFrameVariables();
         CheckStructAssignments();
         foreach (var (offset, type) in _frameTypes) _h.FrameTypes[offset] = type;
@@ -1093,6 +1095,9 @@ public sealed partial class HirBuilder
                 if (h.High) bits = new HBinary(HBinaryOp.Shr, bits, new HConst(32, _int)) { Type = _long };
                 return new HConv(HConvKind.I4, bits) { Type = _int };
             }
+            case SFrame f when BufferAddress(f.Offset) is { } buffer:
+                // An address in a stackalloc'd buffer: the buffer's pointer plus an offset.
+                return buffer;
             case SFrame f when _fakeBoxes.TryGetValue(f.Offset, out TypeSig? boxed):
                 // A value given an object header on the stack so that it can be passed as an object: a box.
                 return new HTypeExpr(HTypeOp.Box, boxed, new HLocal(FrameVar(f.Offset + _header, boxed)) { Type = boxed }) { Type = _object };

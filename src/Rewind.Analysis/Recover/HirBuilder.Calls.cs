@@ -438,6 +438,13 @@ public sealed partial class HirBuilder
         {
             case SRef r:
                 return r.Location;
+            case SFrame f when BufferAddress(f.Offset) is { } buffer:
+            {
+                // In a stackalloc'd buffer: what the pointer points at.
+                TypeSig at = expected != null && !Open(expected) ? expected : _byte;
+                HExpr into = ReferenceEquals(at, _byte) ? buffer : new HConv(HConvKind.U, buffer) { Type = _m.Sigs.Pointer(at) };
+                return new HDeref(into) { Type = at };
+            }
             case SFrame f:
             {
                 // An address inside a struct local is the address of one of its fields (or of the fields that
@@ -1514,7 +1521,7 @@ public sealed partial class HirBuilder
                             HExpr? location = LocationOf(node, byRef.ElementType);
                             arg = location != null ? new HAddressOf(location) { Type = type } : Value(node);
                         }
-                        else if (type is PointerSig && !NoWiderPointees && Eval(node) is SFrame frame &&
+                        else if (type is PointerSig && !NoWiderPointees && Eval(node) is SFrame frame && BufferAddress(frame.Offset) == null &&
                                  FramePlace(frame.Offset, DirectAccessSize(frame.Offset)) is PLocation { Location: { Type: { } heldType } held })
                         {
                             // The address of a local handed over as a pointer ("(byte*)&value").

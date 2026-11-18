@@ -186,6 +186,7 @@ public sealed partial class HirBuilder
     private bool TryEmitBlockOp(Node call)
     {
         if (BlockCopies.Of(call, _p.Helpers, tail: true) is not { } op || op.Bytes < 0) return false;
+        if (ZeroesStackBuffer(op)) return true; // (stackalloc memory starts zeroed)
         int size = op.Bytes;
         if (!op.IsCopy)
         {
