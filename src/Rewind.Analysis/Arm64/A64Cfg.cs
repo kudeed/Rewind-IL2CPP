@@ -26,7 +26,10 @@ public sealed class A64Cfg
     public static A64Cfg Build(ICodeContext context, ulong start) => Build(context, start, null);
 
     /// <param name="extraRoots">Addresses reached other than by the code's own control flow (landing pads).</param>
-    public static A64Cfg Build(ICodeContext context, ulong start, IEnumerable<ulong>? extraRoots)
+    /// <param name="extraLeaders">Addresses where a block must start even without a jump there (call-site boundaries).</param>
+    /// <param name="splitAfter">Call targets after whose calls a block ends (the end of a catch handler).</param>
+    public static A64Cfg Build(ICodeContext context, ulong start, IEnumerable<ulong>? extraRoots, IEnumerable<ulong>? extraLeaders = null,
+        Func<ulong, bool>? splitAfter = null)
     {
         NativeImage image = context.Image;
         var cfg = new A64Cfg { Start = start };
@@ -52,6 +55,10 @@ public sealed class A64Cfg
                     work.Push(root);
                 }
         work.Push(start);
+        if (extraLeaders != null)
+            foreach (ulong leader in extraLeaders)
+                if (leader > start && leader < limit)
+                    leaders.Add(leader);
 
         bool InFunction(ulong a) => a >= start && a < limit && (a == start || !context.IsFunctionStart(a));
 
@@ -145,6 +152,7 @@ public sealed class A64Cfg
                             ends[ip] = (BlockEnd.NoReturnCall, []);
                             goto nextBlock;
                         }
+                        if (ins.Op == A64Op.Bl && splitAfter != null && splitAfter(ins.Target)) leaders.Add(next);
                         break;
                     }
                 }

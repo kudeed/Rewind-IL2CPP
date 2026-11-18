@@ -707,7 +707,7 @@ public sealed class X64Lifter : IMachineLifter
     }
 
     /// <summary>Immediate dominators (Cooper, Harvey, Kennedy) over the given edges; unreachable blocks are absent.</summary>
-    private static Dictionary<Block, Block> Dominators(Block entry, Dictionary<Block, List<Block>> succs, Dictionary<Block, List<Block>> preds)
+    internal static Dictionary<Block, Block> Dominators(Block entry, Dictionary<Block, List<Block>> succs, Dictionary<Block, List<Block>> preds)
     {
         var order = new List<Block>();
         var seen = new HashSet<Block>();

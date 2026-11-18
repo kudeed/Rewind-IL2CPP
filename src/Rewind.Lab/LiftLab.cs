@@ -402,6 +402,21 @@ internal static class LiftLab
         return null;
     }
 
+    /// <summary>eh-dump &lt;input&gt; &lt;filter&gt;: the Itanium exception tables (call sites, landing pads, filters) of matching methods.</summary>
+    public static int ExceptionTables(Il2CppModel model, string filter)
+    {
+        if (model.Image is not Rewind.Binary.ElfImage elf) return 1;
+        foreach (MethodDef method in model.Methods)
+        {
+            if (method.Address == 0 || !method.FullName.Contains(filter, StringComparison.Ordinal)) continue;
+            Console.WriteLine($"=== {method.FullName} 0x{method.Address:X}");
+            if (elf.ExceptionTableOf(method.Address) is not { } table) { Console.WriteLine("  no exception table"); continue; }
+            foreach (var site in table.CallSites)
+                Console.WriteLine($"  [0x{site.Start:X}, 0x{site.End:X}) pad 0x{site.LandingPad:X} action {site.Action} filter {site.Filter}{(site.Catches ? " catches" : "")}");
+        }
+        return 0;
+    }
+
     /// <summary>lift-stats &lt;input&gt;: lifts every managed function and reports what the lifter cannot handle yet.</summary>
     public static int Stats(Il2CppModel model)
     {

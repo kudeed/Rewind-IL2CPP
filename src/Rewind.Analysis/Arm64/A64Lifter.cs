@@ -9,7 +9,7 @@ namespace Rewind.Analysis.Arm64;
 /// IR it makes has the same shapes where the machines agree (32-bit results zero-extended into 64-bit
 /// registers, 32-bit lanes for the floating-point registers, flags kept as the operands that set them).
 /// </summary>
-public sealed class A64Lifter : IMachineLifter
+public sealed partial class A64Lifter : IMachineLifter
 {
     /// <summary>Variables: x0-x30 are 0-30, then sp, the NZCV flags, the thread pointer and the SIMD/FP lanes (four 32-bit lanes per register).</summary>
     public const int VarSp = 31, VarFlags = 32, VarTpidr = 33, VarV = 34, VarCount = VarV + 32 * 4;
@@ -50,13 +50,36 @@ public sealed class A64Lifter : IMachineLifter
 
     public Function Lift(ulong start)
     {
-        A64Cfg cfg = A64Cfg.Build(_ctx, start);
+        FindUnwindImports();
+        // Landing pads that only clean up (C++ destructors) run when an exception leaves the method anyway; the
+        // ones that catch are the method's try regions.
+        ItaniumExceptionTable? table = _image is ElfImage elf ? elf.ExceptionTableOf(start) : null;
+        if (table != null && table.CallSites.Any(c => c.Catches))
+        {
+            if (LiftCore(start, table) is { } withRegions) return withRegions;
+            string? why = _ehFailure;
+            Function plain = LiftCore(start, null)!;
+            plain.Problems.Add($"exception handling not reconstructed: {why}");
+            return plain;
+        }
+        return LiftCore(start, null)!;
+    }
+
+    /// <summary>Lifts one function; with an exception table, null when its try regions have a shape this does not handle.</summary>
+    private Function? LiftCore(ulong start, ItaniumExceptionTable? table)
+    {
+        _gates.Clear();
+        _landings.Clear();
+        _decided.Clear();
+        _ehFailure = null;
+        List<ulong> pads = table?.CallSites.Where(c => c.Catches && ProtectsProgramCalls(c)).Select(c => CanonicalPad(c.LandingPad)).Distinct().OrderBy(a => a).ToList() ?? [];
+        // Blocks start where the protection changes, and after the prologue (a region may begin there).
+        IEnumerable<ulong>? leaders = table?.CallSites.SelectMany(c => new[] { c.Start, c.End }).Append(PrologueEnd(start)).ToList();
+        A64Cfg cfg = table == null
+            ? A64Cfg.Build(_ctx, start)
+            : A64Cfg.Build(_ctx, start, pads, leaders, target => target == _endCatch && _endCatch != 0);
         _fn = new Function { Address = start, End = cfg.Limit, Regs = RegisterModel.Arm64 };
         _fn.Problems.AddRange(cfg.Problems);
-        // Code reached only by unwinding (cleanups, catch clauses) is not lifted yet: such a function would
-        // come out without its handlers, so it is marked.
-        if (_image is ElfImage elf && elf.ExceptionTableOf(start) is { HasLandingPads: true })
-            _fn.Problems.Add("exception handling not reconstructed: landing pads are not lifted for AArch64 yet");
         _b = new IrBuilder(_fn);
         _ssa = new SsaBuilder(_fn, VarTypes);
         if (cfg.Blocks.Count == 0) return _fn;
@@ -80,6 +103,7 @@ public sealed class A64Lifter : IMachineLifter
                     to.Preds.Add(from);
                 }
         }
+        if (table != null && !PlanRegions(table, pads, rawOf, blockAt)) return null;
 
         // A function whose first instruction is also a jump target needs a separate entry block.
         if (_fn.Blocks[0].Preds.Count != 0)
@@ -118,6 +142,8 @@ public sealed class A64Lifter : IMachineLifter
             _block = block;
             _b.Current = block;
             if (rawOf.TryGetValue(block, out A64Block? raw)) LiftBlock(block, raw);
+            else if (_gates.TryGetValue(block, out int region)) LiftGate(block, region);
+            else if (_landings.TryGetValue(block, out var landing)) LiftLanding(block, landing);
             else
             {
                 _b.CurrentAddr = start;
@@ -659,6 +685,8 @@ public sealed class A64Lifter : IMachineLifter
             case BlockEnd.Jump:
                 _b.Raw(Op.Jump, VT.None);
                 return true;
+            case BlockEnd.Branch when LiftDecided(block):
+                return true;
             case BlockEnd.Branch:
             {
                 Node cond = ins.Op switch
@@ -1002,6 +1030,7 @@ public sealed class A64Lifter : IMachineLifter
 
             // ---- calls inside a block
             case A64Op.Bl or A64Op.Blr:
+                if (LiftUnwindCall(i)) return;
                 EmitCall(i, tail: false, noReturn: false);
                 return;
 

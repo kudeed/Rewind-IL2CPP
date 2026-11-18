@@ -444,6 +444,7 @@ public sealed partial class ElfImage : NativeImage
         if (!absolute || _symtab == 0) return;
 
         var (name, value, shndx, _) = ReadSymbol(_symtab, sym);
+        if (name != null) SlotSymbols[offset] = name;
         if (shndx != 0 && value != 0)
         {
             // GLOB_DAT / JUMP_SLOT ignore the addend; ABS uses it.

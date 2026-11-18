@@ -156,6 +156,7 @@ public sealed class RuntimeHelpers
         ("il2cpp_codegen_rethrow_exception", HelperKind.Rethrow, 1, true, false),
         ("class_is_assignable_from", HelperKind.IsAssignableFrom, 2, false, true),
         ("_CxxThrowException", HelperKind.CxxThrow, 2, true, false),
+        ("__cxa_throw", HelperKind.CxxThrow, 3, true, false),
         ("il2cpp_codegen_marshal_store_last_error", HelperKind.StoreLastError, 0, false, false),
         ("RethrowException", HelperKind.Rethrow, 1, true, false),
         ("il2cpp_codegen_get_array_type_mismatch_exception", HelperKind.GetArrayTypeMismatchException, 0, false, true),

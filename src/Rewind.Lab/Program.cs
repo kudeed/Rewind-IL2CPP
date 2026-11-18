@@ -40,6 +40,7 @@ internal static class Program
                 "type-info" => TypeInfo(args),
                 "lift" => LiftLab.Dump(LoadModel(args[1]), args[2], args.Length > 3 ? args[3] : null),
                 "lift-stats" => LiftLab.Stats(LoadModel(args[1])),
+                "eh-dump" => LiftLab.ExceptionTables(LoadModel(args[1]), args[2]),
                 "norm" => LiftLab.Normalized(LoadModel(args[1]), args[2], args[3]),
                 "ir" => LiftLab.PipelineIr(LoadModel(args[1]), args[2], args[3]),
                 "generic-try" => GenericLab.Run(LoadModel(args[1]), args[2], args.Length > 3 && args[3] != "-" ? args[3] : null, args.Length > 4 && args[4] != "-" ? args[4] : null, args.Length > 5 ? int.Parse(args[5]) : 6),

@@ -1,7 +1,19 @@
 namespace Rewind.Binary;
 
-/// <summary>One entry of an Itanium C++ exception table's call-site list (addresses absolute).</summary>
-public readonly record struct CallSite(ulong Start, ulong End, ulong LandingPad, int Action);
+/// <summary>
+/// One entry of an Itanium C++ exception table's call-site list (addresses absolute). Filter: the type filter
+/// of its first action - the selector its landing pad is entered with for that action (positive: a catch
+/// clause, 0: a cleanup, negative: an exception specification); 0 when there is no action.
+/// </summary>
+public readonly record struct CallSite(ulong Start, ulong End, ulong LandingPad, int Action, long Filter = 0, bool CatchAll = false)
+{
+    /// <summary>
+    /// The landing pad catches a type (rather than only cleaning up before the exception goes on). A catch of
+    /// everything is no such catch here: IL2CPP never writes one; clang does, to call std::terminate when an
+    /// exception leaves a function that may not throw.
+    /// </summary>
+    public bool Catches => LandingPad != 0 && Action != 0 && Filter > 0 && !CatchAll;
+}
 
 /// <summary>What an Itanium LSDA says about one function: its call sites, and the type table the actions index.</summary>
 public sealed class ItaniumExceptionTable
@@ -37,6 +49,12 @@ public sealed partial class ElfImage
     /// </summary>
     public Dictionary<ulong, string> ImportStubs { get; } = [];
 
+    /// <summary>
+    /// The symbol each GOT and PLT slot is bound to, whether another library or this one defines it (a function
+    /// this library both defines and exports is still called through its PLT slot).
+    /// </summary>
+    public Dictionary<ulong, string> SlotSymbols { get; } = [];
+
     private void ReadPltStubs()
     {
         if (Arch != CpuArch.Arm64) return;
@@ -52,7 +70,7 @@ public sealed partial class ElfImage
                 long immlo = (adrp >> 29) & 3, immhi = (adrp >> 5) & 0x7FFFF;
                 long page = ((immhi << 2 | immlo) << 43) >> 31; // sign-extended 21 bits, shifted left by 12
                 ulong slot = (ulong)((long)(at & ~0xFFFUL) + page) + (((ldr >> 10) & 0xFFF) << 3);
-                if (ImportSlots.TryGetValue(slot, out string? name)) ImportStubs[at] = name;
+                if (SlotSymbols.TryGetValue(slot, out string? name) || ImportSlots.TryGetValue(slot, out name)) ImportStubs[at] = name;
                 at += 12;
             }
         }
@@ -198,7 +216,13 @@ public sealed partial class ElfImage
         ulong lpStart = functionStart;
         if (lpStartEncoding != 0xFF && !ReadEncoded(ref p, lpStartEncoding, out lpStart)) return null;
         byte ttypeEncoding = U8(p++);
-        if (ttypeEncoding != 0xFF) Uleb(this, ref p);
+        ulong ttypeBase = 0;
+        if (ttypeEncoding != 0xFF)
+        {
+            ulong offset = Uleb(this, ref p);
+            ttypeBase = p + offset;
+        }
+        int ttypeSize = (ttypeEncoding & 0x0F) switch { 0x02 or 0x0A => 2, 0x03 or 0x0B => 4, _ => 8 };
         byte callSiteEncoding = U8(p++);
         ulong tableLength = Uleb(this, ref p);
         ulong end = p + tableLength;
@@ -208,7 +232,23 @@ public sealed partial class ElfImage
             if (!ReadEncoded(ref p, callSiteEncoding, out ulong siteStart) || !ReadEncoded(ref p, callSiteEncoding, out ulong siteLength) ||
                 !ReadEncoded(ref p, callSiteEncoding, out ulong pad)) return null;
             int action = (int)Uleb(this, ref p);
-            table.CallSites.Add(new CallSite(lpStart + siteStart, lpStart + siteStart + siteLength, pad == 0 ? 0 : lpStart + pad, action));
+            long filter = 0;
+            bool catchAll = false;
+            if (action != 0)
+            {
+                // The action table follows the call-site table; an action is its byte offset there, plus one.
+                ulong record = end + (ulong)(action - 1);
+                if (IsMapped(record)) filter = Sleb(this, ref record);
+                // The type a positive filter catches is entry -filter of the type table, counted back from its
+                // end; an entry of zero catches everything.
+                if (filter > 0 && ttypeBase != 0)
+                {
+                    ulong entry = ttypeBase - (ulong)(filter * ttypeSize);
+                    if (IsMapped(entry, ttypeSize))
+                        catchAll = ttypeSize switch { 2 => U16(entry) == 0, 4 => U32(entry) == 0, _ => U64(entry) == 0 };
+                }
+            }
+            table.CallSites.Add(new CallSite(lpStart + siteStart, lpStart + siteStart + siteLength, pad == 0 ? 0 : lpStart + pad, action, filter, catchAll));
         }
         return table;
     }
