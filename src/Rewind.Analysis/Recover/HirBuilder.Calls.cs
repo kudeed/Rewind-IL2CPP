@@ -619,6 +619,16 @@ public sealed partial class HirBuilder
             EmitHelperCall(call, target.Helper, tail);
             return;
         }
+        // An imported function a P/Invoke declaration wraps (AArch64, linked directly): a call of the declaration,
+        // where it is the only declaration of that function (overloads would have to be told apart), and not
+        // from inside the declaration's own wrapper.
+        // (Each assembly declares its own copy of Interop's imports: declarations that agree in every type are one.)
+        if (!NoPInvokeStubs && _p.PInvokeStubs.TryGetValue(info.Target, out List<MethodDef>? declarations) && !declarations.Contains(_method) &&
+            declarations.All(d => SameSignature(d, declarations[0])))
+        {
+            MethodDef declaration = declarations.FirstOrDefault(d => ReferenceEquals(d.DeclaringType.Assembly, _method.DeclaringType.Assembly)) ?? declarations[0];
+            if (TryBuildPInvokeCall(call, declaration, tail)) return;
+        }
         Problem($"call to unidentified native function 0x{info.Target:X}");
         var args = new List<HExpr>();
         for (int i = 0; i < 4; i++)
@@ -1888,6 +1898,12 @@ public sealed partial class HirBuilder
     }
 
     private static readonly bool NoPInvokeChoices = Environment.GetEnvironmentVariable("REWIND_NO_PINVOKE_CHOICES") != null;
+    private static readonly bool NoPInvokeStubs = Environment.GetEnvironmentVariable("REWIND_NO_PINVOKE_STUBS") != null;
+
+    /// <summary>Whether two methods take and return the same types (by name, across assemblies).</summary>
+    private static bool SameSignature(MethodDef a, MethodDef b) =>
+        a.Parameters.Length == b.Parameters.Length && a.ReturnType.Key == b.ReturnType.Key &&
+        a.Parameters.Zip(b.Parameters).All(p => p.First.Type.Key == p.Second.Type.Key);
     private static readonly bool NoNullReceivers = Environment.GetEnvironmentVariable("REWIND_NO_NULL_RECEIVERS") != null;
     internal const string UnkeptReceiver = "an instance method called on an object the code did not keep";
 

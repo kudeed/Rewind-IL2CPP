@@ -45,7 +45,7 @@ internal static class LiftLab
             if (stubs != 0) Console.WriteLine($"helpers from import stubs: {stubs}");
             var watch = Stopwatch.StartNew();
             var analysis = new ProgramAnalysis(model, matched, context);
-            Console.WriteLine($"exact copies: {analysis.ExactCopies.Copies.Count} of {analysis.ExactCopies.Examined} unlisted functions equal a listed method ({analysis.ExactCopies.Rounds} rounds); witnessed copies: {analysis.InlineCopies.Count}; near copies: {analysis.NearCopies.Count}; program analysis {watch.ElapsedMilliseconds} ms");
+            Console.WriteLine($"exact copies: {analysis.ExactCopies.Copies.Count} of {analysis.ExactCopies.Examined} unlisted functions equal a listed method ({analysis.ExactCopies.Rounds} rounds); witnessed copies: {analysis.InlineCopies.Count}; near copies: {analysis.NearCopies.Count}; P/Invoke stubs: {analysis.PInvokeStubs.Count}; program analysis {watch.ElapsedMilliseconds} ms");
             return analysis;
         }
         Dictionary<ulong, List<string>> symbols = CallStats.LoadSymbols(model.Image, symbolsPath);
