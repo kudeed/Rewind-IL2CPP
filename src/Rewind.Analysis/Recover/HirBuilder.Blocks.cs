@@ -185,7 +185,7 @@ public sealed partial class HirBuilder
     /// </summary>
     private bool TryEmitBlockOp(Node call)
     {
-        if (BlockCopies.Of(call, _p.Helpers) is not { } op || op.Bytes < 0) return false;
+        if (BlockCopies.Of(call, _p.Helpers, tail: true) is not { } op || op.Bytes < 0) return false;
         int size = op.Bytes;
         if (!op.IsCopy)
         {

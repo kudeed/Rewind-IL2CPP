@@ -1219,7 +1219,111 @@ public sealed partial class HirBuilder
             return Times(IntValue(StripExtension(index)), scale / elementSize);
         if (scale < elementSize && Multiple(StripExtension(index)) is ({ } x, var factor) && factor > 0 && factor * scale % elementSize == 0)
             return Times(IntValue(StripExtension(x)), factor * scale / elementSize);
+        // An index the compiler keeps already multiplied (a loop counter stepping by 3 for 12-byte elements,
+        // an offset stepping by the element size): always a multiple of what it is missing, so the element
+        // index is that exact quotient.
+        if (scale > 0 && scale < elementSize && !NoProvenMultiples)
+        {
+            long g = Gcd(scale, elementSize), missing = elementSize / g;
+            if (missing > 1 && missing < 1 << 20 && AlwaysMultiple(index, missing, [], 0))
+            {
+                var quotient = new HBinary(HBinaryOp.Div, IntValue(StripExtension(index)), new HConst((int)missing, _int)) { Type = _int };
+                return Times(quotient, scale / g);
+            }
+        }
         return null;
+    }
+
+    private static readonly bool NoProvenMultiples = Environment.GetEnvironmentVariable("REWIND_NO_PROVEN_MULTIPLES") != null;
+    private static readonly bool NoFixedBuffers = Environment.GetEnvironmentVariable("REWIND_NO_FIXED_BUFFERS") != null;
+
+    /// <summary>The element of a fixed-size buffer ("fixed ulong bits[64]": a struct of the compiler's with one field, FixedElementField).</summary>
+    private bool IsFixedBuffer(TypeSig type, out FieldSlot element)
+    {
+        element = default;
+        if (type.Definition is not { IsValueType: true } definition || !definition.Name.Contains("e__FixedBuffer", StringComparison.Ordinal)) return false;
+        TypeLayout layout = _p.Layouts.Of(type);
+        if (!layout.Known || layout.Fields.Length != 1 || layout.Fields[0].Field.Name != "FixedElementField" || layout.Fields[0].Offset != 0) return false;
+        element = layout.Fields[0];
+        return element.Size > 0;
+    }
+
+    /// <summary>
+    /// An element of a fixed-size buffer inside the struct a reference refers to, reached by index: the
+    /// address of the buffer's first element plus the index times the element size, as C# indexes such a
+    /// buffer ("bits[i]", which needs no pinning since C# 7.3).
+    /// </summary>
+    private Place? FixedBufferPlace(HExpr owner, TypeSig type, AddressParts a, int size)
+    {
+        long offset = a.Offset;
+        HExpr at = owner;
+        for (int depth = 0; depth < 6; depth++)
+        {
+            if (!IsStructType(type) || offset < 0 || _p.Layouts.FieldAt(type, (int)offset) is not { } slot) return null;
+            var field = new HField { Object = at, Field = slot.Field, DeclaringType = type, Type = slot.Type };
+            if (IsFixedBuffer(slot.Type, out FieldSlot element))
+            {
+                int elementSize = element.Size;
+                long inside = offset - slot.Offset;
+                if (inside % elementSize != 0 || (size > 0 && size != elementSize) || IsStructType(element.Type)) return null;
+                HExpr? index = a.Scale == elementSize ? IntValue(StripExtension(a.Index!)) : ScaledIndex(a.Index!, a.Scale, elementSize);
+                if (index == null) return null;
+                if (inside != 0) index = new HBinary(HBinaryOp.Add, index, new HConst((int)(inside / elementSize), _int)) { Type = _int };
+                // (A reference to the first element moved on by the offset: what C# makes of "bits[i]".)
+                TypeSig pointerType = _m.Sigs.ByRef(element.Type);
+                var first = new HField { Object = field, Field = element.Field, DeclaringType = slot.Type, Type = element.Type };
+                // (The offset as a native integer, as pointer arithmetic takes it: "(nint)i * 8".)
+                HExpr wide = new HConv(HConvKind.I, index) { Type = _nint };
+                HExpr bytes = elementSize == 1 ? wide : new HBinary(HBinaryOp.Mul, wide, new HConst(elementSize, _int)) { Type = _nint };
+                var pointer = new HBinary(HBinaryOp.Add, new HAddressOf(first) { Type = pointerType }, bytes) { Type = pointerType };
+                return new PLocation(new HDeref(pointer) { Type = element.Type }, element.Type);
+            }
+            if (!IsStructType(slot.Type)) return null;
+            at = field;
+            type = slot.Type;
+            offset -= slot.Offset;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="n"/> is a multiple of <paramref name="k"/> however it is reached: constants,
+    /// products and shifts with a multiple, sums and differences of multiples, and selects and phis of them (a
+    /// phi met again on its own cycle is taken to be one; every way into the cycle must then show it).
+    /// </summary>
+    private static bool AlwaysMultiple(Node n, long k, HashSet<Node> assumed, int depth)
+    {
+        if (depth > 24) return false;
+        if (n.IsConst) return IrBuilder.SImm(n) % k == 0;
+        if (Multiple(n) is ({ } of, var factor) && factor != 0 && (factor % k == 0 || AlwaysMultiple(of, k / Gcd(k, factor), assumed, depth + 1)))
+            return true;
+        switch (n.Op)
+        {
+            case Op.ZExt or Op.SExt or Op.Neg:
+                return AlwaysMultiple(n.In[0], k, assumed, depth + 1);
+            case Op.Add or Op.Sub:
+                return AlwaysMultiple(n.In[0], k, assumed, depth + 1) && AlwaysMultiple(n.In[1], k, assumed, depth + 1);
+            case Op.Mul:
+                return AlwaysMultiple(n.In[0], k, assumed, depth + 1) || AlwaysMultiple(n.In[1], k, assumed, depth + 1);
+            case Op.Select:
+                return AlwaysMultiple(n.In[1], k, assumed, depth + 1) && AlwaysMultiple(n.In[2], k, assumed, depth + 1);
+            case Op.Phi:
+            {
+                if (assumed.Contains(n)) return true;
+                // (What is shown while this phi is assumed rests on it: if it fails, so does all of that.)
+                var before = new HashSet<Node>(assumed);
+                assumed.Add(n);
+                foreach (Node input in n.In)
+                    if (!AlwaysMultiple(input, k, assumed, depth + 1))
+                    {
+                        assumed.IntersectWith(before);
+                        return false;
+                    }
+                return true;
+            }
+            default:
+                return false;
+        }
     }
 
     /// <summary>
@@ -1352,7 +1456,9 @@ public sealed partial class HirBuilder
                 return ValuePlace(a, new SVal(new HLocal(o.Variable) { Type = o.Type }), size);
             case SRef r:
             {
-                if (a.Index != null) return new PUnknown("indexed access through a reference");
+                if (a.Index != null)
+                    return !NoFixedBuffers && FixedBufferPlace(r.Location, r.Type, a, size) is { } element ? element
+                        : new PUnknown("indexed access through a reference");
                 var (refSize, _, _) = _p.Layouts.SizeOf(r.Type);
                 bool isStruct = r.Type.Definition is { IsValueType: true, IsEnum: false } && r.Type is not PrimitiveSig;
                 if (a.Offset == 0 && (!isStruct || size < 0 || size == refSize)) return new PLocation(r.Location, r.Type);
@@ -1595,6 +1701,8 @@ public sealed partial class HirBuilder
         return true;
     }
 
+    private static readonly bool NoUnboxedWords = Environment.GetEnvironmentVariable("REWIND_NO_UNBOXED_WORDS") != null;
+
     /// <summary>
     /// The value type an object is known to be a boxed instance of where <paramref name="at"/> runs: an exact
     /// class comparison of the object (class of obj == T) on the way in, its "same" edge the only way to
@@ -1826,6 +1934,10 @@ public sealed partial class HirBuilder
                 if (u.Offset == 0 && (!isStruct || size == n.Type.Bytes())) return new SVal(unboxed);
                 if (isStruct && FieldPlace(unboxed, type, u.Offset, n.Type.Bytes()) is PLocation inner) return new SVal(inner.Location);
                 if (isStruct && FieldPlace(unboxed, type, u.Offset, n.Type.Bytes()) is PPair innerPair) return new SPair(innerPair.Low, innerPair.High);
+                // A word read whole (clang loads a struct's first eight bytes for a register pair): the fields in
+                // it, the padding between them nothing.
+                if (isStruct && !NoUnboxedWords && StructLeaves(unboxed, type, u.Offset, n.Type.Bytes()) is { } words)
+                    return new SParts(words, n.Type.Bytes());
                 Problem("partial read of an unboxed value");
                 return new SVal(new HOpaque("unbox_part", unboxed) { Type = TypeForBits(n.Type) });
             }

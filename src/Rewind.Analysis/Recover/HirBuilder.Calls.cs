@@ -465,7 +465,9 @@ public sealed partial class HirBuilder
                     if (!_frameVotes.TryGetValue(f.Offset, out HashSet<TypeSig>? votes)) _frameVotes[f.Offset] = votes = [];
                     votes.Add(expected);
                 }
-                return FramePlace(f.Offset, -1) is PLocation loc ? loc.Location : null;
+                // (Nothing says what is there: as wide as the code itself reads or writes it, not a guess.)
+                int width = expected == null && !NoWiderPointees && !_frameTypes.ContainsKey(f.Offset) ? DirectAccessSize(f.Offset) : -1;
+                return FramePlace(f.Offset, width) is PLocation loc ? loc.Location : null;
             }
             case SStatics statics:
             {
@@ -2237,10 +2239,13 @@ public sealed partial class HirBuilder
             }
             case HelperKind.Memcpy or HelperKind.Memset:
             {
-                if (tail && _abi.Return != ReturnKind.Void) break;
+                // A struct returned through a buffer, filled last by a copy the compiler jumps to: what is
+                // returned is the buffer.
+                bool buffer = _abi.Return == ReturnKind.Buffer && _returnBuffer != null;
+                if (tail && _abi.Return != ReturnKind.Void && !buffer) break;
                 if (!TryEmitBlockOp(call)) break;
                 if (result != null && a0 != null) _sem[result] = Eval(a0); // both return the destination
-                if (tail) Emit(new HReturn(null), call.Addr);
+                if (tail) Emit(new HReturn(buffer ? new HLocal(_returnBuffer!) { Type = _returnBuffer!.Type } : null), call.Addr);
                 return;
             }
             case HelperKind.InitObj:

@@ -298,7 +298,8 @@ public sealed class RuntimeHelpers
         if (name == "?UnBox@@YAPEAXPEAUIl2CppObject@@@Z") return new HelperInfo(HelperKind.Unbox, 1, false, true, name);
         if (core == "il2cpp_codegen_resolve") return new HelperInfo(HelperKind.ResolvePInvoke, 1, false, true, name);
         if (core is "IsInstClass" or "IsInstSealed") return new HelperInfo(HelperKind.IsInst, 2, false, true, name);
-        if (core is "CastclassClass" or "CastclassSealed") return new HelperInfo(HelperKind.CastClass, 2, false, true, name);
+        // (Plain Castclass - any class or interface - is pasted in place by MSVC, but clang keeps it a function.)
+        if (core is "CastclassClass" or "CastclassSealed" or "Castclass") return new HelperInfo(HelperKind.CastClass, 2, false, true, name);
         if (core == "il2cpp_codegen_raise_profile_exception") return new HelperInfo(HelperKind.RaiseProfileException, 1, true, false, name);
         if (core == "il2cpp_codegen_initobj") return new HelperInfo(HelperKind.InitObj, 2, false, false, name);
         if (core.Contains("Il2CppFakeBox", StringComparison.Ordinal) && (name.StartsWith("??0", StringComparison.Ordinal) || name.Contains("C1E", StringComparison.Ordinal) || name.Contains("C2E", StringComparison.Ordinal)))
