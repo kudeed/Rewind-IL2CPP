@@ -59,6 +59,8 @@ public sealed partial class HirBuilder
         return null;
     }
 
+    private static readonly bool NoSplitCells = Environment.GetEnvironmentVariable("REWIND_NO_SPLIT_CELLS") != null;
+
     private void PlanRawCells()
     {
         var accesses = new List<(int Start, int End)>();
@@ -86,11 +88,26 @@ public sealed partial class HirBuilder
         accesses.Sort();
         int cellStart = accesses[0].Start, cellEnd = accesses[0].End;
         bool mixed = false;
+        var cluster = new List<(int Start, int End)> { accesses[0] };
         void Close()
         {
             int width = cellEnd - cellStart;
-            if (!mixed || width > 8 || Typed(cellStart, cellEnd)) return;
-            _rawCells[cellStart] = width <= 1 ? 1 : width <= 2 ? 2 : width <= 4 ? 4 : 8;
+            if (!mixed || Typed(cellStart, cellEnd)) return;
+            if (width <= 8)
+            {
+                _rawCells[cellStart] = width <= 1 ? 1 : width <= 2 ? 2 : width <= 4 ? 4 : 8;
+                return;
+            }
+            // Wider than any number, reached eight bytes at a time four bytes apart (a struct moved in
+            // pieces): four-byte numbers side by side, every access one of them, two of them, or part of one.
+            if (NoSplitCells || width > 64) return;
+            foreach (var (start, end) in cluster)
+            {
+                int size = end - start, from = start - cellStart;
+                bool fits = size >= 4 ? from % 4 == 0 && size % 4 == 0 : from / 4 == (end - 1 - cellStart) / 4;
+                if (!fits) return;
+            }
+            for (int at = cellStart; at < cellEnd; at += 4) _frameTypes[at] = _int;
         }
         foreach (var (start, end) in accesses.Skip(1))
         {
@@ -98,12 +115,14 @@ public sealed partial class HirBuilder
             {
                 if (start != cellStart || end != cellEnd) mixed = true;
                 cellEnd = Math.Max(cellEnd, end);
+                cluster.Add((start, end));
                 continue;
             }
             Close();
             cellStart = start;
             cellEnd = end;
             mixed = false;
+            cluster = [(start, end)];
         }
         Close();
     }

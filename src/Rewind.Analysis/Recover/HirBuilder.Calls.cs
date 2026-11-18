@@ -465,7 +465,9 @@ public sealed partial class HirBuilder
                     if (!_frameVotes.TryGetValue(f.Offset, out HashSet<TypeSig>? votes)) _frameVotes[f.Offset] = votes = [];
                     votes.Add(expected);
                 }
-                return FramePlace(f.Offset, -1) is PLocation loc ? loc.Location : null;
+                // (Nothing says what is there: as wide as the code itself reads or writes it, not a guess.)
+                int width = expected == null && !NoWiderPointees && !_frameTypes.ContainsKey(f.Offset) ? DirectAccessSize(f.Offset) : -1;
+                return FramePlace(f.Offset, width) is PLocation loc ? loc.Location : null;
             }
             case SStatics statics:
             {
