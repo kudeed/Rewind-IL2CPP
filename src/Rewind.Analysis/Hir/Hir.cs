@@ -145,6 +145,8 @@ public enum HTypeOp
     Box, UnboxAny, IsInst, CastClass, Default, SizeOf, TypeToken,
     /// <summary>A new, zeroed object of the type on which no constructor has run.</summary>
     Allocate,
+    /// <summary>"stackalloc T[n]": n elements on the stack (the operand), zeroed; the value is a T*.</summary>
+    StackAlloc,
 }
 
 /// <summary>Operations parameterized by a type: box, unbox.any, isinst, castclass, default(T), sizeof, typeof.</summary>
@@ -497,6 +499,7 @@ public static class HirPrinter
                     HTypeOp.Default => $"default({t.Target.ShortName})",
                     HTypeOp.SizeOf => $"sizeof({t.Target.ShortName})",
                     HTypeOp.Allocate => $"__allocate({t.Target.ShortName})",
+                    HTypeOp.StackAlloc => $"stackalloc {t.Target.ShortName}[{Print(t.Operand!, m)}]",
                     _ => $"typeof({t.Target.ShortName})",
                 };
             case HSelect s: return $"({Print(s.Condition, m)} ? {Print(s.WhenTrue, m)} : {Print(s.WhenFalse, m)})";
