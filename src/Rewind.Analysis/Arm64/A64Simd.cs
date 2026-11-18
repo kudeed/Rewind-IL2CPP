@@ -211,7 +211,8 @@ public static partial class A64Decoder
                 if (!sz) { i.ElemSize = 4; i.Amount = (byte)(h << 1 | l); i.Rm = (byte)Bits(w, 20, 16); }
                 else if (l == 0) { i.ElemSize = 8; i.Amount = (byte)h; i.Rm = (byte)Bits(w, 20, 16); if (!q && !scalar) kind = VecKind.None; }
                 else kind = VecKind.None;
-                if (a) kind = VecKind.None;
+                // (Bit 23 is set in the single- and double-precision forms; clear, it is the half-precision one.)
+                if (!a) kind = VecKind.None;
             }
             else if (!scalar && opcode is 0b1000 or 0b0000 or 0b0100 && (opcode == 0b1000 ? !u : u))
             {

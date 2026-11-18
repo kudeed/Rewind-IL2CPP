@@ -40,6 +40,9 @@ internal static class LiftLab
             var matched = library.Match(index, model.Image, context.FunctionStarts.Where(a => !context.IsManaged(a)), out var report,
                 context.FunctionStarts.Where(context.IsManaged));
             Console.WriteLine($"helpers from {Path.GetFileName(symbolsPath)}: {report}");
+            // (As the decompiler does: functions named by the stubs they are called through.)
+            int stubs = Rewind.Analysis.Runtime.HelperDiscovery.AddImportStubs(model.Image, matched);
+            if (stubs != 0) Console.WriteLine($"helpers from import stubs: {stubs}");
             var watch = Stopwatch.StartNew();
             var analysis = new ProgramAnalysis(model, matched, context);
             Console.WriteLine($"exact copies: {analysis.ExactCopies.Copies.Count} of {analysis.ExactCopies.Examined} unlisted functions equal a listed method ({analysis.ExactCopies.Rounds} rounds); witnessed copies: {analysis.InlineCopies.Count}; program analysis {watch.ElapsedMilliseconds} ms");

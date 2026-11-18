@@ -71,6 +71,7 @@ public sealed partial class A64Lifter : IMachineLifter
         _gates.Clear();
         _landings.Clear();
         _decided.Clear();
+        _deferredConditions.Clear();
         _ehFailure = null;
         List<ulong> pads = table?.CallSites.Where(c => c.Catches && ProtectsProgramCalls(c)).Select(c => CanonicalPad(c.LandingPad)).Distinct().OrderBy(a => a).ToList() ?? [];
         // Blocks start where the protection changes, and after the prologue (a region may begin there).
@@ -155,6 +156,7 @@ public sealed partial class A64Lifter : IMachineLifter
                     _ssa.Seal(s);
         }
         foreach (Block block in _fn.Blocks) _ssa.Seal(block);
+        SettleDeferredConditions();
         _ssa.Finish();
         return _fn;
     }
@@ -318,7 +320,120 @@ public sealed partial class A64Lifter : IMachineLifter
     private Node Condition(int cc)
     {
         if (cc >= 14) return True;
-        return ConditionOf(cc, Var(VarFlags), 0);
+        Node f = Var(VarFlags);
+        if (f.Op == Op.Phi && ConditionFromPhi(cc, f) is { } merged) return merged;
+        Node condition = ConditionOf(cc, f, 0);
+        // At the head of a loop the flags of the way back are not known yet: asked again when they are.
+        if (f.Op == Op.Phi && condition.Op == Op.FlagCond) _deferredConditions.Add((condition, cc, f, _fn.Problems.Count - 1));
+        return condition;
+    }
+
+    /// <summary>Conditions on flags that several ways in bring, left open because one of the ways was not lifted yet.</summary>
+    private readonly List<(Node Placeholder, int Code, Node Flags, int Problem)> _deferredConditions = [];
+
+    /// <summary>
+    /// Flags that reach a block from several predecessors (a compare on each way, the test after they meet):
+    /// the condition worked out at the end of each predecessor, where the compare's operands are known, merged.
+    /// </summary>
+    private Node? ConditionFromPhi(int cc, Node phi)
+    {
+        Block home = phi.Block!;
+        if (phi.In.Length == 0 || phi.In.Length != home.Preds.Count) return null;
+        var flags = new Node[phi.In.Length];
+        for (int k = 0; k < flags.Length; k++)
+        {
+            flags[k] = _ssa.Resolve(phi.In[k]);
+            if (flags[k].Op != Op.Flags) return null;
+        }
+        Block savedBlock = _block;
+        ulong savedAddr = _b.CurrentAddr;
+        int problemsBefore = _fn.Problems.Count;
+        var conditions = new Node[flags.Length];
+        try
+        {
+            _b.InsertBeforeTerminator = true;
+            for (int k = 0; k < flags.Length; k++)
+            {
+                Block pred = home.Preds[k];
+                _block = pred;
+                _b.Current = pred;
+                conditions[k] = ConditionOf(cc, flags[k], 0);
+            }
+        }
+        finally
+        {
+            _b.InsertBeforeTerminator = false;
+            _block = savedBlock;
+            _b.Current = savedBlock;
+            _b.CurrentAddr = savedAddr;
+        }
+        if (_fn.Problems.Count != problemsBefore)
+        {
+            _fn.Problems.RemoveRange(problemsBefore, _fn.Problems.Count - problemsBefore);
+            return null;
+        }
+        Node merged = _fn.NewNode(Op.Phi, VT.I1, home, conditions);
+        home.Phis.Add(merged);
+        return merged;
+    }
+
+    /// <summary>The open conditions, once every block is lifted (see the x64 lifter's SettleDeferredConditions).</summary>
+    private void SettleDeferredConditions()
+    {
+        if (_deferredConditions.Count == 0) return;
+        var settled = new Dictionary<Node, Node>();
+        var solved = new List<int>();
+        Block savedBlock = _block;
+        foreach (var (placeholder, cc, flags, problem) in _deferredConditions)
+        {
+            Node now = _ssa.Resolve(flags);
+            Block home = placeholder.Block!;
+            int before = _fn.Problems.Count;
+            Node? condition = null;
+            if (now.Op == Op.Flags)
+            {
+                _block = home;
+                _b.PositionBefore(home, placeholder);
+                condition = ConditionOf(cc, now, 0);
+                _b.InsertIndex = -1;
+            }
+            else if (now.Op == Op.Phi && !now.Dead)
+            {
+                _b.CurrentAddr = placeholder.Addr;
+                condition = ConditionFromPhi(cc, now);
+            }
+            if (condition == null || _fn.Problems.Count != before)
+            {
+                _fn.Problems.RemoveRange(before, _fn.Problems.Count - before);
+                continue;
+            }
+            settled[placeholder] = condition;
+            solved.Add(problem);
+        }
+        _block = savedBlock;
+        _deferredConditions.Clear();
+        if (settled.Count == 0) return;
+        foreach (Block b in _fn.Blocks)
+        {
+            foreach (Node n in b.Phis)
+                for (int k = 0; k < n.In.Length; k++)
+                    if (settled.TryGetValue(n.In[k], out Node? condition))
+                        n.In[k] = condition;
+            foreach (Node n in b.Nodes)
+                for (int k = 0; k < n.In.Length; k++)
+                    if (settled.TryGetValue(n.In[k], out Node? condition))
+                        n.In[k] = condition;
+            b.Nodes.RemoveAll(n =>
+            {
+                if (!settled.ContainsKey(n)) return false;
+                n.Dead = true;
+                return true;
+            });
+        }
+        solved.Sort();
+        for (int k = solved.Count - 1; k >= 0; k--)
+            if (solved[k] < _fn.Problems.Count)
+                _fn.Problems.RemoveAt(solved[k]);
     }
 
     private Node ConditionOf(int cc, Node f, int depth)
