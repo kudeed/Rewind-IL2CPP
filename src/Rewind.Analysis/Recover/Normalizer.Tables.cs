@@ -5,8 +5,8 @@ namespace Rewind.Analysis.Recover;
 
 public sealed partial class Normalizer
 {
-    /// <summary>Lookup tables longer than this stay loads.</summary>
-    private const int MaxTableEntries = 32;
+    /// <summary>Lookup tables longer than this stay loads, and so do those with more entries than MaxTableTests apart from the commonest.</summary>
+    private const int MaxTableEntries = 256, MaxTableTests = 32;
 
     /// <summary>
     /// A switch that only picks a value is compiled (by clang above all) into a table of those values in
@@ -35,6 +35,7 @@ public sealed partial class Normalizer
                 // The most common entry is what is left when no index matched (the bound leaves nothing else);
                 // every other entry is tested for, from the end.
                 long otherwise = entries.GroupBy(v => v).OrderByDescending(g => g.Count()).ThenBy(g => Array.IndexOf(entries, g.Key)).First().Key;
+                if (entries.Count(v => v != otherwise) > MaxTableTests) continue;
                 int at = i;
                 Node result = _b.Const(load.Type, otherwise);
                 for (long e = last; e >= 0; e--)
@@ -89,7 +90,17 @@ public sealed partial class Normalizer
             {
                 bool taken = ReferenceEquals(p.Succs[0], child);
                 Node c = branch.In[0];
-                bool Is(Node n) => ReferenceEquals(n, compared) || ReferenceEquals(n, index);
+                // (The same value computed again, or widened with zeros, which an unsigned comparison does not mind.)
+                bool Is(Node n)
+                {
+                    for (int strip = 0; strip < 3; strip++)
+                    {
+                        if (SameValue(n, compared) || SameValue(n, index)) return true;
+                        if (n.Op != Op.ZExt || n.In.Length != 1) break;
+                        n = n.In[0];
+                    }
+                    return false;
+                }
                 if (c.In.Length == 2)
                 {
                     long? bound = c.Op switch
