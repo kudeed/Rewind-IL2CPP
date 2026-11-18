@@ -329,6 +329,9 @@ public sealed class MethodPipeline
         MethodAbi abi = _program.Abi.For(method, classArgs, methodArgs);
         Function fn = _lifter.Lift(address != 0 ? address : method.Address);
         CheckShape(fn, "lifting");
+        // (Landing pads: only calls raise exceptions, so what a try statement stores before its first call is
+        // stored before it.)
+        if (!fn.Regs.SharedPositions && Environment.GetEnvironmentVariable("REWIND_NO_TRY_PROLOGUES") == null) TryPrologues.Run(fn);
         MathCalls.Run(fn, _program.Helpers);
         TrimReturns(fn, abi);
         NormalizeResult normalization = _normalizer.Run(fn);

@@ -23,6 +23,8 @@ namespace Rewind.Analysis.Arm64;
 /// </summary>
 public sealed partial class A64Lifter
 {
+    private static readonly bool NoWidenedTries = Environment.GetEnvironmentVariable("REWIND_NO_WIDENED_TRIES") != null;
+    private static readonly bool NoNestedHandlerEntries = Environment.GetEnvironmentVariable("REWIND_NO_NESTED_HANDLER_ENTRIES") != null;
     private string? _ehFailure;
     private readonly Dictionary<Block, int> _gates = [];
     private readonly Dictionary<Block, (int Region, long Selector, List<int> Lost)> _landings = [];
@@ -373,14 +375,40 @@ public sealed partial class A64Lifter
             Block entry = must[0];
             foreach (Block b in must.Skip(1))
                 while (!Dominates(entry, b)) entry = idom[entry];
-            var body = new HashSet<Block>(must) { entry };
-            var work = new Stack<Block>(must);
-            while (work.Count > 0)
+            HashSet<Block> Body(Block start)
             {
-                Block b = work.Pop();
-                if (ReferenceEquals(b, entry)) continue;
-                foreach (Block p in preds[b])
-                    if (!continuations[t].Contains(p) && Dominates(entry, p) && body.Add(p)) work.Push(p);
+                var blocks = new HashSet<Block>(must) { start };
+                var work = new Stack<Block>(must);
+                while (work.Count > 0)
+                {
+                    Block b = work.Pop();
+                    if (ReferenceEquals(b, start)) continue;
+                    foreach (Block p in preds[b])
+                        if (!continuations[t].Contains(p) && Dominates(start, p) && blocks.Add(p)) work.Push(p);
+                }
+                return blocks;
+            }
+            var body = Body(entry);
+            // A way into the protected code that passes by its first block (code the compiler shares between
+            // two paths, a branch around the first call): the try statement starts higher up, where all the ways
+            // in meet.
+            for (int round = 0; round < 8 && !NoWidenedTries; round++)
+            {
+                Block? stray = null;
+                foreach (Block b in body)
+                {
+                    if (ReferenceEquals(b, entry)) continue;
+                    foreach (Block p in preds[b])
+                        if (!body.Contains(p) && !continuations[t].Contains(p)) { stray = p; break; }
+                    if (stray != null) break;
+                }
+                if (stray == null) break;
+                Block widened = entry;
+                for (int guard = 0; guard < 256 && !Dominates(widened, stray) && idom.TryGetValue(widened, out Block? up) && !ReferenceEquals(up, widened); guard++)
+                    widened = up;
+                if (!Dominates(widened, stray) || ReferenceEquals(widened, entry)) break;
+                entry = widened;
+                body = Body(entry);
             }
             if (body.Any(continuations[t].Contains)) return Fail("the catch continues inside its own try region");
             if (ReferenceEquals(entry, own[0])) return Fail("try region entry not found");
@@ -394,11 +422,17 @@ public sealed partial class A64Lifter
             int outer = entry.Scope;
             if (body.Any(b => b.Scope != outer)) return Fail("try regions overlap");
             var outside = new List<Block>();
+            // A handler of a try statement nested in this one runs inside it too: where it continues (the
+            // shared code of a finally, say) is no way in from outside. (Funclets elsewhere; here pads are inline.)
+            bool NestedHandler(Block p) => !NoNestedHandlerEntries && handlerOf.TryGetValue(p, out int u) && u != t &&
+                                           found.Any(f => f.Region == u && f.Body.IsSubsetOf(body));
             foreach (Block b in body)
                 foreach (Block p in b.Preds)
                 {
                     if (body.Contains(p)) continue;
-                    if (!ReferenceEquals(b, entry)) return Fail("try region entered in several places");
+                    if (!ReferenceEquals(b, entry) && NestedHandler(p)) continue;
+                    if (!ReferenceEquals(b, entry))
+                        return Fail("try region entered in several places" + (Environment.GetEnvironmentVariable("REWIND_EH_DEBUG") != null ? $" (0x{b.Start:X} from 0x{p.Start:X}, entry 0x{entry.Start:X}, pred is {(handlerOf.ContainsKey(p) ? "a handler block" : continuations[t].Contains(p) ? "a continuation" : ownSet.Contains(p) ? "own code" : "other")})" : ""));
                     if (!outside.Contains(p)) outside.Add(p);
                 }
             foreach (Block b in body) b.Scope = 2 * t;
