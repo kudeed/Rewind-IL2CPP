@@ -71,7 +71,7 @@ public static class ExceptionStacks
 
     public static bool Run(Function fn, RuntimeHelpers helpers)
     {
-        if (fn.TryRegions.Count == 0 || !fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0)) return false;
+        if (fn.TryRegions.Count == 0 || !fn.Params.TryGetValue(fn.Regs.StackPointer, out Node? sp0)) return false;
 
         bool Stack(Node n, out int offset)
         {

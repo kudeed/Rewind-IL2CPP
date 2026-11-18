@@ -215,7 +215,7 @@ internal static class Program
         string outDir = Path.GetFullPath(o.OutDir ?? "rewind-out");
 
         Rewind.Analysis.ProgramAnalysis? program = null;
-        if (image.Arch == CpuArch.X64)
+        if (image.Arch is CpuArch.X64 or CpuArch.Arm64)
         {
             IEnumerable<string> files = o.Signatures == null
                 ? Rewind.Analysis.Runtime.HelperDiscovery.DefaultSignatureFiles()
@@ -231,7 +231,7 @@ internal static class Program
         }
         else
         {
-            Console.WriteLine($"note:     method bodies are recovered for x64 code only so far; this {image.Arch} build gets complete " +
+            Console.WriteLine($"note:     method bodies are recovered for x64 and ARM64 code only so far; this {image.Arch} build gets complete " +
                               "types and signatures, with placeholder bodies.");
         }
 

@@ -38,7 +38,11 @@ public static class ClassMerges
         return changed;
     }
 
-    public static bool Run(Function fn, Func<ulong, bool> isClassOrMethod)
+    /// <param name="isMetadataSlot">
+    /// When given: also undo a merge in which each way in brings the address of a metadata slot (what the
+    /// metadata initializer is handed) - the same code for two string literals or two classes, kept once.
+    /// </param>
+    public static bool Run(Function fn, Func<ulong, bool> isClassOrMethod, Func<ulong, bool>? isMetadataSlot = null)
     {
         bool changed = false;
         for (int round = 0; round < 4; round++)
@@ -47,7 +51,7 @@ public static class ClassMerges
             bool any = false;
             foreach (Block j in fn.Blocks.ToList())
             {
-                if (!MergesClasses(j, isClassOrMethod)) continue;
+                if (!MergesClasses(j, isClassOrMethod) && (isMetadataSlot == null || !MergesSlotAddresses(j, isMetadataSlot))) continue;
                 uses ??= DeadCode.Uses(fn);
                 if (!Separable(fn, j, uses)) continue;
                 Split(fn, j);
@@ -77,6 +81,17 @@ public static class ClassMerges
                 if (!ReferenceEquals(input, phi.In[0]) && !(input.Op == Op.SlotValue && phi.In[0].Op == Op.SlotValue && input.Imm == phi.In[0].Imm)) differ = true;
             }
             if (all && differ && named) return true;
+        }
+        return false;
+    }
+
+    private static bool MergesSlotAddresses(Block j, Func<ulong, bool> isMetadataSlot)
+    {
+        if (j.Preds.Count < 2 || j.Preds.Count > MaxWays || j.Nodes.Count > MaxNodes) return false;
+        foreach (Node phi in j.Phis)
+        {
+            if (phi.Dead || phi.In.Length != j.Preds.Count || !phi.Type.IsInt()) continue;
+            if (phi.In.All(i => i.IsConst && isMetadataSlot(i.UImm)) && phi.In.Any(i => i.UImm != phi.In[0].UImm)) return true;
         }
         return false;
     }

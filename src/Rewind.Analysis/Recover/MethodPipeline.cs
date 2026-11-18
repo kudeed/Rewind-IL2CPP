@@ -24,7 +24,7 @@ public sealed class LiftedMethod
 public sealed class MethodPipeline
 {
     private readonly ProgramAnalysis _program;
-    private readonly X64Lifter _lifter;
+    private readonly IMachineLifter _lifter;
     private readonly Normalizer _normalizer;
 
     public MethodPipeline(ProgramAnalysis program) : this(program, forAccessors: false)
@@ -360,7 +360,7 @@ public sealed class MethodPipeline
         }
         CheckShape(fn, "parked addresses");
         ParkedAddresses.Canonicalize(fn);
-        Dictionary<int, int>? stackArguments = StackArguments(abi);
+        Dictionary<int, int>? stackArguments = StackArguments(abi, fn.Regs);
         List<FrameObject> frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, boxes), stackArguments);
         DeadCode.Run(fn);
         // A promoted slot that held a stack address turns what was read through it into direct stack accesses:
@@ -374,7 +374,8 @@ public sealed class MethodPipeline
         CheckShape(fn, "stack promotion");
         if (LoopValues.Run(fn, ArgumentBits)) _normalizer.Cleanup(fn);
         CheckShape(fn, "loop values");
-        if (Environment.GetEnvironmentVariable("REWIND_NO_CLASS_SPLIT") == null && ClassMerges.Run(fn, IsClassOrMethodSlot)) _normalizer.Cleanup(fn);
+        if (Environment.GetEnvironmentVariable("REWIND_NO_CLASS_SPLIT") == null && ClassMerges.Run(fn, IsClassOrMethodSlot,
+                fn.Regs.SharedPositions ? null : slot => _program.Model.ResolveUsageSlot(slot) != null)) _normalizer.Cleanup(fn);
         CheckShape(fn, "class merges");
         if (Environment.GetEnvironmentVariable("REWIND_NO_WIDENED_CONSTANTS") == null) FoldWidenedConstants(fn);
         return new LiftedMethod
@@ -433,21 +434,21 @@ public sealed class MethodPipeline
     }
 
     /// <summary>The arguments a method is handed on the stack: where (from the entry stack pointer), and how many bytes of the slot they are.</summary>
-    private static Dictionary<int, int>? StackArguments(MethodAbi abi)
+    private static Dictionary<int, int>? StackArguments(MethodAbi abi, RegisterModel regs)
     {
         if (!abi.Known) return null;
         Dictionary<int, int>? result = null;
         foreach (AbiParam p in abi.Params)
         {
-            if (p.Role != ParamRole.Argument || p.Position < Win64Abi.RegisterSlots) continue;
+            if (p.Role != ParamRole.Argument || !regs.IsStackPosition(p.Position)) continue;
             int bytes = p.Pass switch
             {
                 PassKind.Indirect => 8,
                 PassKind.Float => p.IsDouble ? 8 : 4,
                 _ => p.Size is 1 or 2 or 4 or 8 ? p.Size : 8,
             };
-            // (Above the return address and the four slots kept for the arguments that come in registers.)
-            (result ??= [])[8 + 8 * p.Position] = bytes;
+            // (Win64: above the return address and the four slots kept for the arguments that come in registers.)
+            (result ??= [])[regs.StackOffsetOf(p.Position)] = bytes;
         }
         return result;
     }
@@ -567,8 +568,11 @@ public sealed class MethodPipeline
             StructFolding.Run(result, _program, this);
             _inlineFolding.Run(result);
         }
+        StructFromParts.Run(result, this);
+        WriteBacks.Run(result, _program);
         AccessorFolding.Run(result, _program);
         LibraryInternals.Run(result, _program);
+        HiddenImplementations.Run(result, _program);
         InitializerOrder.Run(result);
         UnsetLocals.Run(result);
         FlagMarkers(result);
@@ -904,7 +908,7 @@ public sealed class MethodPipeline
                 int extent = EscapeExtent(call, input, fn, boxes, current);
                 if (extent > 0 || extent == StackPromotion.NotTaken || NoAssumedReach || call.Aux is not CallInfo { Indirect: true } ||
                     current.ChosenCalls.ContainsKey(call)) return extent;
-                if (!fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0) || StackOffset(sp0, call.In[input]) is not int at) return extent;
+                if (!fn.Params.TryGetValue(fn.Regs.StackPointer, out Node? sp0) || StackOffset(sp0, call.In[input]) is not int at) return extent;
                 int reach = current.ReachThrough(at);
                 if (reach <= 0) return extent;
                 assumed.Add((call, input, reach));
@@ -912,11 +916,11 @@ public sealed class MethodPipeline
             }
             if (StackSplitting.Run(fn, current.FrameConflicts, Extent,
                     (call, input) => WritesOnly(call, input, current), ReadsOnly, WritesAndNothingElse, current.ReachThrough,
-                    (call, input) => TakesLowHalf(current, call, input)) <= 0)
+                    (call, input) => TakesLowHalf(current, call, input), current.ScalarSlotConflicts) <= 0)
                 break;
             Dictionary<int, int> after = InPlaceBoxes(fn);
             ParkedAddresses.Canonicalize(fn);
-            lifted.Frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, after, current), StackArguments(lifted.Abi),
+            lifted.Frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, after, current), StackArguments(lifted.Abi, fn.Regs),
                 (call, input) => TakesLowHalf(current, call, input));
             DeadCode.Run(fn);
             _normalizer.Cleanup(fn);
@@ -1025,6 +1029,11 @@ public sealed class MethodPipeline
         foreach (Block b in fn.Blocks)
         {
             Node? ret = b.Terminator;
+            if (ret?.Op == Op.Return && ret.In.Length == 10)
+            {
+                TrimArm64Return(ret, abi, builder, b);
+                continue;
+            }
             if (ret?.Op != Op.Return || ret.In.Length != 3) continue;
             switch (abi.Return)
             {
@@ -1054,6 +1063,54 @@ public sealed class MethodPipeline
     }
 
     /// <summary>
+    /// An AArch64 return captures x0, x1 and lanes 0-1 of v0-v3 (in that order: x0, v0.0, v0.1, x1, v1.0, v1.1,
+    /// v2.0, v2.1, v3.0, v3.1); keep what the return type uses, in byte order.
+    /// </summary>
+    private static void TrimArm64Return(Node ret, MethodAbi abi, IrBuilder builder, Block b)
+    {
+        Node[] all = ret.In;
+        switch (abi.Return)
+        {
+            case ReturnKind.Void or ReturnKind.Buffer:
+                ret.In = [];
+                return;
+            case ReturnKind.Float:
+                ret.In = [all[1]];
+                return;
+            case ReturnKind.Double:
+                ret.In = [all[1], all[2]];
+                return;
+            case ReturnKind.StructInRegisterPair:
+                ret.In = [all[0], all[3]];
+                return;
+            case ReturnKind.FloatAggregate:
+            {
+                int[] lane0 = [1, 4, 6, 8], lane1 = [2, 5, 7, 9];
+                var kept = new List<Node>();
+                for (int k = 0; k < Math.Min(4, abi.ReturnCount); k++)
+                {
+                    kept.Add(all[lane0[k]]);
+                    if (abi.ReturnIsDouble) kept.Add(all[lane1[k]]);
+                }
+                ret.In = kept.ToArray();
+                return;
+            }
+            default:
+            {
+                Node value = all[0];
+                if (abi.ReturnSize is 1 or 2 or 4)
+                {
+                    builder.Current = b;
+                    builder.CurrentAddr = ret.Addr;
+                    value = builder.Trunc(value, VTExtensions.IntOfBytes(abi.ReturnSize));
+                }
+                ret.In = [value];
+                return;
+            }
+        }
+    }
+
+    /// <summary>
     /// How many low bits of <paramref name="value"/> a call looks at, given the parameters it is passed as:
     /// a bool or byte parameter is read as 8 bits no matter what else the register holds.
     /// </summary>
@@ -1067,7 +1124,7 @@ public sealed class MethodPipeline
         {
             if (!ReferenceEquals(call.In[i], value)) continue;
             ArgSlot slot = info.Slots[i];
-            int position = slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + 4 : -1;
+            int position = _program.Abi.Regs.IntPositionOfSlot(slot);
             if (position < 0) return 64;
             void Consider(MethodAbi abi)
             {
@@ -1104,7 +1161,7 @@ public sealed class MethodPipeline
         if (BlockCopies.Access(call, inputIndex, _program.Helpers, out _, out bool blockReads, out _)) return !blockReads;
         if (call.Aux is not CallInfo info || info.Indirect || info.Intrinsic != null || inputIndex >= info.Slots.Count) return false;
         ArgSlot slot = info.Slots[inputIndex];
-        int position = slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + 4 : -1;
+        int position = _program.Abi.Regs.IntPositionOfSlot(slot);
         if (position < 0) return false;
         CallTarget target = _program.Resolve(info.Target);
         if (target.Helper != null || !target.IsManaged) return false;
@@ -1178,7 +1235,7 @@ public sealed class MethodPipeline
     private Dictionary<int, int> InPlaceBoxes(Function fn)
     {
         var boxes = new Dictionary<int, int>();
-        if (!fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0)) return boxes;
+        if (!fn.Params.TryGetValue(fn.Regs.StackPointer, out Node? sp0)) return boxes;
         int header = 2 * _program.Model.Image.PointerSize;
         foreach (Block b in fn.Blocks)
             foreach (Node n in b.Nodes)
@@ -1211,6 +1268,7 @@ public sealed class MethodPipeline
                 if (!target.IsManaged || target.Helper != null || target.Forwarded) continue;
                 var integer = new HashSet<int>();
                 var floating = new HashSet<int>();
+                var exact = new HashSet<ArgSlot>();
                 bool unknown = false;
                 void Consider(MethodAbi abi)
                 {
@@ -1219,6 +1277,8 @@ public sealed class MethodPipeline
                         unknown = true;
                         return;
                     }
+                    // (Where integer and floating-point registers are counted apart, the slots each parameter takes.)
+                    if (!fn.Regs.SharedPositions && ProgramAnalysis.SlotsFrom(abi, fn.Regs).Slots is { } taken) exact.UnionWith(taken);
                     foreach (AbiParam p in abi.Params) (p.Pass == PassKind.Float ? floating : integer).Add(p.Position);
                 }
                 foreach (MethodDef m in target.Methods) Consider(_program.Abi.For(m, [], []));
@@ -1230,7 +1290,7 @@ public sealed class MethodPipeline
                 for (int i = 0; i < call.In.Length; i++)
                 {
                     ArgSlot slot = info.Slots[i];
-                    bool taken = slot.Kind switch
+                    bool taken = !fn.Regs.SharedPositions ? slot.Kind == ArgSlotKind.Target || exact.Contains(slot) : slot.Kind switch
                     {
                         ArgSlotKind.IntReg => integer.Contains(slot.Index),
                         ArgSlotKind.Stack => integer.Contains(slot.Index + 4) || floating.Contains(slot.Index + 4),
@@ -1262,23 +1322,32 @@ public sealed class MethodPipeline
         {
             if (fn.Params.TryGetValue(variable, out Node? entry)) leftovers.Add(entry);
         }
-        Add(0);   // rax
-        Add(10);  // r10
-        Add(11);  // r11
+        RegisterModel regs = fn.Regs;
+        if (regs.SharedPositions)
+        {
+            Add(0);   // rax
+            Add(10);  // r10
+            Add(11);  // r11
+        }
+        else
+        {
+            for (int r = 9; r <= 18; r++) Add(r); // x9-x18: scratch
+            Add(30);                              // the link register: the return address, never a value
+        }
         // What the caller left in a register this method must preserve means nothing to the method itself: it
         // is only saved and put back. Writing one byte of such a register ("mov bl, [rcx+18h]") keeps the caller's
         // other seven, which no one reads.
         if (!NoSavedLeftovers)
-            foreach (int saved in X64Lifter.CalleeSaved)
-                if (saved != X64Lifter.VarRsp)
+            foreach (int saved in regs.CalleeSaved)
+                if (saved != regs.StackPointer)
                     Add(saved);
         if (abi.Known)
         {
             var taken = new HashSet<int>();
             foreach (AbiParam p in abi.Params)
-                if (p.Pass != PassKind.Float) taken.Add(p.Position);
-            for (int position = 0; position < X64Lifter.IntArgRegs.Length; position++)
-                if (!taken.Contains(position)) Add(X64Lifter.IntArgRegs[position]);
+                if (p.Pass != PassKind.Float && regs.IntRegisterOf(p.Position) is int r and >= 0) taken.Add(r);
+            for (int position = 0; position < regs.IntArgs.Length; position++)
+                if (!taken.Contains(position)) Add(regs.IntArgs[position]);
         }
         return leftovers.Contains;
     }
@@ -1298,7 +1367,7 @@ public sealed class MethodPipeline
     private int EscapeExtent(Node call, int inputIndex, Function fn, Dictionary<int, int> boxes)
     {
         int extent = EscapeExtent(call, inputIndex, out bool asObject);
-        if (extent > 0 || !asObject || boxes.Count == 0 || !fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0)) return extent;
+        if (extent > 0 || !asObject || boxes.Count == 0 || !fn.Params.TryGetValue(fn.Regs.StackPointer, out Node? sp0)) return extent;
         // A stack address where an object is expected: the value boxed in place there.
         return StackOffset(sp0, call.In[inputIndex]) is int at && boxes.TryGetValue(at, out int box) ? box : -1;
     }
@@ -1310,14 +1379,14 @@ public sealed class MethodPipeline
     /// exact where the call's target alone names several methods sharing one body. False when the call was not
     /// resolved that way; a null parameter means the method takes nothing in that position.
     /// </summary>
-    private static bool Chosen(HirBuilder built, Node call, int inputIndex, out MethodDef method, out MethodAbi abi, out AbiParam? parameter)
+    private bool Chosen(HirBuilder built, Node call, int inputIndex, out MethodDef method, out MethodAbi abi, out AbiParam? parameter)
     {
         method = null!;
         abi = null!;
         parameter = null;
         if (!built.ChosenCalls.TryGetValue(call, out var chosen) || call.Aux is not CallInfo info || inputIndex >= info.Slots.Count) return false;
         ArgSlot slot = info.Slots[inputIndex];
-        int position = slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + 4 : -1;
+        int position = _program.Abi.Regs.IntPositionOfSlot(slot);
         if (position < 0) return false;
         method = chosen.Method;
         abi = chosen.Abi;
@@ -1330,7 +1399,7 @@ public sealed class MethodPipeline
         return true;
     }
 
-    private static int Position(ArgSlot slot) => slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + 4 : -1;
+    private int Position(ArgSlot slot) => _program.Abi.Regs.IntPositionOfSlot(slot);
 
     /// <summary>The call takes a value of four bytes or fewer in that input (an int, a float, a small struct): the bottom half of the slot.</summary>
     private bool TakesLowHalf(HirBuilder built, Node call, int inputIndex)
@@ -1390,7 +1459,7 @@ public sealed class MethodPipeline
             if (!NoUntakenInputs && built.ChosenCalls.TryGetValue(call, out var chosen) && call.Aux is CallInfo info && inputIndex < info.Slots.Count)
             {
                 ArgSlot slot = info.Slots[inputIndex];
-                int position = slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + 4 : -1;
+                int position = _program.Abi.Regs.IntPositionOfSlot(slot);
                 int last = -1;
                 foreach (AbiParam taken in chosen.Abi.Params)
                     if (chosen.Shift == 0 || taken.Role != ParamRole.MethodInfo)
@@ -1410,7 +1479,7 @@ public sealed class MethodPipeline
         if (size > 0) return size;
         bool asObject = p.Role is ParamRole.This or ParamRole.Argument && p.Pass == PassKind.Integer &&
                         p.Type is { IsValueType: false } and not ByRefSig and not PointerSig && !p.Type.ContainsGenericParameter;
-        if (asObject && fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0) && StackOffset(sp0, call.In[inputIndex]) is int at &&
+        if (asObject && fn.Params.TryGetValue(fn.Regs.StackPointer, out Node? sp0) && StackOffset(sp0, call.In[inputIndex]) is int at &&
             boxes.TryGetValue(at, out int box))
             return box;
         return -1;
@@ -1431,7 +1500,7 @@ public sealed class MethodPipeline
         if (call.Aux is not CallInfo info || info.Indirect || info.Intrinsic != null) return -1;
         if (inputIndex >= info.Slots.Count) return -1;
         ArgSlot slot = info.Slots[inputIndex];
-        int position = slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + 4 : -1;
+        int position = _program.Abi.Regs.IntPositionOfSlot(slot);
         if (position < 0) return -1;
 
         CallTarget target = _program.Resolve(info.Target);

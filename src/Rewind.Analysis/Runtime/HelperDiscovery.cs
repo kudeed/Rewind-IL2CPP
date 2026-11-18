@@ -36,12 +36,29 @@ public static class HelperDiscovery
         return Math.Abs(Line(a) - Line(b)) * 1000 + Math.Abs(a.Build - b.Build);
     }
 
+    /// <summary>
+    /// Functions called through stubs that name them (an ELF's PLT): imported C library functions (memcpy,
+    /// sinf, ...) and the C++ runtime's (__cxa_throw). Returns how many were added.
+    /// </summary>
+    public static int AddImportStubs(NativeImage image, RuntimeHelpers helpers)
+    {
+        if (image is not ElfImage elf) return 0;
+        int added = 0;
+        foreach (var (stub, name) in elf.ImportStubs)
+            if (helpers.At(stub) == null && RuntimeHelpers.Classify(name) is { } imported)
+            {
+                helpers.Add(stub, imported);
+                added++;
+            }
+        return added;
+    }
+
     public static DiscoveredHelpers Discover(Il2CppModel model, IEnumerable<string> signatureFiles, Action<string> log)
     {
         var context = new ModelCodeContext(model);
         NativeImage image = model.Image;
-        if (image.Arch != CpuArch.X64)
-            return new DiscoveredHelpers(new RuntimeHelpers(), context, "none (machine code analysis supports x64 only so far)", 0, false);
+        if (image.Arch is not (CpuArch.X64 or CpuArch.Arm64))
+            return new DiscoveredHelpers(new RuntimeHelpers(), context, "none (machine code analysis supports x64 and ARM64 only so far)", 0, false);
 
         context.DiscoverCallTargets();
         var index = new CodeIndex(context);
@@ -82,6 +99,8 @@ public static class HelperDiscovery
             if (exact && kinds >= 20) break;
         }
         if (best == null) return new DiscoveredHelpers(new RuntimeHelpers(), context, "none (no signature library for this platform)", 0, false);
+        if (AddImportStubs(image, best.Helpers) > 0)
+            best = best with { Kinds = best.Helpers.ByAddress.Values.Select(i => i.Kind).Distinct().Count() };
         // What no library recognized, the compiled methods may show by the way they call it.
         if (HelperRoles.Identify(model, context, index, best.Helpers) is { } found)
         {

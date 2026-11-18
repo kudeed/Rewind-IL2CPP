@@ -94,6 +94,18 @@ public static class StackSplitting
         return found;
     }
 
+    private static readonly bool NoUntakenLoads = Environment.GetEnvironmentVariable("REWIND_NO_UNTAKEN_LOADS") != null;
+
+    /// <summary>Every use of the value is an input of a call that does not take it.</summary>
+    private static bool OnlyUntaken(Node load, Function fn, Func<Node, int, int> escapeExtent, ref Dictionary<Node, List<(Node User, int Input)>>? uses)
+    {
+        uses ??= UsesOf(fn);
+        if (!uses.TryGetValue(load, out var users) || users.Count == 0) return false;
+        foreach (var (user, input) in users)
+            if (user.Op is not (Op.Call or Op.TailCall) || escapeExtent(user, input) != StackPromotion.NotTaken) return false;
+        return true;
+    }
+
     private static readonly bool NoMergedArguments = Environment.GetEnvironmentVariable("REWIND_NO_MERGED_ARGUMENTS") != null;
 
     /// <summary>
@@ -149,8 +161,14 @@ public static class StackSplitting
 
     /// <summary>Splits the stack objects covering <paramref name="offsets"/>; returns how many lifetimes moved.</summary>
     /// <param name="removable">True for a call that does nothing but write the memory behind that input (a fill, the destination of a copy).</param>
+    /// <param name="lenient">
+    /// Objects (by the offset the high-level form named) where a read that only goes to call inputs no call takes is
+    /// no read: slots of a number that held a struct or another number for a while. Elsewhere such a read still ties
+    /// what it sees together (a struct copied through a temporary keeps the type the call it ends at gives it).
+    /// </param>
     public static int Run(Function fn, IEnumerable<int> offsets, Func<Node, int, int>? escapeExtent = null, Func<Node, int, bool>? writesOnly = null,
-        Func<Node, int, bool>? readsOnly = null, Func<Node, int, bool>? removable = null, Func<int, int>? reach = null, Func<Node, int, bool>? lowHalfOnly = null)
+        Func<Node, int, bool>? readsOnly = null, Func<Node, int, bool>? removable = null, Func<int, int>? reach = null, Func<Node, int, bool>? lowHalfOnly = null,
+        ISet<int>? lenient = null)
     {
         Trace?.Invoke($"function 0x{fn.Address:X}");
         // An address kept in a value (stored, merged) can be used from anywhere, but only to get at the object it
@@ -159,7 +177,7 @@ public static class StackSplitting
         // A handler is entered from anywhere in its region: it sees what the region's blocks wrote, each write.
         var handlerOf = new Dictionary<Block, int>();
         foreach (var (gate, region) in fn.TryGates()) handlerOf[gate.Succs[0]] = region;
-        if (!fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0)) return 0;
+        if (!fn.Params.TryGetValue(fn.Regs.StackPointer, out Node? sp0)) return 0;
         bool IsStackAddress(Node n, out int offset)
         {
             offset = 0;
@@ -173,6 +191,7 @@ public static class StackSplitting
 
         // Every use of a stack address of the function's own memory.
         var all = new List<Access>();
+        var untaken = new List<Access>();
         var escaped = new List<(int Start, int End, Node By)>();
         Dictionary<Node, List<(Node User, int Input)>>? uses = null;
         foreach (Block b in fn.Blocks)
@@ -182,7 +201,14 @@ public static class StackSplitting
                 for (int i = 0; i < n.In.Length; i++)
                 {
                     if (!IsStackAddress(n.In[i], out int at) || !Owned(at)) continue;
-                    if (n.Op == Op.Load && i == 0) all.Add(new Access(n, i, at, at + n.Type.Bytes(), true, false));
+                    if (n.Op == Op.Load && i == 0)
+                    {
+                        // What a call captures in its stack slots that it does not take (an outgoing slot used as
+                        // a temporary in between, read at each call): no read of what the memory holds.
+                        var read = new Access(n, i, at, at + n.Type.Bytes(), true, false);
+                        if (!NoUntakenLoads && lenient is { Count: > 0 } && escapeExtent != null && OnlyUntaken(n, fn, escapeExtent, ref uses)) untaken.Add(read);
+                        else all.Add(read);
+                    }
                     else if (n.Op == Op.Store && i == 0) all.Add(new Access(n, i, at, at + n.In[1].Type.Bytes(), false, true));
                     else if (n.Op is Op.Call)
                     {
@@ -240,13 +266,14 @@ public static class StackSplitting
         foreach (int offset in offsets.OrderBy(o => o))
         {
             if (!Owned(offset) || done.Contains(offset)) continue;
+            List<Access> pool = untaken.Count == 0 || lenient!.Contains(offset) ? all : [.. all, .. untaken];
             // The object: everything that overlaps the offset, transitively.
             int start = offset, end = offset + 1;
             bool grew = true;
             while (grew)
             {
                 grew = false;
-                foreach (Access a in all)
+                foreach (Access a in pool)
                 {
                     int aEnd = Math.Min(a.End, Top(a.Start));
                     if (a.Start < end && start < aEnd && (a.Start < start || aEnd > end))
@@ -269,7 +296,7 @@ public static class StackSplitting
                     }
                 continue;
             }
-            var accesses = all.Where(a => a.Start < end && start < Math.Min(a.End, Top(a.Start))).ToList();
+            var accesses = pool.Where(a => a.Start < end && start < Math.Min(a.End, Top(a.Start))).ToList();
             if (accesses.Count < 2 || accesses.Count > 400)
             {
                 Trace?.Invoke($"object [{start}, {end}) at {offset}: {accesses.Count} accesses");

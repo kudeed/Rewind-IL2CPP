@@ -426,6 +426,23 @@ public sealed partial class HirBuilder
         _ => null,
     };
 
+    private static readonly bool NoReferencePieces = Environment.GetEnvironmentVariable("REWIND_NO_REFERENCE_PIECES") != null;
+
+    /// <summary>
+    /// A reference written over the fields of a struct (two floats of a Vector3): no field of a struct holds a
+    /// piece of a reference, so the memory is the struct's slot used again for another variable - on the stack,
+    /// each lifetime gets its own memory (see StackSplitting). Until then, or anywhere else, it is a gap: cut into
+    /// the fields, the reference came out as two numbers, and C# refuses them.
+    /// </summary>
+    private void MarkReferenceInPieces(Node store, Node valueNode)
+    {
+        // (A value typed only "object" says little: the bytes of a struct copied whose source was not known.)
+        TypeSig? type = Eval(valueNode) switch { SVal v => v.Type, SNewObject o => o.Type, _ => null };
+        if (NoReferencePieces || type == null || !IsReference(type) || type.Key == _object.Key) return;
+        if (IsFrameAddress(store.In[0], out int at)) FrameConflicts.Add(FrameObjectAt(at) ?? at);
+        Problem("a reference stored over the fields of a struct");
+    }
+
     /// <summary>Assigns the bytes of a value to the fields a wide store covers.</summary>
     private void StoreParts(List<Part> leaves, Node valueNode, ulong address)
     {

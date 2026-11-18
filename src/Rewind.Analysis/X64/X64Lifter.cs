@@ -14,6 +14,21 @@ public sealed class CallShape
     public bool[] IsDouble = [];
     /// <summary>Where the result arrives, when known.</summary>
     public CallReturn Returns = CallReturn.Unknown;
+    /// <summary>
+    /// For conventions that do not number every parameter in one sequence (AArch64): exactly the argument
+    /// locations to capture, as call slots (a double takes lanes 0 and 1 of its register).
+    /// </summary>
+    public List<ArgSlot>? Slots;
+    /// <summary>AArch64: how many integer (x0, x1) and floating-point (v0-v3) registers the result arrives in.</summary>
+    public int IntResults = 1, FloatResults = 1;
+}
+
+/// <summary>Turns a machine's code into SSA IR, one function at a time.</summary>
+public interface IMachineLifter
+{
+    Function Lift(ulong start);
+    /// <summary>How often each instruction the lifter does not model was met.</summary>
+    IReadOnlyDictionary<string, int> UnsupportedCounts { get; }
 }
 
 /// <summary>What a callee leaves in the return registers.</summary>
@@ -41,8 +56,10 @@ public interface ILiftContext : ICodeContext
 /// Translates x64 machine code into SSA IR. The translation is purely about what the instructions do; nothing
 /// here knows about IL2CPP.
 /// </summary>
-public sealed class X64Lifter
+public sealed class X64Lifter : IMachineLifter
 {
+    public IReadOnlyDictionary<string, int> UnsupportedCounts => Unsupported.ToDictionary(kv => kv.Key.ToString(), kv => kv.Value);
+
     /// <summary>VarSavedRsp: the function's stack pointer while one of its catch funclets runs on a stack of its own.</summary>
     public const int VarRsp = 4, VarXmm = 16, VarFlags = 80, VarGsBase = 81, VarSavedRsp = 82, VarCount = 83;
 
@@ -690,7 +707,7 @@ public sealed class X64Lifter
     }
 
     /// <summary>Immediate dominators (Cooper, Harvey, Kennedy) over the given edges; unreachable blocks are absent.</summary>
-    private static Dictionary<Block, Block> Dominators(Block entry, Dictionary<Block, List<Block>> succs, Dictionary<Block, List<Block>> preds)
+    internal static Dictionary<Block, Block> Dominators(Block entry, Dictionary<Block, List<Block>> succs, Dictionary<Block, List<Block>> preds)
     {
         var order = new List<Block>();
         var seen = new HashSet<Block>();

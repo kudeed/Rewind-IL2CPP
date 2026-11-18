@@ -23,7 +23,7 @@ public static class ParkedAddresses
     /// </summary>
     public static bool Canonicalize(Function fn)
     {
-        if (!fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0)) return false;
+        if (!fn.Params.TryGetValue(fn.Regs.StackPointer, out Node? sp0)) return false;
         bool any = false;
         for (int round = 0; round < 6; round++)
         {
@@ -48,7 +48,7 @@ public static class ParkedAddresses
     /// <param name="escapeExtent">For a stack address passed as input <c>index</c> of a call: how many bytes the callee may touch, or -1.</param>
     public static bool Run(Function fn, Func<Node, int, int>? escapeExtent = null)
     {
-        if (!fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0)) return false;
+        if (!fn.Params.TryGetValue(fn.Regs.StackPointer, out Node? sp0)) return false;
 
         int? Stack(Node n)
         {

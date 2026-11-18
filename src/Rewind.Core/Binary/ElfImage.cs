@@ -8,7 +8,7 @@ namespace Rewind.Binary;
 /// relative relocations (REL, RELA, RELR and Android packed APS2) are applied, because position independent
 /// libraries keep most data pointers as relocation addends rather than as bytes in the file.
 /// </summary>
-public sealed class ElfImage : NativeImage
+public sealed partial class ElfImage : NativeImage
 {
     public override ImageFormat Format => ImageFormat.Elf;
 
@@ -91,11 +91,15 @@ public sealed class ElfImage : NativeImage
         foreach (Segment s in segments)
             if (s.Type == PT_DYNAMIC)
                 ReadDynamic(s.Vaddr, s.MemSize);
+        foreach (Segment s in segments)
+            if (s.Type == 0x6474e552 && s.MemSize != 0) // PT_GNU_RELRO
+                _relro.Add((s.Vaddr, s.Vaddr + s.MemSize));
 
         Os = DetectOs(haveSections);
         ReadFunctionSymbols(shoff, shentsize, shnum);
         // A stripped library has no symbol table, but its unwind tables still list every function.
         if (FunctionTable.Count == 0) ReadUnwindStarts(segments);
+        ReadPltStubs();
         FunctionTable.Sort((a, b) => a.Start.CompareTo(b.Start));
     }
 
@@ -440,6 +444,7 @@ public sealed class ElfImage : NativeImage
         if (!absolute || _symtab == 0) return;
 
         var (name, value, shndx, _) = ReadSymbol(_symtab, sym);
+        if (name != null) SlotSymbols[offset] = name;
         if (shndx != 0 && value != 0)
         {
             // GLOB_DAT / JUMP_SLOT ignore the addend; ABS uses it.

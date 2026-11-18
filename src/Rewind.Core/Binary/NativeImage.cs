@@ -61,6 +61,9 @@ public abstract class NativeImage
 
     public bool Is64Bit => PointerSize == 8;
 
+    /// <summary>True for writable memory that is constant once the image is loaded and relocated (an ELF's RELRO segment).</summary>
+    public virtual bool IsReadOnlyAfterLoad(ulong va) => false;
+
     public ulong MemoryStart => MemoryBase;
     public ulong MemoryEnd => MemoryBase + (ulong)Memory.Length;
 

@@ -49,7 +49,7 @@ public sealed class FunctionCode
 /// functions called, recursively, and the string constants referenced along the way. That tells
 /// "raise NullReferenceException" from "raise IndexOutOfRangeException" although their own bytes are equal.
 /// </summary>
-public sealed class CodeIndex(ICodeContext context)
+public sealed partial class CodeIndex(ICodeContext context)
 {
     private readonly NativeImage _image = context.Image;
     private readonly Dictionary<ulong, FunctionCode?> _code = [];
@@ -91,6 +91,7 @@ public sealed class CodeIndex(ICodeContext context)
 
     private FunctionCode? Compute(ulong address)
     {
+        if (_image.Arch == CpuArch.Arm64) return ComputeArm64(address);
         X64Cfg cfg = X64Cfg.Build(context, address);
         if (cfg.Blocks.Count == 0) return null;
         var inside = new HashSet<ulong>();

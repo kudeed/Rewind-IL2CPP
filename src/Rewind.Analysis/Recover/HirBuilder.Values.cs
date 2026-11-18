@@ -42,7 +42,7 @@ public sealed partial class HirBuilder
 
     private Sem ParamSem(Node n)
     {
-        if (n.Imm == X64Lifter.VarRsp) return new SFrame(0);
+        if (n.Imm == _fn.Regs.StackPointer) return new SFrame(0);
         return SJunk.Instance; // a register the calling convention gives no meaning on entry
     }
 
@@ -71,8 +71,8 @@ public sealed partial class HirBuilder
                 return SJunk.Instance;
             }
             case Op.Idiom when (IdiomKind)n.Imm == IdiomKind.LostRegister:
-                Problem("a value kept in a callee-saved register is used after a caught exception");
-                return SJunk.Instance;
+                if (NoLazyLostRegisters) Problem(LostRegisterUsed);
+                return NoLazyLostRegisters ? SJunk.Instance : SLostRegister.Instance;
             case Op.Idiom when (IdiomKind)n.Imm == IdiomKind.CaughtWrapper:
                 // The catch object itself (not the exception read through it) means nothing to the program. It
                 // turns up where a call captured whatever the stack slots held; used for real, it shows as an
@@ -267,6 +267,8 @@ public sealed partial class HirBuilder
         return call is HCall ? call : null;
     }
 
+    private static readonly bool NoWideShifts = Environment.GetEnvironmentVariable("REWIND_NO_WIDE_SHIFTS") != null;
+
     private Sem BinarySem(Node n)
     {
         HBinaryOp op = n.Op switch
@@ -339,6 +341,11 @@ public sealed partial class HirBuilder
 
         bool isShift = n.Op is Op.Shl or Op.ShrU or Op.ShrS;
         HExpr left = IntValue(n.In[0]), right = isShift ? ShiftCount(n.In[1], n.Type.Bits()) : IntValue(n.In[1]);
+        // A shift takes its width from the value shifted: a 64-bit shift of what the program holds as a 32-bit
+        // number shifts that number made 64 bits wide ("(long)y << 32", not "y << 32", which shifts by 0).
+        if (isShift && n.Type == VT.I64 && !NoWideShifts && left is not HConst && left.Type is PrimitiveSig && !IsFloat(left.Type) && !IsBool(left.Type) &&
+            BitsOf(left.Type) is > 0 and < 64)
+            left = IsUnsigned(left.Type) ? new HConv(HConvKind.U8, left) { Type = _ulong } : new HConv(HConvKind.I8, left) { Type = _long };
         if (n.Op == Op.ShrU && n.Type == VT.I64 && right is HConst { Value: int down } && down is > 0 and < 64 && PartOfCombined(left, down, 64 - down) is { } upper)
             return new SVal(upper);
         // Logic on truth values stays boolean: "b ^ true" is "!b".
@@ -496,6 +503,15 @@ public sealed partial class HirBuilder
             _ => HCompareOp.LeUn,
         };
         if (TypeTestCompare(n) is { } typeTest) return typeTest;
+        // "x as T" of a struct T against zero, before the operands become numbers: taken as a number, a T that is
+        // one number became that number - its field read out of the box, which is null where x is no T.
+        if (n.Op is Op.CmpEq or Op.CmpNe && !NoBoxedTests)
+        {
+            Node x = n.In[0], y = n.In[1];
+            if (x.IsConstValue(0)) (x, y) = (y, x);
+            if (y.IsConstValue(0) && Eval(x) is SVal { Expr: HTypeExpr { Op: HTypeOp.IsInst, Target: var tested } boxTest } && !IsReference(tested))
+                return new SVal(new HCompare(op, boxTest, new HConst(null, _object)) { Type = _bool });
+        }
         bool signedCompare = n.Op is Op.CmpLtS or Op.CmpLeS;
         // Equal or not is the same question either way: asked the way the values are held ("x != -1" of an sbyte).
         if (n.Op is Op.CmpEq or Op.CmpNe && !NoHeldSigned) signedCompare = HeldSigned(n.In[0]) || HeldSigned(n.In[1]);
@@ -791,6 +807,8 @@ public sealed partial class HirBuilder
     private sealed record PLocation(HExpr Location, TypeSig Type) : Place;
     private sealed record PPair(HExpr Low, HExpr High) : Place;
     private sealed record PArrayLength(HExpr Array) : Place;
+    /// <summary>One of two fields of different classes, chosen by a test: a value to read ("c ? (Renderer)a : b"), no place to write.</summary>
+    private sealed record PChosenValue(HExpr Value) : Place;
     private sealed record PObjKlass(Node Object) : Place;
     private sealed record PStatics(TypeSig Type) : Place;
     private sealed record PVTable(Node Object, int Slot, bool MethodInfo) : Place;
@@ -839,15 +857,38 @@ public sealed partial class HirBuilder
         }
         HExpr? condition = null;
         if (index.Type == VT.I1) condition = Condition(index);
-        else if (Peek(index) is SVal { Type: var known } && ReferenceEquals(known, _bool)) condition = Value(index);
+        else if (Peek(index) is SVal { Type: var known } && (ReferenceEquals(known, _bool) || known is PrimitiveSig { Element: Il2CppTypeEnum.Boolean })) condition = Value(index);
         if (condition == null) return null;
         if (FieldPlace(obj, type, (int)a.Offset, size) is not PLocation first || FieldPlace(obj, type, (int)(a.Offset + a.Scale), size) is not PLocation second)
             return null;
-        if (first.Type.Key != second.Type.Key || _p.Layouts.SizeOf(first.Type) is not { Known: true } bytes || (size > 0 && bytes.Size != size)) return null;
+        if (first.Type.Key != second.Type.Key)
+        {
+            // Two references of different classes ("skinned ? skinnedRenderer : meshRenderer"): read as the class
+            // both are.
+            if (NoChosenReferences || !IsReference(first.Type) || !IsReference(second.Type) || size != _p.Model.Image.PointerSize ||
+                CommonBase(first.Type, second.Type) is not { } common) return null;
+            HExpr one = turned ? first.Location : second.Location, zero = turned ? second.Location : first.Location;
+            return new PChosenValue(new HSelect(condition, one, zero) { Type = common });
+        }
+        if (_p.Layouts.SizeOf(first.Type) is not { Known: true } bytes || (size > 0 && bytes.Size != size)) return null;
         TypeSig reference = _m.Sigs.ByRef(first.Type);
         HExpr whenOne = new HAddressOf(second.Location) { Type = reference }, whenZero = new HAddressOf(first.Location) { Type = reference };
         var picked = new HSelect(condition, turned ? whenZero : whenOne, turned ? whenOne : whenZero) { Type = reference };
         return new PLocation(new HDeref(picked) { Type = first.Type }, first.Type);
+    }
+
+    private static readonly bool NoChosenReferences = Environment.GetEnvironmentVariable("REWIND_NO_CHOSEN_REFERENCES") != null;
+
+    /// <summary>The nearest class both classes derive from (object at the latest); null for anything but two classes.</summary>
+    private TypeSig? CommonBase(TypeSig a, TypeSig b)
+    {
+        if (a.Definition is not { IsValueType: false, IsInterface: false } || b.Definition is not { IsValueType: false, IsInterface: false }) return null;
+        if (a is GenericInstSig || b is GenericInstSig) return null;
+        var ancestors = new List<string>();
+        for (TypeSig? t = a; t != null && ancestors.Count < 64; t = t.Definition?.BaseType) ancestors.Add(t.Key);
+        for (TypeSig? t = b; t != null && ancestors.Count < 128; t = t.Definition?.BaseType)
+            if (ancestors.Contains(t.Key)) return t;
+        return _object;
     }
 
     private static Node StripExtension(Node n)
@@ -1595,6 +1636,7 @@ public sealed partial class HirBuilder
         return new SVal(new HTypeExpr(HTypeOp.IsInst, type, Value(obj)) { Type = type });
     }
 
+    private static readonly bool NoBoxedTests = Environment.GetEnvironmentVariable("REWIND_NO_BOXED_TESTS") != null;
     private static readonly bool NoFlaggedCasts = Environment.GetEnvironmentVariable("REWIND_NO_FLAGGED_CASTS") != null;
     private static readonly bool NoStructPieces = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_PIECES") != null;
     private static readonly bool NoStructTops = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_TOPS") != null;
@@ -1723,6 +1765,8 @@ public sealed partial class HirBuilder
                 return new SParts(parts.Leaves, parts.Size);
             case PArrayLength len:
                 return new SVal(new HArrayLength(len.Array) { Type = _int });
+            case PChosenValue chosen:
+                return new SVal(chosen.Value);
             case PObjKlass ok:
                 return new SObjKlass(ok.Object);
             case PStatics st:
@@ -1908,6 +1952,7 @@ public sealed partial class HirBuilder
                 if (!NoPairConflicts && (IsFloat(pair.Low.Type) || IsFloat(pair.High.Type)) && IsFrameAddress(n.In[0], out int pairAt) &&
                     IsWholeNumber(valueNode, IsFloat(pair.Low.Type), IsFloat(pair.High.Type)))
                     FrameConflicts.Add(pairAt);
+                MarkReferenceInPieces(n, valueNode);
                 Sem s = Eval(valueNode);
                 HExpr low, high;
                 if (s is SPair p) (low, high) = (p.Low, p.High);
@@ -1928,6 +1973,7 @@ public sealed partial class HirBuilder
                 return;
             }
             case PParts parts:
+                MarkReferenceInPieces(n, valueNode);
                 StoreParts(parts.Leaves, valueNode, n.Addr);
                 return;
             case PInternal:

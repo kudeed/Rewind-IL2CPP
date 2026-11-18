@@ -104,6 +104,11 @@ public sealed record HelperInfo(HelperKind Kind, int IntArgs, bool NoReturn, boo
     public int FloatArgs { get; init; }
     public bool IsDouble { get; init; }
     public string MathName { get; init; } = "";
+    /// <summary>
+    /// For a method invoker that returns a struct: the address the struct goes to comes first, before the slot
+    /// ("Invoke(&amp;result, slot, interfaceClass, obj, args...)").
+    /// </summary>
+    public bool BufferFirst { get; init; }
 }
 
 /// <summary>Maps function addresses to the runtime helpers they implement.</summary>
@@ -151,6 +156,7 @@ public sealed class RuntimeHelpers
         ("il2cpp_codegen_rethrow_exception", HelperKind.Rethrow, 1, true, false),
         ("class_is_assignable_from", HelperKind.IsAssignableFrom, 2, false, true),
         ("_CxxThrowException", HelperKind.CxxThrow, 2, true, false),
+        ("__cxa_throw", HelperKind.CxxThrow, 3, true, false),
         ("il2cpp_codegen_marshal_store_last_error", HelperKind.StoreLastError, 0, false, false),
         ("RethrowException", HelperKind.Rethrow, 1, true, false),
         ("il2cpp_codegen_get_array_type_mismatch_exception", HelperKind.GetArrayTypeMismatchException, 0, false, true),
@@ -240,8 +246,8 @@ public sealed class RuntimeHelpers
         }
         else if (core.StartsWith("_Z", StringComparison.Ordinal))
         {
-            int paren = core.Length;
-            core = core[..paren];
+            // Itanium: the qualified name, innermost first like MSVC's ("Invoke@VirtualFuncInvoker0").
+            core = ItaniumNames.Core(core) ?? core;
         }
 
         // Invoker templates: Invoke@?$InterfaceFuncInvoker0@... (MSVC) or InterfaceFuncInvoker0<...>::Invoke (Itanium).

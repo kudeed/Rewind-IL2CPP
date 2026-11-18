@@ -22,15 +22,16 @@ public sealed partial class HirBuilder
     }
 
     /// <summary>The value passed in argument position <paramref name="position"/> when it is an integer/pointer.</summary>
-    private static Node? IntAt(Node call, int position) =>
-        position < Win64Abi.RegisterSlots ? Input(call, ArgSlotKind.IntReg, position) : Input(call, ArgSlotKind.Stack, position - Win64Abi.RegisterSlots);
+    private Node? IntAt(Node call, int position) =>
+        _fn.Regs.IsStackPosition(position) ? Input(call, ArgSlotKind.Stack, _fn.Regs.StackSlotOf(position))
+        : _fn.Regs.IntRegisterOf(position) is int r and >= 0 ? Input(call, ArgSlotKind.IntReg, r) : null;
 
     private HExpr FloatAt(Node call, int position, bool isDouble)
     {
         TypeSig type = isDouble ? _double : _float;
-        if (position >= Win64Abi.RegisterSlots)
+        if (_fn.Regs.IsStackPosition(position))
         {
-            Node? slot = Input(call, ArgSlotKind.Stack, position - Win64Abi.RegisterSlots);
+            Node? slot = Input(call, ArgSlotKind.Stack, _fn.Regs.StackSlotOf(position));
             if (slot == null) return Missing(type);
             // A float occupies the low half of its stack slot. What fills the rest - what the slot held before,
             // or the widening of a value read as 32 bits - is not part of it and is not looked at.
@@ -44,10 +45,13 @@ public sealed partial class HirBuilder
             if (s is SVal v) return AsFloat(v.Expr, type);
             return AsFloat(Value(slot), type);
         }
-        Node? lo = Input(call, ArgSlotKind.FloatReg, position * 4);
+        int register = _fn.Regs.FloatRegisterOf(position);
+        if (!_fn.Regs.SharedPositions)
+            return FloatFromLanes(Input(call, ArgSlotKind.FloatReg, register * 4), isDouble ? Input(call, ArgSlotKind.FloatReg, register * 4 + 1) : null, isDouble);
+        Node? lo = Input(call, ArgSlotKind.FloatReg, register * 4);
         if (lo == null) return Missing(type);
         if (!isDouble) return AsFloat(FloatValue(lo), type);
-        Node? hi = Input(call, ArgSlotKind.FloatReg, position * 4 + 1);
+        Node? hi = Input(call, ArgSlotKind.FloatReg, register * 4 + 1);
         if (Eval(lo) is SHalf { High: false } l && hi != null && Eval(hi) is SHalf { High: true } h && ReferenceEquals(l.Whole, h.Whole))
             return l.Whole;
         if (Eval(lo) is SVal { Expr: HConst { Value: int low } } && hi != null && Eval(hi) is SVal { Expr: HConst { Value: int high } })
@@ -92,7 +96,7 @@ public sealed partial class HirBuilder
     private bool IsFrameAddress(Node n, out int offset)
     {
         offset = 0;
-        if (!_fn.Params.TryGetValue(X64Lifter.VarRsp, out Node? sp0)) return false;
+        if (!_fn.Params.TryGetValue(_fn.Regs.StackPointer, out Node? sp0)) return false;
         if (ReferenceEquals(n, sp0)) return true;
         if (n.Op == Op.Add && ReferenceEquals(n.In[0], sp0) && n.In[1].IsConst)
         {
@@ -189,7 +193,7 @@ public sealed partial class HirBuilder
                         offset = merged[0];
                     }
                     ArgSlot slot = info.Slots[i];
-                    int position = slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + Win64Abi.RegisterSlots : -1;
+                    int position = slot.Kind == ArgSlotKind.IntReg ? slot.Index : slot.Kind == ArgSlotKind.Stack ? slot.Index + _fn.Regs.FirstStackPosition : -1;
                     if (position < 0) continue;
                     TypeSig? type = null;
                     if (!info.Indirect)
@@ -462,6 +466,11 @@ public sealed partial class HirBuilder
             return;
         }
 
+        if (kind is ReturnKind.StructInRegisterPair or ReturnKind.FloatAggregate)
+        {
+            FinishRegisterStruct(call, expr, kind, returnType);
+            return;
+        }
         Dictionary<int, Node> projs = Projections(call);
         switch (kind)
         {
@@ -521,7 +530,7 @@ public sealed partial class HirBuilder
         // itself.)
         bool own = _p.OwnTranslation && _p.Translations == 1;
         if (!own && !_p.CheckingCopies) return null;
-        for (int position = 0; position < Win64Abi.RegisterSlots; position++)
+        for (int position = 0; position < _fn.Regs.IntArgs.Length; position++)
         {
             if (IntAt(call, position) is not { } handed || Peek(handed) is not SMethod named) continue;
             MethodAbi abi = named.Inst != null ? _p.Abi.For(named.Inst) : _p.Abi.For(named.Method, [], []);
@@ -578,6 +587,22 @@ public sealed partial class HirBuilder
     private void EmitIntrinsic(Node call, CallInfo info)
     {
         if (TryEmitBlockOp(call)) return;
+        // A rounding the machine does in one instruction (AArch64's FRINT*): the Math method of that name.
+        if (info.Intrinsic!.StartsWith("math.", StringComparison.Ordinal) && call.In.Length == 1 && call.Type is VT.F32 or VT.F64)
+        {
+            bool isDouble = call.Type == VT.F64;
+            HExpr operand = AsFloat(FloatValue(call.In[0]), isDouble ? _double : _float);
+            HExpr rounded = MathCall(info.Intrinsic[5..], isDouble, operand);
+            if (!IsUsed(call)) Emit(new HEval(rounded), call.Addr);
+            else if (_materialize.Contains(call))
+            {
+                HVar t = Temp(isDouble ? _double : _float, call.Type);
+                Emit(new HAssign(new HLocal(t) { Type = t.Type }, rounded), call.Addr);
+                _sem[call] = new SVal(new HLocal(t) { Type = t.Type });
+            }
+            else _sem[call] = new SVal(rounded);
+            return;
+        }
         HExpr[] args = call.In.Select(Value).ToArray();
         var expr = new HOpaque(info.Intrinsic!, args) { Type = TypeForBits(call.Type) };
         if (info.Intrinsic == "memory_barrier") return; // volatile access marker
@@ -1164,6 +1189,7 @@ public sealed partial class HirBuilder
     }
 
     private static readonly bool NoInvokerShapes = Environment.GetEnvironmentVariable("REWIND_NO_INVOKER_SHAPES") != null;
+    private static readonly bool NoBufferInvokers = Environment.GetEnvironmentVariable("REWIND_NO_BUFFER_INVOKERS") != null;
     private static readonly bool NoGenericInvokerShapes = Environment.GetEnvironmentVariable("REWIND_NO_GENERIC_INVOKERS") != null;
     private static readonly bool NoRgctxCalls = Environment.GetEnvironmentVariable("REWIND_NO_RGCTX_CALLS") != null;
     // (Asked from every thread that recovers methods; what a function is does not depend on who asks.)
@@ -1192,9 +1218,12 @@ public sealed partial class HirBuilder
             {
                 [Iced.Intel.Register.RDX] = Iced.Intel.Register.RDX,
                 [Iced.Intel.Register.R8] = Iced.Intel.Register.R8,
+                [Iced.Intel.Register.R9] = Iced.Intel.Register.R9,
             };
             Iced.Intel.Register objectIn = Iced.Intel.Register.None, classIn = Iced.Intel.Register.None;
             bool slot = false, entry = false, offsets = false, through = false, others = false, slow = false, generic = false;
+            // (One that returns a struct is handed the address it goes to first: the slot comes second.)
+            bool slotSecond = false;
             bool first = true;
             foreach (var block in cfg.Blocks)
             {
@@ -1202,6 +1231,7 @@ public sealed partial class HirBuilder
                 {
                     bool load = i.Mnemonic == Iced.Intel.Mnemonic.Mov && i.Op0Kind == Iced.Intel.OpKind.Register && i.Op1Kind == Iced.Intel.OpKind.Memory;
                     if (i.Mnemonic == Iced.Intel.Mnemonic.Movzx && i.Op1Kind == Iced.Intel.OpKind.Register && i.Op1Register == Iced.Intel.Register.CX) slot = true;
+                    if (i.Mnemonic == Iced.Intel.Mnemonic.Movzx && i.Op1Kind == Iced.Intel.OpKind.Register && i.Op1Register == Iced.Intel.Register.DX) slotSecond = true;
                     // The class of the object: read through the register an argument came in, or a copy of it.
                     if (first && load && classIn == Iced.Intel.Register.None && i.MemoryIndex == Iced.Intel.Register.None && i.MemoryDisplacement64 == 0 &&
                         holds.TryGetValue(i.MemoryBase, out Iced.Intel.Register argument))
@@ -1257,6 +1287,13 @@ public sealed partial class HirBuilder
                 else if (objectIn == Iced.Intel.Register.R8 && offsets)
                     found = new HelperInfo(HelperKind.InterfaceInvoker, 0, false, true, "InterfaceInvoker (known by its code)");
             }
+            else if (slotSecond && !slot && through && !others && !generic && !NoBufferInvokers)
+            {
+                if (objectIn == Iced.Intel.Register.R8 && entry && !offsets && !slow)
+                    found = new HelperInfo(HelperKind.VirtualInvoker, 0, false, true, "VirtualInvoker returning a struct (known by its code)") { BufferFirst = true };
+                else if (objectIn == Iced.Intel.Register.R9 && offsets)
+                    found = new HelperInfo(HelperKind.InterfaceInvoker, 0, false, true, "InterfaceInvoker returning a struct (known by its code)") { BufferFirst = true };
+            }
         }
         return InvokerShapes.GetOrAdd(address, found);
     }
@@ -1305,7 +1342,7 @@ public sealed partial class HirBuilder
     /// not ones that something else told.
     /// </summary>
     private void BuildCall(Node call, MethodDef method, TypeSig[] classArgs, TypeSig[] methodArgs, bool isVirtual, bool tail,
-        List<MethodDef>? alternatives, bool skipFirst, Node? receiverOverride = null, int shift = 0, bool listed = false)
+        List<MethodDef>? alternatives, bool skipFirst, Node? receiverOverride = null, int shift = 0, bool listed = false, bool bufferFirst = false)
     {
         MethodAbi abi = _p.Abi.For(method, classArgs, methodArgs);
         bool classTold = false, methodTold = false;
@@ -1315,7 +1352,7 @@ public sealed partial class HirBuilder
         // method descriptor the shared code is handed, and the type of the receiver.
         foreach (AbiParam p in abi.Params)
         {
-            if (p.Role != ParamRole.MethodInfo || IntAt(call, p.Position + shift) is not { } descriptor) continue;
+            if (p.Role != ParamRole.MethodInfo || IntAt(call, Shifted(p, shift)) is not { } descriptor) continue;
             // The hidden method argument is whatever the register held unless the callee is generic: only looked at.
             if (Peek(descriptor) is SMethod { Inst: { } named } sm && ReferenceEquals(sm.Method, method) &&
                 !named.ClassArguments.Any(Open) && !named.MethodArguments.Any(Open))
@@ -1337,7 +1374,7 @@ public sealed partial class HirBuilder
         }
         if (!method.IsStatic && method.DeclaringType.GenericParameters.Length != 0 && abi.This != null)
         {
-            Node? receiverNode = receiverOverride ?? IntAt(call, abi.This.Position + shift);
+            Node? receiverNode = receiverOverride ?? IntAt(call, Shifted(abi.This, shift));
             TypeSig? receiverType = receiverNode == null ? null : Eval(receiverNode) switch
             {
                 SNewObject o => o.Type,
@@ -1369,7 +1406,8 @@ public sealed partial class HirBuilder
 
         foreach (AbiParam p in abi.Params)
         {
-            int position = p.Position + shift;
+            // (Where the invoker is handed the result's address first, that stays where it is.)
+            int position = bufferFirst && p.Role == ParamRole.ReturnBuffer ? p.Position : Shifted(p, shift);
             switch (p.Role)
             {
                 case ParamRole.MethodInfo:
@@ -1421,6 +1459,11 @@ public sealed partial class HirBuilder
                     TypeSig type = p.Type!;
                     HExpr arg;
                     if (p.Pass == PassKind.Float) arg = FloatAt(call, position, p.IsDouble);
+                    else if (p.Pass is PassKind.IntegerPair or PassKind.FloatAggregate)
+                    {
+                        List<Node?> registers = ArgumentRegisters(call, p, position, out Carried how);
+                        arg = StructFromRegisters(registers, type, how, call.Addr);
+                    }
                     else
                     {
                         Node? node = IntAt(call, position);
@@ -1767,15 +1810,19 @@ public sealed partial class HirBuilder
         if (!method.IsStatic || method.GenericParameters.Length != 0) return false;
         PInvokeImport? import = _p.PInvokeOf(method);
         var arguments = new HExpr[method.Parameters.Length];
+        int ints = 0, floats = 0;
         for (int i = 0; i < arguments.Length; i++)
         {
             TypeSig type = method.Parameters[i].Type;
             if (IsFloat(type))
             {
-                arguments[i] = FloatAt(call, i, BitsOf(type) == 64);
+                arguments[i] = FloatAt(call, _fn.Regs.SharedPositions ? i : FloatArgPosition(floats), BitsOf(type) == 64);
+                floats++;
                 continue;
             }
-            if (IntAt(call, i) is not { } native || Unmarshal(native, type, import) is not { } value) return false;
+            int at = IntArgPosition(ints++, floats);
+            if (!_fn.Regs.SharedPositions && at >= 8) return false;
+            if (IntAt(call, _fn.Regs.SharedPositions ? i : at) is not { } native || Unmarshal(native, type, import) is not { } value) return false;
             arguments[i] = value;
         }
         TypeSig returnType = method.ReturnType;
@@ -1878,6 +1925,8 @@ public sealed partial class HirBuilder
                 {
                     TypeSig type = p.Type!;
                     if (p.Pass == PassKind.Float) args[p.ArgumentIndex] = FloatAt(call, p.Position, p.IsDouble);
+                    else if (p.Pass is PassKind.IntegerPair or PassKind.FloatAggregate)
+                        args[p.ArgumentIndex] = StructFromRegisters(ArgumentRegisters(call, p, p.Position, out Carried how), type, how, call.Addr);
                     else if (IntAt(call, p.Position) is not { } node) args[p.ArgumentIndex] = Missing(type);
                     else if (p.Pass == PassKind.Indirect) args[p.ArgumentIndex] = LocationOf(node, type) ?? Value(node);
                     else if (type is ByRefSig byRef && LocationOf(node, byRef.ElementType) is { } location)
@@ -1952,7 +2001,7 @@ public sealed partial class HirBuilder
             case HelperKind.MathFunction:
             {
                 var operands = new HExpr[helper.FloatArgs];
-                for (int i = 0; i < operands.Length; i++) operands[i] = FloatAt(call, i, helper.IsDouble);
+                for (int i = 0; i < operands.Length; i++) operands[i] = FloatAt(call, FloatArgPosition(i), helper.IsDouble);
                 TypeSig type = helper.IsDouble ? _double : _float;
                 // fmod is the IL "rem" instruction applied to floating point operands.
                 HExpr value = helper.MathName == "fmod" && operands.Length == 2
@@ -1966,7 +2015,7 @@ public sealed partial class HirBuilder
                 // modf(x, &whole): the whole part is x truncated toward zero, the result is what is left - and
                 // for an infinity a zero of its sign, where "x - whole" would give NaN.
                 TypeSig type = helper.IsDouble ? _double : _float;
-                Node? pointer = IntAt(call, 1);
+                Node? pointer = IntAt(call, IntArgPosition(0, 1));
                 HExpr? location = pointer != null ? LocationOf(pointer, type) : null;
                 MethodDef? isInfinity = _m.FindType(helper.IsDouble ? "System.Double" : "System.Single")?.Methods
                     .FirstOrDefault(m => m.Name == "IsInfinity" && m.IsStatic && m.Parameters.Length == 1);
@@ -1974,7 +2023,7 @@ public sealed partial class HirBuilder
                 HVar x = _h.NewLocal(type, "t"), whole = _h.NewLocal(type, "t");
                 HExpr X() => new HLocal(x) { Type = type };
                 HExpr Whole() => new HLocal(whole) { Type = type };
-                Emit(new HAssign(X(), FloatAt(call, 0, helper.IsDouble)), call.Addr);
+                Emit(new HAssign(X(), FloatAt(call, FloatArgPosition(0), helper.IsDouble)), call.Addr);
                 Emit(new HAssign(Whole(), MathCall("Truncate", helper.IsDouble, [X()])), call.Addr);
                 Emit(new HAssign(location, Whole()), call.Addr);
                 HExpr zero = helper.IsDouble ? new HConst(0.0, type) : new HConst(0f, type);
@@ -2163,27 +2212,31 @@ public sealed partial class HirBuilder
                 return;
             case HelperKind.VirtualInvoker:
             {
-                // Invoke(slot, obj, args...)
-                if (a0 == null || !a0.IsConst || a1 == null) break;
-                HExpr receiver = Value(a1);
+                // Invoke(slot, obj, args...) - or Invoke(&result, slot, obj, args...)
+                bool buffer = helper.BufferFirst;
+                Node? slotNode = buffer ? IntAt(call, 1) : a0, objectNode = buffer ? IntAt(call, 2) : a1;
+                if (slotNode == null || !slotNode.IsConst || objectNode == null) break;
+                HExpr receiver = Value(objectNode);
                 TypeSig? receiverType = receiver.Type;
-                if (_castTypes.TryGetValue(a1, out List<TypeSig>? casts) && casts.Count == 1) receiverType = casts[0];
-                MethodDef? method = FindVirtual(receiverType, (int)a0.UImm);
+                if (_castTypes.TryGetValue(objectNode, out List<TypeSig>? casts) && casts.Count == 1) receiverType = casts[0];
+                MethodDef? method = FindVirtual(receiverType, (int)slotNode.UImm);
                 if (method == null) break;
                 TypeSig[] classArgs = receiverType is GenericInstSig g && ReferenceEquals(g.Definition, method.DeclaringType) ? g.Arguments : [];
-                BuildCall(call, method, classArgs, [], isVirtual: true, tail, null, skipFirst: false, receiverOverride: a1, shift: 1);
+                BuildCall(call, method, classArgs, [], isVirtual: true, tail, null, skipFirst: false, receiverOverride: objectNode, shift: 1, bufferFirst: buffer);
                 return;
             }
             case HelperKind.InterfaceInvoker:
             {
-                // Invoke(slot, interfaceClass, obj, args...)
-                if (a0 == null || !a0.IsConst || a1 == null || a2 == null) break;
-                TypeSig? iface = EvalKlass(a1);
-                int slot = (int)a0.UImm;
+                // Invoke(slot, interfaceClass, obj, args...) - or Invoke(&result, slot, interfaceClass, obj, args...)
+                bool buffer = helper.BufferFirst;
+                Node? slotNode = buffer ? IntAt(call, 1) : a0, classNode = buffer ? IntAt(call, 2) : a1, objectNode = buffer ? IntAt(call, 3) : a2;
+                if (slotNode == null || !slotNode.IsConst || classNode == null || objectNode == null) break;
+                TypeSig? iface = EvalKlass(classNode);
+                int slot = (int)slotNode.UImm;
                 MethodDef? method = iface?.Definition?.Methods.FirstOrDefault(m => m.HasSlot && m.Slot == slot);
                 if (method == null) break;
                 TypeSig[] classArgs = iface is GenericInstSig g ? g.Arguments : [];
-                BuildCall(call, method, classArgs, [], isVirtual: true, tail, null, skipFirst: false, receiverOverride: a2, shift: 2);
+                BuildCall(call, method, classArgs, [], isVirtual: true, tail, null, skipFirst: false, receiverOverride: objectNode, shift: 2, bufferFirst: buffer);
                 return;
             }
             case HelperKind.RgctxData:

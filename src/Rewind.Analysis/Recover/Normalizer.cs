@@ -337,6 +337,21 @@ public sealed partial class Normalizer(ProgramAnalysis program)
     private bool IsMetadataSlot(ulong va) =>
         program.Defaults.Slots.ContainsKey(va) || program.Model.ResolveUsageSlot(va) != null;
 
+    /// <summary>
+    /// A merged choice of metadata slot addresses (a phi of constants, perhaps widened): a phi of the slots'
+    /// contents in the same block, or null.
+    /// </summary>
+    private Node? SlotChoice(Node slot)
+    {
+        Node inner = slot;
+        while (inner.Op is Op.ZExt or Op.SExt && inner.In.Length == 1) inner = inner.In[0];
+        if (inner.Op != Op.Phi || inner.Block is not { } block || inner.In.Length != block.Preds.Count || inner.In.Length is < 2 or > 8) return null;
+        if (!inner.In.All(i => i.IsConst && IsMetadataSlot(i.UImm))) return null;
+        Node phi = _fn.NewNode(Op.Phi, VT.I64, block, inner.In.Select(i => SlotValue(i.UImm)).ToArray());
+        block.Phis.Add(phi);
+        return phi;
+    }
+
     private Node SlotValue(ulong va)
     {
         if (!_slotValues.TryGetValue(va, out Node? node))
@@ -427,6 +442,13 @@ public sealed partial class Normalizer(ProgramAnalysis program)
                     {
                         // Returns the initialized content of the slot whose address it was given.
                         Node? slot = IntArg(call, 0);
+                        if (slot != null && !slot.IsConst && !_fn.Regs.SharedPositions && SlotChoice(slot) is { } choice)
+                        {
+                            // One call for two slots, the compiler having merged two ways that differed in it
+                            // alone: the content of the slot each way brings.
+                            result = choice;
+                            break;
+                        }
                         if (slot == null || !slot.IsConst) { remove = false; break; }
                         result = SlotValue((ulong)slot.Imm);
                         break;
@@ -909,7 +931,8 @@ public sealed partial class Normalizer(ProgramAnalysis program)
                     // point register of its position, by its type. The other register of a position holds leftovers.
                     bool IsFloating(int position) => position >= 1 && position <= method.Parameters.Length &&
                         method.Parameters[position - 1].Type is PrimitiveSig { Element: Rewind.Runtime.Il2CppTypeEnum.R4 or Rewind.Runtime.Il2CppTypeEnum.R8 };
-                    bool compared = a.Kind switch
+                    // (Where integer and floating-point registers are counted apart, every slot is compared.)
+                    bool compared = !_fn.Regs.SharedPositions ? a.Kind != ArgSlotKind.Target : a.Kind switch
                     {
                         ArgSlotKind.IntReg => a.Index < positions && !IsFloating(a.Index),
                         ArgSlotKind.FloatReg => a.Index / 4 < positions && IsFloating(a.Index / 4),
