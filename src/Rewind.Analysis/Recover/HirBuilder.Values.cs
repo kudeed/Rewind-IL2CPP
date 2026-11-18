@@ -1235,6 +1235,56 @@ public sealed partial class HirBuilder
     }
 
     private static readonly bool NoProvenMultiples = Environment.GetEnvironmentVariable("REWIND_NO_PROVEN_MULTIPLES") != null;
+    private static readonly bool NoFixedBuffers = Environment.GetEnvironmentVariable("REWIND_NO_FIXED_BUFFERS") != null;
+
+    /// <summary>The element of a fixed-size buffer ("fixed ulong bits[64]": a struct of the compiler's with one field, FixedElementField).</summary>
+    private bool IsFixedBuffer(TypeSig type, out FieldSlot element)
+    {
+        element = default;
+        if (type.Definition is not { IsValueType: true } definition || !definition.Name.Contains("e__FixedBuffer", StringComparison.Ordinal)) return false;
+        TypeLayout layout = _p.Layouts.Of(type);
+        if (!layout.Known || layout.Fields.Length != 1 || layout.Fields[0].Field.Name != "FixedElementField" || layout.Fields[0].Offset != 0) return false;
+        element = layout.Fields[0];
+        return element.Size > 0;
+    }
+
+    /// <summary>
+    /// An element of a fixed-size buffer inside the struct a reference refers to, reached by index: the
+    /// address of the buffer's first element plus the index times the element size, as C# indexes such a
+    /// buffer ("bits[i]", which needs no pinning since C# 7.3).
+    /// </summary>
+    private Place? FixedBufferPlace(HExpr owner, TypeSig type, AddressParts a, int size)
+    {
+        long offset = a.Offset;
+        HExpr at = owner;
+        for (int depth = 0; depth < 6; depth++)
+        {
+            if (!IsStructType(type) || offset < 0 || _p.Layouts.FieldAt(type, (int)offset) is not { } slot) return null;
+            var field = new HField { Object = at, Field = slot.Field, DeclaringType = type, Type = slot.Type };
+            if (IsFixedBuffer(slot.Type, out FieldSlot element))
+            {
+                int elementSize = element.Size;
+                long inside = offset - slot.Offset;
+                if (inside % elementSize != 0 || (size > 0 && size != elementSize) || IsStructType(element.Type)) return null;
+                HExpr? index = a.Scale == elementSize ? IntValue(StripExtension(a.Index!)) : ScaledIndex(a.Index!, a.Scale, elementSize);
+                if (index == null) return null;
+                if (inside != 0) index = new HBinary(HBinaryOp.Add, index, new HConst((int)(inside / elementSize), _int)) { Type = _int };
+                // (A reference to the first element moved on by the offset: what C# makes of "bits[i]".)
+                TypeSig pointerType = _m.Sigs.ByRef(element.Type);
+                var first = new HField { Object = field, Field = element.Field, DeclaringType = slot.Type, Type = element.Type };
+                // (The offset as a native integer, as pointer arithmetic takes it: "(nint)i * 8".)
+                HExpr wide = new HConv(HConvKind.I, index) { Type = _nint };
+                HExpr bytes = elementSize == 1 ? wide : new HBinary(HBinaryOp.Mul, wide, new HConst(elementSize, _int)) { Type = _nint };
+                var pointer = new HBinary(HBinaryOp.Add, new HAddressOf(first) { Type = pointerType }, bytes) { Type = pointerType };
+                return new PLocation(new HDeref(pointer) { Type = element.Type }, element.Type);
+            }
+            if (!IsStructType(slot.Type)) return null;
+            at = field;
+            type = slot.Type;
+            offset -= slot.Offset;
+        }
+        return null;
+    }
 
     /// <summary>
     /// Whether <paramref name="n"/> is a multiple of <paramref name="k"/> however it is reached: constants,
@@ -1406,7 +1456,9 @@ public sealed partial class HirBuilder
                 return ValuePlace(a, new SVal(new HLocal(o.Variable) { Type = o.Type }), size);
             case SRef r:
             {
-                if (a.Index != null) return new PUnknown("indexed access through a reference");
+                if (a.Index != null)
+                    return !NoFixedBuffers && FixedBufferPlace(r.Location, r.Type, a, size) is { } element ? element
+                        : new PUnknown("indexed access through a reference");
                 var (refSize, _, _) = _p.Layouts.SizeOf(r.Type);
                 bool isStruct = r.Type.Definition is { IsValueType: true, IsEnum: false } && r.Type is not PrimitiveSig;
                 if (a.Offset == 0 && (!isStruct || size < 0 || size == refSize)) return new PLocation(r.Location, r.Type);
