@@ -20,7 +20,7 @@ namespace Rewind.Analysis.Runtime;
 /// A copy may call other copies, so identities are refined until they stop changing: two functions are the
 /// same when their own code is the same and the functions they call are the same.
 /// </summary>
-public static class CopyMatcher
+public static partial class CopyMatcher
 {
     private sealed class Body
     {
@@ -147,7 +147,7 @@ public static class CopyMatcher
     {
         var result = new Result();
         NativeImage image = program.Model.Image;
-        if (image.Arch != CpuArch.X64) return result;
+        if (image.Arch is not (CpuArch.X64 or CpuArch.Arm64)) return result;
         ModelCodeContext context = program.Context;
         ulong imageSpan = 0;
         foreach (ImageSection section in image.Sections) imageSpan = Math.Max(imageSpan, section.Va + section.Size - image.ImageBase);
@@ -156,7 +156,8 @@ public static class CopyMatcher
         var bodies = new Dictionary<ulong, Body?>();
         Body? BodyOf(ulong address)
         {
-            if (!bodies.TryGetValue(address, out Body? body)) bodies[address] = body = Describe(program, hash, address, imageSpan);
+            if (!bodies.TryGetValue(address, out Body? body))
+                bodies[address] = body = image.Arch == CpuArch.Arm64 ? DescribeArm64(program, hash, address) : Describe(program, hash, address, imageSpan);
             return body;
         }
 

@@ -106,6 +106,38 @@ public sealed partial class HirBuilder
         return false;
     }
 
+    private static readonly bool NoWiderPointees = Environment.GetEnvironmentVariable("REWIND_NO_WIDER_POINTEES") != null;
+
+    /// <summary>Whether the method called takes an unmanaged pointer (not a reference) at this position.</summary>
+    private bool PointerParameterAt(CallInfo info, int position)
+    {
+        if (info.Indirect) return false;
+        static bool At(MethodAbi abi, int position) => abi.Params.Any(p => p.Position == position && p.Role == ParamRole.Argument && p.Type is PointerSig);
+        CallTarget target = _p.Resolve(info.Target);
+        foreach (MethodDef m in target.Methods.Take(8))
+            if (At(_p.Abi.For(m, [], []), position)) return true;
+        foreach (MethodInst inst in target.Insts.Take(8))
+            if (At(_p.Abi.For(inst), position)) return true;
+        return false;
+    }
+
+    /// <summary>Whether the code reads or writes the stack at <paramref name="offset"/> itself, in more than <paramref name="size"/> bytes at once.</summary>
+    private bool WiderAccessAt(int offset, int size) => DirectAccessSize(offset) > size;
+
+    /// <summary>The widest read or write of the stack at exactly <paramref name="offset"/> (-1: none).</summary>
+    private int DirectAccessSize(int offset)
+    {
+        int widest = -1;
+        foreach (Block b in _fn.Blocks)
+            foreach (Node n in b.Nodes)
+            {
+                if (n.Dead || n.Op is not (Op.Load or Op.Store)) continue;
+                int bytes = n.Op == Op.Load ? n.Type.Bytes() : n.In[1].Type.Bytes();
+                if (bytes > widest && IsFrameAddress(n.In[0], out int at) && at == offset) widest = bytes;
+            }
+        return widest;
+    }
+
     private static TypeSig? PointeeOf(MethodAbi abi, int position)
     {
         foreach (AbiParam p in abi.Params)
@@ -244,6 +276,9 @@ public sealed partial class HirBuilder
                         }
                     }
                     if (type == null || Open(type) || !Nameable(type)) continue;
+                    // "(byte*)&local": a pointer handed on to memory the code itself reads or writes in wider
+                    // pieces is a view of it, not what it is.
+                    if (merged == null && !NoWiderPointees && PointerParameterAt(info, position) && WiderAccessAt(offset, _p.Layouts.SizeOf(type).Size)) continue;
                     if (merged == null)
                     {
                         // (One call takes a struct there, another a different struct: the memory holds one object,
@@ -1477,6 +1512,12 @@ public sealed partial class HirBuilder
                             HExpr? location = LocationOf(node, byRef.ElementType);
                             arg = location != null ? new HAddressOf(location) { Type = type } : Value(node);
                         }
+                        else if (type is PointerSig && !NoWiderPointees && Eval(node) is SFrame frame &&
+                                 FramePlace(frame.Offset, DirectAccessSize(frame.Offset)) is PLocation { Location: { Type: { } heldType } held })
+                        {
+                            // The address of a local handed over as a pointer ("(byte*)&value").
+                            arg = new HAddressOf(held) { Type = _m.Sigs.ByRef(heldType) };
+                        }
                         else
                         {
                             arg = ValueFor(node, type);
@@ -2071,6 +2112,60 @@ public sealed partial class HirBuilder
                 if (a0 == null || result == null) break;
                 _sem[result] = new SUnboxed(a0);
                 return;
+            case HelperKind.ArraySetAt or HelperKind.ArrayGetAt or HelperKind.ArrayGetAddressAt:
+            {
+                // An array's own accessors (GetAt, SetAt, GetAddressAt: the bounds check, then the element),
+                // which clang keeps as functions of their own: array[index].
+                if (a0 == null || a1 == null || Value(a0) is not { Type: SzArraySig arrayType } array) break;
+                TypeSig elementType = arrayType.ElementType;
+                HExpr index = IndexValue(a1, 0);
+                if (index is HConst { Value: long fixedIndex } && fixedIndex is >= 0 and <= int.MaxValue) index = new HConst((int)fixedIndex, _int);
+                var element = new HElement { Array = array, Index = index, Type = elementType };
+                if (helper.Kind == HelperKind.ArrayGetAddressAt)
+                {
+                    if (result != null) _sem[result] = new SRef(element, elementType);
+                    if (tail) Emit(new HReturn(null), call.Addr);
+                    return;
+                }
+                // A value in one register: a reference, a primitive, an enum.
+                bool isFloat = elementType is PrimitiveSig { Element: Il2CppTypeEnum.R4 or Il2CppTypeEnum.R8 };
+                bool isDouble = elementType is PrimitiveSig { Element: Il2CppTypeEnum.R8 };
+                if (!(IsReference(elementType) || elementType is PrimitiveSig { Element: not Il2CppTypeEnum.TypedByRef } or PointerSig ||
+                      elementType.Definition is { IsEnum: true })) break;
+                if (helper.Kind == HelperKind.ArrayGetAt)
+                {
+                    FinishCall(call, element, isDouble ? ReturnKind.Double : isFloat ? ReturnKind.Float : ReturnKind.Integer, elementType, tail);
+                    return;
+                }
+                HExpr value;
+                if (isFloat) value = FloatAt(call, _fn.Regs.SharedPositions ? 2 : FloatArgPosition(0), isDouble);
+                else if (a2 != null) value = Value(a2);
+                else break;
+                Emit(new HAssign(element, Coerce(value, elementType)), call.Addr);
+                if (tail) Emit(new HReturn(null), call.Addr);
+                return;
+            }
+            case HelperKind.UnboxChecked:
+            {
+                // The class it checks the object against is the type of the value inside.
+                if (a0 == null || a1 == null || EvalKlass(a1) is not { } boxedType) break;
+                if (!_castTypes.TryGetValue(a0, out List<TypeSig>? known)) _castTypes[a0] = known = [];
+                if (!known.Contains(boxedType)) known.Insert(0, boxedType);
+                if (result != null) _sem[result] = new SUnboxed(a0);
+                return;
+            }
+            case HelperKind.SinCos:
+            {
+                TypeSig type = helper.IsDouble ? _double : _float;
+                Node? sine = IntAt(call, IntArgPosition(0, 1)), cosine = IntAt(call, IntArgPosition(1, 1));
+                HExpr? sineAt = sine != null ? LocationOf(sine, type) : null, cosineAt = cosine != null ? LocationOf(cosine, type) : null;
+                if (sineAt == null || cosineAt == null) break;
+                HVar x = _h.NewLocal(type, "t");
+                Emit(new HAssign(new HLocal(x) { Type = type }, FloatAt(call, FloatArgPosition(0), helper.IsDouble)), call.Addr);
+                Emit(new HAssign(sineAt, MathCall("Sin", helper.IsDouble, new HLocal(x) { Type = type })), call.Addr);
+                Emit(new HAssign(cosineAt, MathCall("Cos", helper.IsDouble, new HLocal(x) { Type = type })), call.Addr);
+                return;
+            }
             case HelperKind.IsInst:
             {
                 TypeSig? type = a1 != null ? EvalKlass(a1) : null;

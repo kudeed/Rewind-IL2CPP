@@ -204,6 +204,7 @@ public static class ExceptionStacks
         var accesses = new Dictionary<Node, Access>();
         Dictionary<Node, List<Node>>? callUses = null;
         var inner = new HashSet<Node>(); // the values in between: indexes, addresses, the count plus one
+        List<Node>? indexSums = null;
 
         // A read that is only handed to calls as a stack argument: the compiler put the stack where arguments
         // beyond the fourth would go (no call here has any), and a call's possible arguments are read from
@@ -301,10 +302,20 @@ public static class ExceptionStacks
                     // The stack's own memory handed to anything else: not ours to reason about.
                     for (int i = 0; i < n.In.Length; i++)
                         if (stack(n.In[i], out int at) && at >= storage && at < end && !(n.Op == Op.Add && i == 0 && n.In[1].IsConst))
+                        {
+                            // The array's address plus a scaled index (clang adds the index last): fine when
+                            // that sum turns out to be an entry's address.
+                            if (n.Op == Op.Add && n.Type == VT.I64)
+                            {
+                                (indexSums ??= []).Add(n);
+                                continue;
+                            }
                             return Bail(10);
+                        }
                 }
             }
         }
+        if (indexSums != null && indexSums.Any(n => !inner.Contains(n))) return Bail(10);
         if (!accesses.Values.Any(a => !a.IsCount)) return Bail(11);
 
         // The count is only ever stored back, changed by a constant, or used as an index.

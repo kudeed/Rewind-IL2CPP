@@ -66,6 +66,12 @@ public enum HelperKind
     RgctxData,               // il2cpp_rgctx_data(rgctx, index) and its no-init variant
     MethodIsStatic, MethodIsInterface, MethodIsGenericInstance,
     GetInstanceFieldDataPointer, WriteInstanceFieldData,
+    /// <summary>UnBox(object, class): the unboxed value's address, the object checked to be of that class first.</summary>
+    UnboxChecked,
+    /// <summary>__stack_chk_fail: the stack protector found its guard overwritten (does not return).</summary>
+    StackCheckFail,
+    /// <summary>sincos(x, &amp;sine, &amp;cosine) / sincosf.</summary>
+    SinCos,
     ArrayGetAt, ArraySetAt, ArrayGetAddressAt,
     /// <summary>A C runtime math function (sqrt, sin, pow, ...); the helper's name says which.</summary>
     MathFunction,
@@ -270,6 +276,10 @@ public sealed class RuntimeHelpers
         if (MathFunctions.TryGetValue(core, out var math))
             return new HelperInfo(HelperKind.MathFunction, 0, false, true, name) { FloatArgs = math.Args, IsDouble = math.IsDouble, MathName = math.Managed };
         if (core is "modf" or "modff") return new HelperInfo(HelperKind.Modf, 2, false, true, name) { FloatArgs = 1, IsDouble = core == "modf" };
+        if (core is "sincos" or "sincosf") return new HelperInfo(HelperKind.SinCos, 2, false, false, name) { FloatArgs = 1, IsDouble = core == "sincos" };
+        if (core is "__stack_chk_fail") return new HelperInfo(HelperKind.StackCheckFail, 0, true, false, name);
+        // UnBox(Il2CppObject*, Il2CppClass*) as clang leaves it a function of its own (Itanium name).
+        if (name == "_Z5UnBoxP12Il2CppObjectP11Il2CppClass") return new HelperInfo(HelperKind.UnboxChecked, 2, false, true, name);
         if (core is "memcpy" or "memmove") return new HelperInfo(HelperKind.Memcpy, 3, false, true, name);
         if (core is "memset") return new HelperInfo(HelperKind.Memset, 3, false, true, name);
         if (core is "__chkstk") return new HelperInfo(HelperKind.CheckStack, 0, false, false, name);

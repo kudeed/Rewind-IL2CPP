@@ -496,7 +496,7 @@ public sealed class ProgramAnalysis
 
     private void FindForwarders()
     {
-        if (Model.Image.Arch != Rewind.Binary.CpuArch.X64) return;
+        if (Model.Image.Arch is not (Rewind.Binary.CpuArch.X64 or Rewind.Binary.CpuArch.Arm64)) return;
         const ushort InternalCall = 0x1000;
         CodeIndex index = Code;
 
@@ -709,6 +709,15 @@ public sealed class ProgramAnalysis
                 shape.IsFloat[i] = true;
                 shape.IsDouble[i] = helper.IsDouble;
             }
+        }
+        else if (helper is { Kind: HelperKind.SinCos })
+        {
+            // sincos(x, &sine, &cosine)
+            shape = new CallShape
+            {
+                Count = 3, IsFloat = [true, false, false, false], IsDouble = [helper.IsDouble, false, false, false],
+                Returns = CallReturn.Void,
+            };
         }
         else if (helper is { Kind: HelperKind.Modf })
         {

@@ -1595,6 +1595,34 @@ public sealed partial class HirBuilder
         return true;
     }
 
+    /// <summary>
+    /// The value type an object is known to be a boxed instance of where <paramref name="at"/> runs: an exact
+    /// class comparison of the object (class of obj == T) on the way in, its "same" edge the only way to
+    /// <paramref name="at"/>. Clang drops the class check of an unbox that such a test already settled.
+    /// </summary>
+    private TypeSig? ProvenClass(Node obj, Block at)
+    {
+        if (_cfg == null || !_cfg.IsReachable(at)) return null;
+        Block child = at;
+        for (int guard = 0; guard < 64 && _cfg.ImmediateDominator(child) is { } p && !ReferenceEquals(p, child); guard++, child = p)
+        {
+            if (p.Terminator is not { Op: Op.Branch } branch || p.Succs.Count != 2 || ReferenceEquals(p.Succs[0], p.Succs[1])) continue;
+            Node c = branch.In[0];
+            if (c.Op is not (Op.CmpEq or Op.CmpNe)) continue;
+            Block same = p.Succs[c.Op == Op.CmpEq ? 0 : 1];
+            if (same.Preds.Count != 1 || !_cfg.Dominates(same, at)) continue;
+            Sem a = Eval(c.In[0]), b = Eval(c.In[1]);
+            TypeSig? type = (a, b) switch
+            {
+                (SObjKlass oa, SKlass kb) when ReferenceEquals(oa.Object, obj) => kb.Type,
+                (SKlass ka, SObjKlass ob) when ReferenceEquals(ob.Object, obj) => ka.Type,
+                _ => null,
+            };
+            if (type is { IsValueType: true }) return type;
+        }
+        return null;
+    }
+
     /// <summary>The comparisons generated code uses to ask whether an object is an instance of a type.</summary>
     private Sem? TypeTestCompare(Node n)
     {
@@ -1786,6 +1814,7 @@ public sealed partial class HirBuilder
             case PUnboxed u:
             {
                 TypeSig? type = _castTypes.TryGetValue(u.Object, out List<TypeSig>? casts) && casts.Count != 0 ? casts[0] : null;
+                if (type == null && n.Block != null) type = ProvenClass(u.Object, n.Block);
                 if (type == null)
                 {
                     Problem("unboxed value of unknown type");

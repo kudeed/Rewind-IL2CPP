@@ -338,7 +338,7 @@ public sealed class MethodPipeline
             DeadCode.Run(fn);
             _normalizer.Cleanup(fn);
         }
-        if (Environment.GetEnvironmentVariable("REWIND_NO_LEFTOVERS") == null && UndefinedValues.Run(fn, Leftovers(fn, abi)))
+        if (Environment.GetEnvironmentVariable("REWIND_NO_LEFTOVERS") == null && UndefinedValues.Run(fn, Leftovers(fn, abi), deadArguments: !fn.Regs.SharedPositions))
         {
             DeadCode.Run(fn);
             _normalizer.Cleanup(fn);
@@ -375,7 +375,12 @@ public sealed class MethodPipeline
         if (LoopValues.Run(fn, ArgumentBits)) _normalizer.Cleanup(fn);
         CheckShape(fn, "loop values");
         if (Environment.GetEnvironmentVariable("REWIND_NO_CLASS_SPLIT") == null && ClassMerges.Run(fn, IsClassOrMethodSlot,
-                fn.Regs.SharedPositions ? null : slot => _program.Model.ResolveUsageSlot(slot) != null)) _normalizer.Cleanup(fn);
+                fn.Regs.SharedPositions ? null : slot => _program.Model.ResolveUsageSlot(slot) != null))
+        {
+            // The copies read their own slots now: those reads are the slots' values.
+            _normalizer.CanonicalizeSlots(fn);
+            _normalizer.Cleanup(fn);
+        }
         CheckShape(fn, "class merges");
         if (Environment.GetEnvironmentVariable("REWIND_NO_WIDENED_CONSTANTS") == null) FoldWidenedConstants(fn);
         return new LiftedMethod

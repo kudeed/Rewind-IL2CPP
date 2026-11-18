@@ -801,14 +801,23 @@ public sealed partial class HirBuilder
                 int offset = _fn.Regs.StackOffsetOf(p.Position);
                 bool byValueStruct = sem is SVal { Expr: { } whole } && p.Pass != PassKind.Indirect && p.Type is { IsValueType: true } &&
                                      p.Type is not PrimitiveSig && p.Type.Definition is { IsEnum: false };
-                for (int part = 0; part < 8; part++)
+                // A struct passed by value on the stack (AArch64: one that found no registers left) fills as many
+                // eight-byte slots as it needs.
+                int structSize = byValueStruct ? _p.Layouts.SizeOf(p.Type!).Size : 0;
+                int extent = Math.Max(8, (structSize + 7) & ~7);
+                for (int part = 0; part < extent; part++)
                 {
                     if (!_fn.StackParams.TryGetValue(offset + part, out Node? slot)) continue;
                     int size = slot.Type.Bytes();
-                    if (byValueStruct && size < _p.Layouts.SizeOf(p.Type!).Size)
+                    if (byValueStruct && size < structSize)
                     {
-                        // A struct read in pieces: each piece is the field at that place.
-                        _sem[slot] = FieldPlace(((SVal)sem).Expr, p.Type!, part, size) is PLocation field ? new SVal(field.Location) : SJunk.Instance;
+                        // A struct read in pieces: each piece is the field at that place, or (a whole slot) the
+                        // fields it holds.
+                        HExpr structArg = ((SVal)sem).Expr;
+                        if (FieldPlace(structArg, p.Type!, part, size) is PLocation field) _sem[slot] = new SVal(field.Location);
+                        else if (size == 8 && part % 8 == 0 && StructLeaves(structArg, p.Type!, part, Math.Min(8, structSize - part)) is { } leaves)
+                            _sem[slot] = new SParts(leaves, 8);
+                        else _sem[slot] = SJunk.Instance;
                         continue;
                     }
                     // An eight-byte argument (a reference, a long, a double) whose slot the code also reaches four

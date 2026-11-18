@@ -231,13 +231,14 @@ numbers don't say how well it recognizes the runtime of other Android builds.
 
 | What was checked | Android ARM64 | The same project for Windows x64 |
 | --- | --- | --- |
-| Complete bodies, the project's own assembly | 473 of 516 (91.7%) | 504 of 516 (97.7%) |
-| Complete bodies, whole game | 117,572 of 130,615 (90.0%) | 124,779 of 132,027 (94.5%) |
-| Behavior check: comparable methods that behave exactly like the original | 155 of 179 | 157 of 179 |
+| Complete bodies, the project's own assembly | 497 of 516 (96.3%) | 504 of 516 (97.7%) |
+| Complete bodies, whole game | 122,435 of 130,615 (93.7%) | 124,779 of 132,027 (94.5%) |
+| Behavior check: comparable methods that behave exactly like the original | 159 of 179 | 157 of 179 |
 
 Most of what is left on ARM64 the x64 build has as well (fully shared generic code, code inlined from other
 classes). On top of that come `try` blocks nested in ways the ARM64 exception planner doesn't take apart yet,
-some SIMD instructions, and small methods clang inlined where MSVC kept a call.
+IL2CPP's private copies of small methods that clang compiled differently from the method itself (so they are
+not recognized as copies), and stack buffers handed around as pointers.
 
 ## What it can't do yet
 

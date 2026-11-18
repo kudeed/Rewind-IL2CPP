@@ -6,7 +6,7 @@ using Rewind.Binary;
 
 namespace Rewind.Analysis.Recover;
 
-public enum ThrowKind { None, NullReference, IndexOutOfRange, DivideByZero, InvalidCast, Overflow, ArrayTypeMismatch }
+public enum ThrowKind { None, NullReference, IndexOutOfRange, DivideByZero, InvalidCast, Overflow, ArrayTypeMismatch, StackCheck }
 
 /// <summary>A type check the native code performed with "throw InvalidCastException" on failure: a castclass.</summary>
 public sealed record CastFact(Block At, Node Object, Node Klass);
@@ -40,6 +40,7 @@ public sealed partial class Normalizer(ProgramAnalysis program)
 
         _slotValues.Clear();
         _lazyTargets.Clear();
+        if (ExpandLookupTables()) ApplyReplacements();
         CanonicalizeSlotLoads();
         RemoveNoOpHelpers();
         RemoveInitFlagStores();
@@ -337,21 +338,6 @@ public sealed partial class Normalizer(ProgramAnalysis program)
     private bool IsMetadataSlot(ulong va) =>
         program.Defaults.Slots.ContainsKey(va) || program.Model.ResolveUsageSlot(va) != null;
 
-    /// <summary>
-    /// A merged choice of metadata slot addresses (a phi of constants, perhaps widened): a phi of the slots'
-    /// contents in the same block, or null.
-    /// </summary>
-    private Node? SlotChoice(Node slot)
-    {
-        Node inner = slot;
-        while (inner.Op is Op.ZExt or Op.SExt && inner.In.Length == 1) inner = inner.In[0];
-        if (inner.Op != Op.Phi || inner.Block is not { } block || inner.In.Length != block.Preds.Count || inner.In.Length is < 2 or > 8) return null;
-        if (!inner.In.All(i => i.IsConst && IsMetadataSlot(i.UImm))) return null;
-        Node phi = _fn.NewNode(Op.Phi, VT.I64, block, inner.In.Select(i => SlotValue(i.UImm)).ToArray());
-        block.Phis.Add(phi);
-        return phi;
-    }
-
     private Node SlotValue(ulong va)
     {
         if (!_slotValues.TryGetValue(va, out Node? node))
@@ -370,11 +356,18 @@ public sealed partial class Normalizer(ProgramAnalysis program)
     /// </summary>
     private void CanonicalizeSlotLoads()
     {
+        // A read through a choice of slots (a select or phi of their addresses) reads the chosen slot's value.
+        var chosen = new List<Node>();
         foreach (Block b in _fn.Blocks)
         {
             foreach (Node n in b.Nodes)
             {
-                if (n.Op != Op.Load || n.Type != VT.I64 || !n.In[0].IsConst) continue;
+                if (n.Op != Op.Load || n.Type != VT.I64) continue;
+                if (!n.In[0].IsConst)
+                {
+                    if (!n.Dead && IsSlotChoice(Resolve(n.In[0]), 0, [])) chosen.Add(n);
+                    continue;
+                }
                 ulong va = (ulong)n.In[0].Imm;
                 if (!IsMetadataSlot(va)) continue;
                 _replace[n] = SlotValue(va);
@@ -382,6 +375,14 @@ public sealed partial class Normalizer(ProgramAnalysis program)
             }
             b.Nodes.RemoveAll(n => n.Dead);
         }
+        if (chosen.Count == 0) return;
+        var made = new Dictionary<Node, Node>();
+        foreach (Node n in chosen)
+        {
+            _replace[n] = SlotRead(Resolve(n.In[0]), made);
+            n.Dead = true;
+        }
+        foreach (Block b in _fn.Blocks) b.Nodes.RemoveAll(n => n.Dead);
     }
 
     // ---- helpers with no managed meaning -------------------------------------------------------------------
@@ -442,10 +443,13 @@ public sealed partial class Normalizer(ProgramAnalysis program)
                     {
                         // Returns the initialized content of the slot whose address it was given.
                         Node? slot = IntArg(call, 0);
+                        int count = b.Nodes.Count;
                         if (slot != null && !slot.IsConst && !_fn.Regs.SharedPositions && SlotChoice(slot) is { } choice)
                         {
                             // One call for two slots, the compiler having merged two ways that differed in it
-                            // alone: the content of the slot each way brings.
+                            // alone: the content of the slot each way brings. (Selects of the contents go next
+                            // to the selects of the addresses, before the call.)
+                            i += b.Nodes.Count - count;
                             result = choice;
                             break;
                         }
@@ -562,17 +566,33 @@ public sealed partial class Normalizer(ProgramAnalysis program)
                 if (n.Dead || n.Op != Op.Load || n.Type != VT.I32 || n.In[0] is not { Op: Op.Add } address || !address.In[1].IsConst ||
                     IrBuilder.SImm(address.In[1]) != flag)
                     continue;
-                // The class: named directly, or read out of a method's record (a generic method's own class).
-                Node klass = Resolve(address.In[0]);
-                bool named = klass.Op == Op.SlotValue ||
-                             (klass.Op == Op.Load && klass.In[0] is { Op: Op.Add } from && from.In[1].IsConst && Resolve(from.In[0]).Op == Op.SlotValue);
-                if (!named) continue;
+                // The class: named directly, or read out of a method's record (a generic method's own class) - or
+                // a merge of such, the slot read again after the call that would have run the constructor.
+                if (!NamedClass(Resolve(address.In[0]), 0)) continue;
                 _replace[n] = _b.Const(VT.I32, 1);
                 n.Dead = true;
             }
             b.Nodes.RemoveAll(n => n.Dead);
         }
     }
+
+    private bool NamedClass(Node klass, int depth)
+    {
+        if (klass.Op == Op.SlotValue) return true;
+        if (klass.Op == Op.Load && klass.In[0] is { Op: Op.Add } from && from.In[1].IsConst && Resolve(from.In[0]).Op == Op.SlotValue) return true;
+        // (A slot load the canonicalization has turned into the slot's value, not yet replaced in the merge.)
+        if (klass.Op == Op.Load && klass.In[0].IsConst && IsMetadataSlot(klass.In[0].UImm)) return true;
+        if (NoMergedClasses || klass.Op != Op.Phi || depth >= 4 || klass.In.Length == 0) return false;
+        foreach (Node input in klass.In)
+        {
+            Node value = Resolve(input);
+            if (ReferenceEquals(value, klass)) continue;
+            if (!NamedClass(value, depth + 1)) return false;
+        }
+        return true;
+    }
+
+    private static readonly bool NoMergedClasses = Environment.GetEnvironmentVariable("REWIND_NO_MERGED_CCTOR_CLASSES") != null;
 
     /// <summary>
     /// A narrowing is folded when it is built; its operand may only later become something it folds into. The
@@ -1267,6 +1287,8 @@ public sealed partial class Normalizer(ProgramAnalysis program)
                 case HelperKind.ThrowNullReference: return ThrowKind.NullReference;
                 case HelperKind.ThrowIndexOutOfRange: return ThrowKind.IndexOutOfRange;
                 case HelperKind.ThrowDivideByZero: return ThrowKind.DivideByZero;
+                // The stack protector's failure (its guard overwritten): no part of the program's meaning.
+                case HelperKind.StackCheckFail: return ThrowKind.StackCheck;
                 case HelperKind.ThrowInvalidCast:
                     first = IntArg(calls[0], 0);
                     second = IntArg(calls[0], 1);
