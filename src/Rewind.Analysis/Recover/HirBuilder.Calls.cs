@@ -620,13 +620,15 @@ public sealed partial class HirBuilder
             return;
         }
         // An imported function a P/Invoke declaration wraps (AArch64, linked directly): a call of the declaration,
-        // where it is the only declaration of that function (overloads would have to be told apart), and not
-        // from inside the declaration's own wrapper.
+        // where it is the only declaration of that function (overloads would have to be told apart).
         // (Each assembly declares its own copy of Interop's imports: declarations that agree in every type are one.)
-        if (!NoPInvokeStubs && _p.PInvokeStubs.TryGetValue(info.Target, out List<MethodDef>? declarations) && !declarations.Contains(_method) &&
-            declarations.All(d => SameSignature(d, declarations[0])))
+        // (In the declaration's own wrapper it is the declaration itself, as on x64: declarations are written without a
+        // body, extern, whatever their wrapper's code says.)
+        if (!NoPInvokeStubs && _p.PInvokeStubs.TryGetValue(info.Target, out List<MethodDef>? declarations) &&
+            (declarations.Contains(_method) || declarations.All(d => SameSignature(d, declarations[0]))))
         {
-            MethodDef declaration = declarations.FirstOrDefault(d => ReferenceEquals(d.DeclaringType.Assembly, _method.DeclaringType.Assembly)) ?? declarations[0];
+            MethodDef declaration = declarations.Contains(_method) ? _method
+                : declarations.FirstOrDefault(d => ReferenceEquals(d.DeclaringType.Assembly, _method.DeclaringType.Assembly)) ?? declarations[0];
             if (TryBuildPInvokeCall(call, declaration, tail)) return;
         }
         Problem($"call to unidentified native function 0x{info.Target:X}");
