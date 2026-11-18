@@ -28,10 +28,10 @@ public static class BlockCopies
     public const string Copy = "memcpy";
     public const int Largest = 1 << 24;
 
-    /// <summary>The block operation a call node is, if it is one.</summary>
-    public static BlockOp? Of(Node call, RuntimeHelpers helpers)
+    /// <summary>The block operation a call node is, if it is one (a jump to the function too, with <paramref name="tail"/>).</summary>
+    public static BlockOp? Of(Node call, RuntimeHelpers helpers, bool tail = false)
     {
-        if (call.Dead || call.Op != Op.Call || call.Aux is not CallInfo info || info.Indirect) return null;
+        if (call.Dead || !(call.Op == Op.Call || (tail && call.Op == Op.TailCall)) || call.Aux is not CallInfo info || info.Indirect) return null;
         if (info.Intrinsic != null)
         {
             if (call.In.Length != 3) return null;

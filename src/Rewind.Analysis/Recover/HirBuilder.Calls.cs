@@ -2237,10 +2237,13 @@ public sealed partial class HirBuilder
             }
             case HelperKind.Memcpy or HelperKind.Memset:
             {
-                if (tail && _abi.Return != ReturnKind.Void) break;
+                // A struct returned through a buffer, filled last by a copy the compiler jumps to: what is
+                // returned is the buffer.
+                bool buffer = _abi.Return == ReturnKind.Buffer && _returnBuffer != null;
+                if (tail && _abi.Return != ReturnKind.Void && !buffer) break;
                 if (!TryEmitBlockOp(call)) break;
                 if (result != null && a0 != null) _sem[result] = Eval(a0); // both return the destination
-                if (tail) Emit(new HReturn(null), call.Addr);
+                if (tail) Emit(new HReturn(buffer ? new HLocal(_returnBuffer!) { Type = _returnBuffer!.Type } : null), call.Addr);
                 return;
             }
             case HelperKind.InitObj:

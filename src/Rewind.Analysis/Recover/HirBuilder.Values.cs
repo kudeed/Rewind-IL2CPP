@@ -1595,6 +1595,8 @@ public sealed partial class HirBuilder
         return true;
     }
 
+    private static readonly bool NoUnboxedWords = Environment.GetEnvironmentVariable("REWIND_NO_UNBOXED_WORDS") != null;
+
     /// <summary>
     /// The value type an object is known to be a boxed instance of where <paramref name="at"/> runs: an exact
     /// class comparison of the object (class of obj == T) on the way in, its "same" edge the only way to
@@ -1826,6 +1828,10 @@ public sealed partial class HirBuilder
                 if (u.Offset == 0 && (!isStruct || size == n.Type.Bytes())) return new SVal(unboxed);
                 if (isStruct && FieldPlace(unboxed, type, u.Offset, n.Type.Bytes()) is PLocation inner) return new SVal(inner.Location);
                 if (isStruct && FieldPlace(unboxed, type, u.Offset, n.Type.Bytes()) is PPair innerPair) return new SPair(innerPair.Low, innerPair.High);
+                // A word read whole (clang loads a struct's first eight bytes for a register pair): the fields in
+                // it, the padding between them nothing.
+                if (isStruct && !NoUnboxedWords && StructLeaves(unboxed, type, u.Offset, n.Type.Bytes()) is { } words)
+                    return new SParts(words, n.Type.Bytes());
                 Problem("partial read of an unboxed value");
                 return new SVal(new HOpaque("unbox_part", unboxed) { Type = TypeForBits(n.Type) });
             }
