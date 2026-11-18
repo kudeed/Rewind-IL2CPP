@@ -47,6 +47,9 @@ public sealed class ProgramAnalysis
     /// <summary>Unlisted functions identified as private copies of managed methods (see <see cref="InlineCopyFinder"/>).</summary>
     public Dictionary<ulong, InlineCopy> InlineCopies { get; private set; } = [];
 
+    /// <summary>Unlisted functions that are a listed method compiled again, differently (see <see cref="NearCopyFinder"/>): copy to method address.</summary>
+    public Dictionary<ulong, List<ulong>> NearCopies { get; private set; } = [];
+
     private Recover.AccessorIndex? _accessors;
     /// <summary>Which method of a class is the plain accessor of which field (computed on demand).</summary>
     public Recover.AccessorIndex Accessors => _accessors ??= new Recover.AccessorIndex(this);
@@ -454,6 +457,10 @@ public sealed class ProgramAnalysis
         FindForwarders();
         ExactCopies = CopyMatcher.Find(this);
         InlineCopies = InlineCopyFinder.Find(this);
+        // Copies compiled differently from the method (AArch64): calls to them are calls to the method, like
+        // calls to exact copies.
+        NearCopies = NearCopyFinder.Find(this);
+        foreach (var (copy, originals) in NearCopies) ExactCopies.Copies.TryAdd(copy, originals.ToArray());
         _shapes.Clear();
     }
 
@@ -486,6 +493,7 @@ public sealed class ProgramAnalysis
         ForwardedInsts = source.ForwardedInsts;
         ExactCopies = source.ExactCopies;
         InlineCopies = source.InlineCopies;
+        NearCopies = source.NearCopies;
         FrameHints = source.FrameHints;
         // (Tables made on first use: made now, by the one thread that forks, and then only read.)
         _instsOf = source.InstTable();
