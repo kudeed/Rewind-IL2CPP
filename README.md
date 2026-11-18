@@ -156,7 +156,8 @@ Roughly, in order:
    position-independent fingerprints (which follow calls into other functions only as far as needed to be
    unique), the binary's own exported API names, a similarity sketch for builds that differ slightly, and
    jump thunks.
-4. **Lifting and cleaning up.** Each method's x64 machine code is lifted to SSA form. Then Rewind removes the
+4. **Lifting and cleaning up.** Each method's x64 or ARM64 machine code is lifted to SSA form, the same IR for
+   both, and the calling convention (Win64 or AAPCS64) says where each argument and result is. Then Rewind removes the
    things IL2CPP added that weren't in the C#: metadata and class initialization, write barriers, and the
    null, bounds and cast checks that IL does implicitly. It also undoes some of the compiler's work on loops,
    like 64-bit copies of 32-bit variables, duplicated counters and pointers walking over arrays.
@@ -222,10 +223,27 @@ runtime. Taking each game's own library away left 68.9% of the 2020.3.49f1 game 
 91.0% instead of 94.3% for 2021.3.45f2 and 92.8% instead of 94.4% for 2022.3.62f3. For the three Unity 6
 versions it made no difference beyond one method.
 
+### Android (ARM64)
+
+The 6000.3.12f1 test project was also built for Android (ARM64, Release) and decompiled from its APK with the
+library `unity-6000.3.12f1-android-arm64.sig`. That library was made from this same build's symbols, so these
+numbers don't say how well it recognizes the runtime of other Android builds.
+
+| What was checked | Android ARM64 | The same project for Windows x64 |
+| --- | --- | --- |
+| Complete bodies, the project's own assembly | 473 of 516 (91.7%) | 504 of 516 (97.7%) |
+| Complete bodies, whole game | 117,572 of 130,615 (90.0%) | 124,779 of 132,027 (94.5%) |
+| Behavior check: comparable methods that behave exactly like the original | 155 of 179 | 157 of 179 |
+
+Most of what is left on ARM64 the x64 build has as well (fully shared generic code, code inlined from other
+classes). On top of that come `try` blocks nested in ways the ARM64 exception planner doesn't take apart yet,
+some SIMD instructions, and small methods clang inlined where MSVC kept a call.
+
 ## What it can't do yet
 
-- Method bodies are only recovered for x64 Windows builds. ARM64, which covers most Android games, gets
-  complete types and signatures but placeholder bodies.
+- ARM64 (Android) bodies come out less complete than x64 ones so far (the numbers are under "Android
+  (ARM64)" above). On ARM64, `try` blocks nested in some ways and some SIMD instructions are marked as gaps.
+  32-bit ARM and x86 builds get complete types and signatures but placeholder bodies.
 - Generic methods, and methods of generic types, are recovered from the code their instantiations over
   reference types share. A definition that is only compiled for value types still gets a placeholder body.
   Where the shared code doesn't say which instantiation a call is to, the call is marked as a gap.
@@ -235,8 +253,8 @@ versions it made no difference beyond one method.
   fields yet. In real games this is the most common kind of gap.
 - Inlined code mostly isn't folded back into a call. Simple field accessors and trivial constructors are, but
   other code that was inlined from another class uses that class's private members directly.
-- Signature libraries come with Rewind for the six Unity versions in the table above, for Windows x64 only.
-  A game built with another version is read with whichever library recognizes most of its runtime, and
+- Signature libraries come with Rewind for the six Unity versions in the table above for Windows x64, and
+  for 6000.3.12f1 for Android ARM64. A game built with another version is read with whichever library recognizes most of its runtime, and
   fewer bodies come out complete the further apart the versions are (the numbers are under the table). The
   best result needs a library built for the game's exact version (see below).
 - A library used on another Unity version than its own can also get a function wrong. Each of the six
@@ -253,8 +271,8 @@ versions it made no difference beyond one method.
 ## Supporting another Unity version
 
 Rewind works best with a signature library for the exact Unity version a game was built with. It comes with
-libraries for 2020.3.49f1, 2021.3.45f2, 2022.3.62f3, 6000.0.85f2, 6000.2.9f1 and 6000.3.12f1 (Windows x64).
-For any other version it tries every library it has, nearest version first, and uses the one that recognizes
+libraries for 2020.3.49f1, 2021.3.45f2, 2022.3.62f3, 6000.0.85f2, 6000.2.9f1 and 6000.3.12f1 (Windows x64),
+and for 6000.3.12f1 (Android ARM64). For any other version it tries every library it has, nearest version first, and uses the one that recognizes
 the most kinds of runtime function. To make a library for another version:
 
 1. Install that Unity version and build any project with IL2CPP for Windows x64. Keep the
@@ -271,6 +289,11 @@ rewind-lab sig-build signatures/unity-<version>-windows-x64.sig <build folder> s
 
 You can put several build configurations of the same version into one library. The more you include, the
 more games built with that version Rewind recognizes exactly.
+
+For Android ARM64, build an APK with IL2CPP for ARM64 instead and use the unstripped library Unity leaves in
+`Library/Bee/artifacts/Android/il2cppOutput/build/arm64-v8a/` (`libil2cpp.sym.so` or `libil2cpp.dbg.so`): dump
+its ELF symbol table into the same `symbols.tsv` format and pass the APK as the build. Name the library
+`unity-<version>-android-arm64.sig`.
 
 `rewind-lab` is the development tool in `src/Rewind.Lab`. After building, it's at
 `src/Rewind.Lab/bin/Release/net10.0/rewind-lab.dll`.
