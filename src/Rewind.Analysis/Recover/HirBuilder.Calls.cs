@@ -46,6 +46,8 @@ public sealed partial class HirBuilder
             return AsFloat(Value(slot), type);
         }
         int register = _fn.Regs.FloatRegisterOf(position);
+        if (!_fn.Regs.SharedPositions)
+            return FloatFromLanes(Input(call, ArgSlotKind.FloatReg, register * 4), isDouble ? Input(call, ArgSlotKind.FloatReg, register * 4 + 1) : null, isDouble);
         Node? lo = Input(call, ArgSlotKind.FloatReg, register * 4);
         if (lo == null) return Missing(type);
         if (!isDouble) return AsFloat(FloatValue(lo), type);
@@ -464,6 +466,11 @@ public sealed partial class HirBuilder
             return;
         }
 
+        if (kind is ReturnKind.StructInRegisterPair or ReturnKind.FloatAggregate)
+        {
+            FinishRegisterStruct(call, expr, kind, returnType);
+            return;
+        }
         Dictionary<int, Node> projs = Projections(call);
         switch (kind)
         {
@@ -1329,7 +1336,7 @@ public sealed partial class HirBuilder
         // method descriptor the shared code is handed, and the type of the receiver.
         foreach (AbiParam p in abi.Params)
         {
-            if (p.Role != ParamRole.MethodInfo || IntAt(call, p.Position + shift) is not { } descriptor) continue;
+            if (p.Role != ParamRole.MethodInfo || IntAt(call, Shifted(p, shift)) is not { } descriptor) continue;
             // The hidden method argument is whatever the register held unless the callee is generic: only looked at.
             if (Peek(descriptor) is SMethod { Inst: { } named } sm && ReferenceEquals(sm.Method, method) &&
                 !named.ClassArguments.Any(Open) && !named.MethodArguments.Any(Open))
@@ -1351,7 +1358,7 @@ public sealed partial class HirBuilder
         }
         if (!method.IsStatic && method.DeclaringType.GenericParameters.Length != 0 && abi.This != null)
         {
-            Node? receiverNode = receiverOverride ?? IntAt(call, abi.This.Position + shift);
+            Node? receiverNode = receiverOverride ?? IntAt(call, Shifted(abi.This, shift));
             TypeSig? receiverType = receiverNode == null ? null : Eval(receiverNode) switch
             {
                 SNewObject o => o.Type,
@@ -1384,7 +1391,7 @@ public sealed partial class HirBuilder
         foreach (AbiParam p in abi.Params)
         {
             // (Where the invoker is handed the result's address first, that stays where it is.)
-            int position = bufferFirst && p.Role == ParamRole.ReturnBuffer ? p.Position : p.Position + shift;
+            int position = bufferFirst && p.Role == ParamRole.ReturnBuffer ? p.Position : Shifted(p, shift);
             switch (p.Role)
             {
                 case ParamRole.MethodInfo:
@@ -1436,6 +1443,11 @@ public sealed partial class HirBuilder
                     TypeSig type = p.Type!;
                     HExpr arg;
                     if (p.Pass == PassKind.Float) arg = FloatAt(call, position, p.IsDouble);
+                    else if (p.Pass is PassKind.IntegerPair or PassKind.FloatAggregate)
+                    {
+                        List<Node?> registers = ArgumentRegisters(call, p, position, out Carried how);
+                        arg = StructFromRegisters(registers, type, how, call.Addr);
+                    }
                     else
                     {
                         Node? node = IntAt(call, position);
@@ -1782,15 +1794,19 @@ public sealed partial class HirBuilder
         if (!method.IsStatic || method.GenericParameters.Length != 0) return false;
         PInvokeImport? import = _p.PInvokeOf(method);
         var arguments = new HExpr[method.Parameters.Length];
+        int ints = 0, floats = 0;
         for (int i = 0; i < arguments.Length; i++)
         {
             TypeSig type = method.Parameters[i].Type;
             if (IsFloat(type))
             {
-                arguments[i] = FloatAt(call, i, BitsOf(type) == 64);
+                arguments[i] = FloatAt(call, _fn.Regs.SharedPositions ? i : FloatArgPosition(floats), BitsOf(type) == 64);
+                floats++;
                 continue;
             }
-            if (IntAt(call, i) is not { } native || Unmarshal(native, type, import) is not { } value) return false;
+            int at = IntArgPosition(ints++, floats);
+            if (!_fn.Regs.SharedPositions && at >= 8) return false;
+            if (IntAt(call, _fn.Regs.SharedPositions ? i : at) is not { } native || Unmarshal(native, type, import) is not { } value) return false;
             arguments[i] = value;
         }
         TypeSig returnType = method.ReturnType;
@@ -1893,6 +1909,8 @@ public sealed partial class HirBuilder
                 {
                     TypeSig type = p.Type!;
                     if (p.Pass == PassKind.Float) args[p.ArgumentIndex] = FloatAt(call, p.Position, p.IsDouble);
+                    else if (p.Pass is PassKind.IntegerPair or PassKind.FloatAggregate)
+                        args[p.ArgumentIndex] = StructFromRegisters(ArgumentRegisters(call, p, p.Position, out Carried how), type, how, call.Addr);
                     else if (IntAt(call, p.Position) is not { } node) args[p.ArgumentIndex] = Missing(type);
                     else if (p.Pass == PassKind.Indirect) args[p.ArgumentIndex] = LocationOf(node, type) ?? Value(node);
                     else if (type is ByRefSig byRef && LocationOf(node, byRef.ElementType) is { } location)
@@ -1967,7 +1985,7 @@ public sealed partial class HirBuilder
             case HelperKind.MathFunction:
             {
                 var operands = new HExpr[helper.FloatArgs];
-                for (int i = 0; i < operands.Length; i++) operands[i] = FloatAt(call, i, helper.IsDouble);
+                for (int i = 0; i < operands.Length; i++) operands[i] = FloatAt(call, FloatArgPosition(i), helper.IsDouble);
                 TypeSig type = helper.IsDouble ? _double : _float;
                 // fmod is the IL "rem" instruction applied to floating point operands.
                 HExpr value = helper.MathName == "fmod" && operands.Length == 2
@@ -1981,7 +1999,7 @@ public sealed partial class HirBuilder
                 // modf(x, &whole): the whole part is x truncated toward zero, the result is what is left - and
                 // for an infinity a zero of its sign, where "x - whole" would give NaN.
                 TypeSig type = helper.IsDouble ? _double : _float;
-                Node? pointer = IntAt(call, 1);
+                Node? pointer = IntAt(call, IntArgPosition(0, 1));
                 HExpr? location = pointer != null ? LocationOf(pointer, type) : null;
                 MethodDef? isInfinity = _m.FindType(helper.IsDouble ? "System.Double" : "System.Single")?.Methods
                     .FirstOrDefault(m => m.Name == "IsInfinity" && m.IsStatic && m.Parameters.Length == 1);
@@ -1989,7 +2007,7 @@ public sealed partial class HirBuilder
                 HVar x = _h.NewLocal(type, "t"), whole = _h.NewLocal(type, "t");
                 HExpr X() => new HLocal(x) { Type = type };
                 HExpr Whole() => new HLocal(whole) { Type = type };
-                Emit(new HAssign(X(), FloatAt(call, 0, helper.IsDouble)), call.Addr);
+                Emit(new HAssign(X(), FloatAt(call, FloatArgPosition(0), helper.IsDouble)), call.Addr);
                 Emit(new HAssign(Whole(), MathCall("Truncate", helper.IsDouble, [X()])), call.Addr);
                 Emit(new HAssign(location, Whole()), call.Addr);
                 HExpr zero = helper.IsDouble ? new HConst(0.0, type) : new HConst(0f, type);

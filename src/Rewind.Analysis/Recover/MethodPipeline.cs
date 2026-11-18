@@ -1028,6 +1028,11 @@ public sealed class MethodPipeline
         foreach (Block b in fn.Blocks)
         {
             Node? ret = b.Terminator;
+            if (ret?.Op == Op.Return && ret.In.Length == 10)
+            {
+                TrimArm64Return(ret, abi, builder, b);
+                continue;
+            }
             if (ret?.Op != Op.Return || ret.In.Length != 3) continue;
             switch (abi.Return)
             {
@@ -1052,6 +1057,54 @@ public sealed class MethodPipeline
                     ret.In = [value];
                     break;
                 }
+            }
+        }
+    }
+
+    /// <summary>
+    /// An AArch64 return captures x0, x1 and lanes 0-1 of v0-v3 (in that order: x0, v0.0, v0.1, x1, v1.0, v1.1,
+    /// v2.0, v2.1, v3.0, v3.1); keep what the return type uses, in byte order.
+    /// </summary>
+    private static void TrimArm64Return(Node ret, MethodAbi abi, IrBuilder builder, Block b)
+    {
+        Node[] all = ret.In;
+        switch (abi.Return)
+        {
+            case ReturnKind.Void or ReturnKind.Buffer:
+                ret.In = [];
+                return;
+            case ReturnKind.Float:
+                ret.In = [all[1]];
+                return;
+            case ReturnKind.Double:
+                ret.In = [all[1], all[2]];
+                return;
+            case ReturnKind.StructInRegisterPair:
+                ret.In = [all[0], all[3]];
+                return;
+            case ReturnKind.FloatAggregate:
+            {
+                int[] lane0 = [1, 4, 6, 8], lane1 = [2, 5, 7, 9];
+                var kept = new List<Node>();
+                for (int k = 0; k < Math.Min(4, abi.ReturnCount); k++)
+                {
+                    kept.Add(all[lane0[k]]);
+                    if (abi.ReturnIsDouble) kept.Add(all[lane1[k]]);
+                }
+                ret.In = kept.ToArray();
+                return;
+            }
+            default:
+            {
+                Node value = all[0];
+                if (abi.ReturnSize is 1 or 2 or 4)
+                {
+                    builder.Current = b;
+                    builder.CurrentAddr = ret.Addr;
+                    value = builder.Trunc(value, VTExtensions.IntOfBytes(abi.ReturnSize));
+                }
+                ret.In = [value];
+                return;
             }
         }
     }

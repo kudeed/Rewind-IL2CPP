@@ -776,7 +776,11 @@ public sealed partial class HirBuilder
                     break;
             }
 
-            if (!_fn.Regs.IsStackPosition(p.Position))
+            if (!_fn.Regs.IsStackPosition(p.Position) && p.Pass is PassKind.IntegerPair or PassKind.FloatAggregate)
+            {
+                if (sem is SVal { Expr: var structArg }) BindRegisterStruct(p, structArg);
+            }
+            else if (!_fn.Regs.IsStackPosition(p.Position))
             {
                 if (p.Pass == PassKind.Float)
                 {
@@ -1704,6 +1708,12 @@ public sealed partial class HirBuilder
             }
             case ReturnKind.StructInRegister:
                 Emit(new HReturn(StructFromBits(ret.In[0], _abi.ReturnType)), ret.Addr);
+                return;
+            case ReturnKind.StructInRegisterPair:
+                Emit(new HReturn(StructFromRegisters(ret.In, _abi.ReturnType, Carried.Words, ret.Addr)), ret.Addr);
+                return;
+            case ReturnKind.FloatAggregate:
+                Emit(new HReturn(StructFromRegisters(ret.In, _abi.ReturnType, _abi.ReturnIsDouble ? Carried.Doubles : Carried.Floats, ret.Addr)), ret.Addr);
                 return;
             default:
                 Emit(new HReturn(ValueFor(ret.In[0], _abi.ReturnType)), ret.Addr);

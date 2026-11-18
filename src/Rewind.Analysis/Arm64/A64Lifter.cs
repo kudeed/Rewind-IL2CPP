@@ -253,6 +253,25 @@ public sealed class A64Lifter : IMachineLifter
 
     private static long Mask(int width) => width >= 64 ? -1L : (1L << width) - 1;
 
+    /// <summary>8, 16 or 32 when <paramref name="mask"/> keeps exactly that many low bits of a narrower-than-<paramref name="bits"/> value.</summary>
+    private static int? LowBits(long mask, int bits) => (ulong)mask switch
+    {
+        0xFF => 8,
+        0xFFFF => 16,
+        0xFFFFFFFF when bits == 64 => 32,
+        _ => null,
+    };
+
+    /// <summary>
+    /// The low <paramref name="width"/> bits of a value, zero-extended to <paramref name="t"/>: an extension of
+    /// a narrower value where the width is a byte, halfword or word (the shape the x64 lifter gives movzx and
+    /// 32-bit moves), a mask otherwise.
+    /// </summary>
+    private Node LowPart(Node x, int width, VT t) =>
+        width is 8 or 16 or 32 && width < t.Bits()
+            ? _b.ZExt(_b.Trunc(x, VTExtensions.IntOfBytes(width / 8)), t)
+            : width >= t.Bits() ? x : _b.And(x, C(t, Mask(width)));
+
     // ---- flags and conditions ----------------------------------------------------------------------------------
 
     private Node Flags(FlagKind kind, params Node[] inputs)
@@ -753,6 +772,9 @@ public sealed class A64Lifter : IMachineLifter
                 SetR(i.Rd, i.Is64, r);
                 return;
             }
+            case A64Op.AndImm when !i.SetFlags && LowBits(i.Imm, bits) is int keep:
+                SetR(i.Rd, i.Is64, LowPart(R(i.Rn, i.Is64), keep, t));
+                return;
             case A64Op.AndImm or A64Op.OrrImm or A64Op.EorImm:
             {
                 Node a = R(i.Rn, i.Is64), b = C(t, i.Imm);
@@ -806,6 +828,7 @@ public sealed class A64Lifter : IMachineLifter
                 Node r = i.Op switch
                 {
                     A64Op.And or A64Op.Bic => _b.And(a, b),
+                    A64Op.Orr when i.Is64 && PairOf(a, b) is { } pair => pair,
                     A64Op.Orr or A64Op.Orn => _b.Or(a, b),
                     _ => _b.Xor(a, b),
                 };
@@ -855,7 +878,7 @@ public sealed class A64Lifter : IMachineLifter
                         A64Op.Csneg => _b.Neg(b),
                         _ => b,
                     };
-                    r = _b.Select(cond, a, other);
+                    r = InfinityConversion(cond, a, other) ?? _b.Select(cond, a, other);
                 }
                 SetR(i.Rd, i.Is64, r);
                 return;
@@ -1224,6 +1247,50 @@ public sealed class A64Lifter : IMachineLifter
         Unknown(i);
     }
 
+    /// <summary>
+    /// "value == +infinity ? MIN : (int)value": how IL2CPP compiles a conversion from floating point to a signed
+    /// integer for ARM (il2cpp_codegen_cast_double_to_int), so that +infinity gives what it gives on x86. The
+    /// program's own operation is the plain conversion.
+    /// </summary>
+    private Node? InfinityConversion(Node cond, Node whenTrue, Node whenFalse)
+    {
+        // (The same with the condition turned round: "value != +infinity ? (int)value : MIN".)
+        if (cond.Op == Op.Xor && cond.In[1].IsConstValue(1) && cond.In[0].Op == Op.FCmpEq) (cond, whenTrue, whenFalse) = (cond.In[0], whenFalse, whenTrue);
+        if (cond.Op != Op.FCmpEq || whenFalse.Op != Op.FToSInt || !whenTrue.IsConst) return null;
+        Node value = whenFalse.In[0];
+        Node? other = SameValue(cond.In[0], value) ? cond.In[1] : SameValue(cond.In[1], value) ? cond.In[0] : null;
+        if (other is not { IsConst: true }) return null;
+        bool infinity = other.Type == VT.F32 ? (uint)other.Imm == 0x7F800000u : other.Type == VT.F64 && (ulong)other.Imm == 0x7FF0000000000000UL;
+        ulong min = whenFalse.Type == VT.I64 ? 0x8000000000000000UL : 0x80000000UL;
+        return infinity && whenTrue.UImm == min ? whenFalse : null;
+    }
+
+    /// <summary>Two nodes computing the same thing from the same inputs (register reads made twice: the bits of a float, a pair of lanes).</summary>
+    private static bool SameValue(Node a, Node b, int depth = 0)
+    {
+        if (ReferenceEquals(a, b)) return true;
+        if (depth > 4 || a.Op != b.Op || a.Type != b.Type || a.Imm != b.Imm || a.In.Length != b.In.Length) return false;
+        if (a.Op == Op.Const) return a.Imm == b.Imm;
+        if (a.Op is not (Op.BitsToF or Op.FToBits or Op.Concat or Op.Trunc or Op.ZExt or Op.SExt)) return false;
+        for (int k = 0; k < a.In.Length; k++)
+            if (!SameValue(a.In[k], b.In[k], depth + 1)) return false;
+        return true;
+    }
+
+    /// <summary>
+    /// "lo | hi &lt;&lt; 32" with lo a 32-bit value: two 32-bit values side by side, which is what the x64 lifter's
+    /// Concat stands for (a struct of two ints built in a register).
+    /// </summary>
+    private Node? PairOf(Node a, Node b)
+    {
+        foreach (var (low, high) in new[] { (a, b), (b, a) })
+        {
+            if (high.Op != Op.Shl || high.Type != VT.I64 || !high.In[1].IsConstValue(32)) continue;
+            if (low.Op == Op.ZExt && low.In[0].Type == VT.I32) return _b.Concat(_b.Trunc(high.In[0], VT.I32), low.In[0]);
+        }
+        return null;
+    }
+
     private Node FZero(VT type)
     {
         Node c = _fn.NewNode(Op.Const, type, null);
@@ -1243,14 +1310,13 @@ public sealed class A64Lifter : IMachineLifter
                 if (s >= r)
                 {
                     int width = s - r + 1;
-                    if (r == 0 && width is 8 or 16 or 32 && width < bits) return _b.ZExt(_b.Trunc(x, VTExtensions.IntOfBytes(width / 8)), t);
                     Node shifted = _b.Shift(Op.ShrU, x, Count(r));
-                    return r + width == bits ? shifted : _b.And(shifted, C(t, Mask(width)));
+                    return r + width == bits ? shifted : LowPart(shifted, width, t);
                 }
                 else
                 {
                     int width = s + 1, shift = bits - r;
-                    Node field = width + shift == bits ? x : _b.And(x, C(t, Mask(width)));
+                    Node field = width + shift == bits ? x : LowPart(x, width, t);
                     return _b.Shift(Op.Shl, field, Count(shift));
                 }
             case A64Op.Sbfm:
@@ -1275,13 +1341,15 @@ public sealed class A64Lifter : IMachineLifter
                 if (s >= r)
                 {
                     int width = s - r + 1;
-                    Node field = _b.And(_b.Shift(Op.ShrU, x, Count(r)), C(t, Mask(width)));
+                    Node field = LowPart(_b.Shift(Op.ShrU, x, Count(r)), width, t);
                     return _b.Or(_b.And(dst, C(t, ~Mask(width))), field);
                 }
                 else
                 {
                     int width = s + 1, shift = bits - r;
-                    Node field = _b.Shift(Op.Shl, _b.And(x, C(t, Mask(width))), Count(shift));
+                    // "bfi xd, xn, #32, #32": xn's low half over xd's high half - two 32-bit values side by side.
+                    if (bits == 64 && shift == 32 && width == 32) return _b.Concat(_b.Trunc(x, VT.I32), _b.Trunc(dst, VT.I32));
+                    Node field = _b.Shift(Op.Shl, LowPart(x, width, t), Count(shift));
                     return _b.Or(_b.And(dst, C(t, ~(Mask(width) << shift))), field);
                 }
             }

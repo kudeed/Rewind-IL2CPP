@@ -267,6 +267,8 @@ public sealed partial class HirBuilder
         return call is HCall ? call : null;
     }
 
+    private static readonly bool NoWideShifts = Environment.GetEnvironmentVariable("REWIND_NO_WIDE_SHIFTS") != null;
+
     private Sem BinarySem(Node n)
     {
         HBinaryOp op = n.Op switch
@@ -339,6 +341,11 @@ public sealed partial class HirBuilder
 
         bool isShift = n.Op is Op.Shl or Op.ShrU or Op.ShrS;
         HExpr left = IntValue(n.In[0]), right = isShift ? ShiftCount(n.In[1], n.Type.Bits()) : IntValue(n.In[1]);
+        // A shift takes its width from the value shifted: a 64-bit shift of what the program holds as a 32-bit
+        // number shifts that number made 64 bits wide ("(long)y << 32", not "y << 32", which shifts by 0).
+        if (isShift && n.Type == VT.I64 && !NoWideShifts && left is not HConst && left.Type is PrimitiveSig && !IsFloat(left.Type) && !IsBool(left.Type) &&
+            BitsOf(left.Type) is > 0 and < 64)
+            left = IsUnsigned(left.Type) ? new HConv(HConvKind.U8, left) { Type = _ulong } : new HConv(HConvKind.I8, left) { Type = _long };
         if (n.Op == Op.ShrU && n.Type == VT.I64 && right is HConst { Value: int down } && down is > 0 and < 64 && PartOfCombined(left, down, 64 - down) is { } upper)
             return new SVal(upper);
         // Logic on truth values stays boolean: "b ^ true" is "!b".
