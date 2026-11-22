@@ -2372,8 +2372,6 @@ public sealed partial class HirBuilder
     {
         if (Eval(fieldNode) is not SFieldInfo info)
         {
-
-                Console.Error.WriteLine($"[field] node {fieldNode.Id} op {fieldNode.Op} type {fieldNode.Type} sem {Eval(fieldNode).GetType().Name}");
             return null;
         }
         FieldDef field = info.Field;
