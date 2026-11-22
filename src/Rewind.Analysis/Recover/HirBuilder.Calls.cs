@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): float arguments of native calls, slot-specialized invokers, offset-0 field addresses, gaps always marked, small structs as numbers, floating-point negation, inlined compare-exchange on references, one virtual method through nested merges, objects copied into a merge before their constructor runs.
 using Rewind.Analysis.Abi;
 using Rewind.Analysis.Hir;
 using Rewind.Analysis.Ir;
@@ -26,6 +27,8 @@ public sealed partial class HirBuilder
         _fn.Regs.IsStackPosition(position) ? Input(call, ArgSlotKind.Stack, _fn.Regs.StackSlotOf(position))
         : _fn.Regs.IntRegisterOf(position) is int r and >= 0 ? Input(call, ArgSlotKind.IntReg, r) : null;
 
+    private static readonly bool NoDoubleHalves = Environment.GetEnvironmentVariable("REWIND_NO_DOUBLE_HALVES") != null;
+
     private HExpr FloatAt(Node call, int position, bool isDouble)
     {
         TypeSig type = isDouble ? _double : _float;
@@ -41,7 +44,12 @@ public sealed partial class HirBuilder
                 else if (slot.Op is Op.ZExt or Op.SExt && slot.In[0].Type == VT.I32 && !_materialize.Contains(slot) && !_sem.ContainsKey(slot)) slot = slot.In[0];
             }
             Sem s = Eval(slot);
-            if (s is SPair pair) return AsFloat(pair.Low, type);           // a float occupies the low half of its stack slot
+            if (s is SPair pair)
+            {
+                // A float occupies the low half of its stack slot; a double, both halves.
+                if (!isDouble || NoDoubleHalves) return AsFloat(pair.Low, type);
+                return ValueFromBits(CombineParts([new Part(0, 4, pair.Low), new Part(4, 4, pair.High)], 8), _double, 8);
+            }
             if (s is SVal v) return AsFloat(v.Expr, type);
             return AsFloat(Value(slot), type);
         }
@@ -54,6 +62,7 @@ public sealed partial class HirBuilder
         Node? hi = Input(call, ArgSlotKind.FloatReg, register * 4 + 1);
         if (Eval(lo) is SHalf { High: false } l && hi != null && Eval(hi) is SHalf { High: true } h && ReferenceEquals(l.Whole, h.Whole))
             return l.Whole;
+        if (hi != null && SignedLanes(lo, hi) is { } signed) return signed;
         if (Eval(lo) is SVal { Expr: HConst { Value: int low } } && hi != null && Eval(hi) is SVal { Expr: HConst { Value: int high } })
             return new HConst(BitConverter.Int64BitsToDouble((long)(uint)high << 32 | (uint)low), _double);
         HExpr bits = CombineParts([new Part(0, 4, HalfBits(lo)), new Part(4, 4, hi != null ? HalfBits(hi) : new HConst(0, _int))], 8);
@@ -77,7 +86,7 @@ public sealed partial class HirBuilder
     private HExpr Missing(TypeSig type)
     {
         Problem("call argument was not captured");
-        return new HOpaque("missing_argument") { Type = type };
+        return Site(new HOpaque("missing_argument") { Type = type }, "call argument was not captured");
     }
 
     private Dictionary<int, Node> Projections(Node call)
@@ -428,6 +437,32 @@ public sealed partial class HirBuilder
         }
     }
 
+    private static readonly bool NoFirstFields = Environment.GetEnvironmentVariable("REWIND_NO_FIRST_FIELDS") != null;
+
+    /// <summary>
+    /// A struct's address is also the address of its first field (and of that field's first field): where
+    /// something of the field's type is wanted there ("Value.ToString()" called with the address of the
+    /// struct that holds it), the location is that field. Unchanged when no field at the start is of exactly
+    /// that type.
+    /// </summary>
+    private HExpr AtStart(HExpr location, TypeSig? held, TypeSig? expected)
+    {
+        if (NoFirstFields || held == null || expected == null || Open(expected) || held.Key == expected.Key) return location;
+        int wanted = _p.Layouts.SizeOf(expected).Size;
+        HExpr current = location;
+        TypeSig type = held;
+        for (int depth = 0; depth < 8 && IsStructType(type) && !Open(type); depth++)
+        {
+            // (In a union, the field of the wanted size is the one meant.)
+            FieldSlot? first = _p.Layouts.FieldExactly(type, 0, wanted) is { } exact && exact.Type.Key == expected.Key ? exact : _p.Layouts.FieldAt(type, 0);
+            if (first is not { Offset: 0 } slot) break;
+            current = new HField { Object = current, Field = slot.Field, DeclaringType = type, Type = slot.Type };
+            type = slot.Type;
+            if (type.Key == expected.Key) return current;
+        }
+        return location;
+    }
+
     /// <summary>The storage location a pointer argument refers to.</summary>
     private HExpr? LocationOf(Node pointer, TypeSig? expected)
     {
@@ -437,7 +472,7 @@ public sealed partial class HirBuilder
         switch (s)
         {
             case SRef r:
-                return r.Location;
+                return AtStart(r.Location, r.Type, expected);
             case SFrame f when BufferAddress(f.Offset) is { } buffer:
             {
                 // In a stackalloc'd buffer: what the pointer points at.
@@ -486,15 +521,36 @@ public sealed partial class HirBuilder
                 return new HField { Object = null, Field = first, DeclaringType = statics.Type, Type = fieldType };
             }
             case SVal { Type: ByRefSig byRef } v:
-                return new HDeref(v.Expr) { Type = byRef.ElementType };
+                return AtStart(new HDeref(v.Expr) { Type = byRef.ElementType }, byRef.ElementType, expected);
             case SVal { Type: PointerSig pointerType } v:
-                return new HDeref(v.Expr) { Type = pointerType.ElementType };
+                return AtStart(new HDeref(v.Expr) { Type = pointerType.ElementType }, pointerType.ElementType, expected);
             default:
                 return null;
         }
     }
 
     // ---- results -----------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// A struct made from a value of another type: a struct that is one number, from that number ("new
+    /// Handle32(value)", its explicit conversion pasted in); anything else is marked.
+    /// </summary>
+    private HExpr StructOfValue(HExpr e, TypeSig structType, ulong addr)
+    {
+        TypeLayout layout = _p.Layouts.Of(structType);
+        if (layout.Known && layout.Fields.Length == 1 && layout.Fields[0] is { Offset: 0 } only && only.Size == layout.Size &&
+            only.Type is PrimitiveSig or { Definition.IsEnum: true } && !IsFloat(only.Type) && !IsFloat(e.Type) &&
+            (e.Type is PrimitiveSig or { Definition.IsEnum: true }) && !IsReference(e.Type) && BitsOf(e.Type) == BitsOf(only.Type))
+        {
+            HVar temp = _h.NewLocal(structType, "s");
+            temp.AddressTaken = true;
+            Emit(new HAssign(new HField { Object = new HLocal(temp) { Type = structType }, Field = only.Field, DeclaringType = structType, Type = only.Type }, e), addr);
+            return new HLocal(temp) { Type = structType };
+        }
+        string problem = $"could not rebuild {structType.DisplayName} from a {e.Type?.DisplayName ?? "value"}";
+        Problem(problem);
+        return Site(new HOpaque("struct_from_value", e) { Type = structType }, problem);
+    }
 
     private void FinishCall(Node call, HExpr expr, ReturnKind kind, TypeSig returnType, bool tail)
     {
@@ -506,7 +562,14 @@ public sealed partial class HirBuilder
                 Emit(new HEval(expr), call.Addr);
                 Emit(new HReturn(null), call.Addr);
             }
-            else Emit(new HReturn(expr), call.Addr);
+            else
+            {
+                // A struct returned where the call's result is something else (a conversion operator pasted in):
+                // the struct made from it.
+                if (_abi.ReturnType is { } returned && IsStructType(returned) && expr.Type is { } given && given.Key != returned.Key)
+                    expr = StructOfValue(expr, returned, call.Addr);
+                Emit(new HReturn(expr), call.Addr);
+            }
             return;
         }
 
@@ -589,6 +652,21 @@ public sealed partial class HirBuilder
         return null;
     }
 
+    private static readonly bool NoNativeFloatArgs = Environment.GetEnvironmentVariable("REWIND_NO_NATIVE_FLOAT_ARGS") != null;
+
+    /// <summary>
+    /// The value in the <paramref name="index"/>th floating-point argument register at a call to a function nothing is
+    /// known about, when the method put one there: a double when the register's upper half is set too.
+    /// </summary>
+    private HExpr? NativeFloatArg(Node call, int index)
+    {
+        int position = _fn.Regs.SharedPositions ? index : _fn.Regs.FirstFloatPosition + index;
+        int register = _fn.Regs.FloatRegisterOf(position);
+        if (register < 0 || Input(call, ArgSlotKind.FloatReg, register * 4) is not { } low || Eval(low) is SJunk) return null;
+        bool isDouble = Input(call, ArgSlotKind.FloatReg, register * 4 + 1) is { } high && Eval(high) is not SJunk;
+        return FloatAt(call, position, isDouble);
+    }
+
     private void EmitCall(Node call, bool tail)
     {
         var info = (CallInfo)call.Aux!;
@@ -608,6 +686,11 @@ public sealed partial class HirBuilder
             EmitHelperCall(call, invoker, tail);
             return;
         }
+        if (!target.IsManaged && target.Helper == null && _p.SlotInvokerAt(info.Target) is { } slotInvoker)
+        {
+            EmitSlotInvokerCall(call, slotInvoker, info.Target, tail);
+            return;
+        }
         if (!target.IsManaged && target.Helper == null && !NoNamedCopies && NamedCopy(call, info.Target) is { } named) target = named;
         if (target.IsManaged)
         {
@@ -622,11 +705,143 @@ public sealed partial class HirBuilder
         Problem($"call to unidentified native function 0x{info.Target:X}");
         var args = new List<HExpr>();
         for (int i = 0; i < 4; i++)
+        {
+            bool taken = false;
             if (IntAt(call, i) is { } a && Eval(a) is not SJunk)
+            {
                 args.Add(Value(a));
+                taken = true;
+            }
+            // A floating-point argument (where the convention gives each position one register or the other: when
+            // the general register at its position holds nothing).
+            if (!NoNativeFloatArgs && (!taken || !_fn.Regs.SharedPositions) && NativeFloatArg(call, i) is { } f) args.Add(f);
+        }
         FinishCall(call, new HOpaque($"native_0x{info.Target:X}", args.ToArray()) { Type = _long }, info.NoReturn ? ReturnKind.Void : ReturnKind.Integer, _long, tail);
         if (info.NoReturn) Emit(new HThrow(new HOpaque("noreturn")), call.Addr);
     }
+
+    /// <summary>
+    /// A call of an invoker made for one slot of the class's table (see SlotInvoker): the virtual method in that
+    /// slot of the object's class, called on the object with the invoker's arguments moved down one position,
+    /// or with the constants the invoker writes in. Where the method or how its arguments arrive is not
+    /// recovered, the gap says so and names what is known: the slot and the object.
+    /// </summary>
+    private void EmitSlotInvokerCall(Node call, Rewind.Analysis.Runtime.SlotInvoker invoker, ulong address, bool tail)
+    {
+        Node? objectNode = IntAt(call, 1);
+        string why;
+        if (objectNode != null)
+        {
+            HExpr receiver = Value(objectNode);
+            TypeSig? receiverType = receiver.Type;
+            if (_castTypes.TryGetValue(objectNode, out List<TypeSig>? casts) && casts.Count == 1) receiverType = casts[0];
+            if (receiverType != null) receiverType = Declared(receiverType);
+            MethodDef? method = FindVirtual(receiverType, invoker.Slot);
+            if (method == null) why = $"virtual slot {invoker.Slot} not found on {receiverType?.DisplayName ?? "unknown type"}";
+            else
+            {
+                TypeSig[] classArgs = receiverType is GenericInstSig g && ReferenceEquals(g.Definition, method.DeclaringType) ? g.Arguments : [];
+                MethodAbi abi = _p.Abi.For(method, classArgs, []);
+                if (SlotInvokerConstants(invoker, abi, out why) is { } constants)
+                {
+                    BuildCall(call, method, classArgs, [], isVirtual: true, tail, null, skipFirst: false, receiverOverride: objectNode, shift: 1,
+                        fixedArguments: constants);
+                    return;
+                }
+                why = $"how {method.DeclaringType.Name}.{method.Name} is handed its arguments: {why}";
+            }
+        }
+        else why = "object not captured";
+        Problem($"call through vtable slot {invoker.Slot} (invoker 0x{address:X}) not recovered: {why}");
+        // (Only the object is known for certain; the other values the invoker was handed are not shown.)
+        HExpr[] known = objectNode != null ? [Value(objectNode)] : [];
+        FinishCall(call, new HOpaque($"virtual_slot{invoker.Slot}_arguments_unknown", known) { Type = _long }, ReturnKind.Integer, _long, tail);
+    }
+
+    /// <summary>
+    /// Whether the method's arguments arrive the way the invoker hands them on: each from the invoker's own
+    /// argument one position further on, of the same kind, or as a constant it writes in (returned, by
+    /// position); its method record right after them. Null, with the reason, when they do not.
+    /// </summary>
+    private Dictionary<int, long>? SlotInvokerConstants(Rewind.Analysis.Runtime.SlotInvoker invoker, MethodAbi abi, out string why)
+    {
+        var constants = new Dictionary<int, long>();
+        why = "";
+        if (!abi.Known)
+        {
+            why = "signature not known";
+            return null;
+        }
+        int last = -1;
+        foreach (AbiParam p in abi.Params)
+        {
+            last = Math.Max(last, p.Position);
+            switch (p.Role)
+            {
+                case ParamRole.MethodInfo:
+                    if (p.Position != invoker.MethodInfoPosition)
+                    {
+                        why = "a different number of arguments";
+                        return null;
+                    }
+                    continue;
+                case ParamRole.This:
+                case ParamRole.Argument:
+                {
+                    if (p.Position >= invoker.MethodInfoPosition)
+                    {
+                        why = "a different number of arguments";
+                        return null;
+                    }
+                    if (p.Pass is not (PassKind.Integer or PassKind.Float or PassKind.Indirect))
+                    {
+                        why = "an argument passed in parts";
+                        return null;
+                    }
+                    bool inFloat = p.Pass == PassKind.Float && p.Position < 4;
+                    Rewind.Analysis.Runtime.InvokerSource? source = inFloat ? invoker.FloatSources[p.Position] : invoker.IntSources[p.Position];
+                    if (source is not { } s)
+                    {
+                        why = $"argument {p.Position} not handed on";
+                        return null;
+                    }
+                    if (s.IsConstant)
+                    {
+                        if (p.Role == ParamRole.This || p.Pass == PassKind.Indirect || IsStructType(p.Type) || (IsReference(p.Type) && s.Constant != 0))
+                        {
+                            why = $"argument {p.Position} a constant of no such type";
+                            return null;
+                        }
+                        constants[p.Position] = s.Constant;
+                        continue;
+                    }
+                    if (s.Position != p.Position + 1)
+                    {
+                        why = $"argument {p.Position} not the invoker's next";
+                        return null;
+                    }
+                    // (Of the same kind: the invoker's own argument arrived where the method's goes.)
+                    if (s.Position < 4 && invoker.FloatIn[s.Position] != (p.Pass == PassKind.Float))
+                    {
+                        why = $"argument {p.Position} of another kind";
+                        return null;
+                    }
+                    continue;
+                }
+                default:
+                    why = $"a {p.Role} argument";
+                    return null;
+            }
+        }
+        if (last != invoker.MethodInfoPosition)
+        {
+            why = "a different number of arguments";
+            return null;
+        }
+        return constants;
+    }
+
+    private static readonly bool NoInlineCompareExchange = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_COMPARE_EXCHANGE") != null;
 
     private void EmitIntrinsic(Node call, CallInfo info)
     {
@@ -645,6 +860,25 @@ public sealed partial class HirBuilder
                 _sem[call] = new SVal(new HLocal(t) { Type = t.Type });
             }
             else _sem[call] = new SVal(rounded);
+            return;
+        }
+        // "lock cmpxchg" on a reference field (an inlined field-like event's add or remove, a lazy initializer):
+        // what Interlocked.CompareExchange<T> does with it, as for the runtime's own helper.
+        if (!NoInlineCompareExchange && info.Intrinsic == "atomic_compare_exchange" && call.In.Length == 3 && call.Type == VT.I64 &&
+            LocationOf(call.In[0], null) is { Type: { } held } location && IsReference(held) &&
+            _m.FindType("System.Threading.Interlocked")?.Methods.FirstOrDefault(m =>
+                m.Name == "CompareExchange" && m.GenericParameters.Length == 1 && m.Parameters.Length == 3) is { } compareExchange)
+        {
+            HExpr[] arguments = [new HAddressOf(location) { Type = _m.Sigs.ByRef(held) }, ValueFor(call.In[1], held), ValueFor(call.In[2], held)];
+            var exchange = new HCall { Method = compareExchange, MethodArguments = [held], Arguments = arguments, Type = held };
+            if (!IsUsed(call)) Emit(new HEval(exchange), call.Addr);
+            else
+            {
+                // (Once, into a variable: the exchange is done where the code does it, and its result read after.)
+                HVar t = Temp(held, call.Type);
+                Emit(new HAssign(new HLocal(t) { Type = held }, exchange), call.Addr);
+                _sem[call] = new SVal(new HLocal(t) { Type = held });
+            }
             return;
         }
         HExpr[] args = call.In.Select(Value).ToArray();
@@ -1386,7 +1620,8 @@ public sealed partial class HirBuilder
     /// not ones that something else told.
     /// </summary>
     private void BuildCall(Node call, MethodDef method, TypeSig[] classArgs, TypeSig[] methodArgs, bool isVirtual, bool tail,
-        List<MethodDef>? alternatives, bool skipFirst, Node? receiverOverride = null, int shift = 0, bool listed = false, bool bufferFirst = false)
+        List<MethodDef>? alternatives, bool skipFirst, Node? receiverOverride = null, int shift = 0, bool listed = false, bool bufferFirst = false,
+        IReadOnlyDictionary<int, long>? fixedArguments = null)
     {
         MethodAbi abi = _p.Abi.For(method, classArgs, methodArgs);
         bool classTold = false, methodTold = false;
@@ -1493,8 +1728,8 @@ public sealed partial class HirBuilder
                         // A struct wrapping the object (see IsReferenceWrapper): the receiver is the object.
                         if (thisExpr.Type is { } held && IsReferenceWrapper(held)) thisExpr = Coerce(thisExpr, p.Type);
                         if (Eval(node) is SNewObject) { }
-                        else if (_castTypes.TryGetValue(node, out List<TypeSig>? casts) && casts.Count == 1 && !IsAssignable(thisExpr.Type, p.Type))
-                            thisExpr = new HTypeExpr(HTypeOp.CastClass, casts[0], thisExpr) { Type = casts[0] };
+                        else if (CheckedClassHere(node) is { } checkedAs && !IsAssignable(thisExpr.Type, p.Type))
+                            thisExpr = new HTypeExpr(HTypeOp.CastClass, checkedAs, thisExpr) { Type = checkedAs };
                     }
                     break;
                 }
@@ -1502,7 +1737,10 @@ public sealed partial class HirBuilder
                 {
                     TypeSig type = p.Type!;
                     HExpr arg;
-                    if (p.Pass == PassKind.Float) arg = FloatAt(call, position, p.IsDouble);
+                    // A value the code called through writes in itself (the same at every call).
+                    if (fixedArguments != null && fixedArguments.TryGetValue(p.Position, out long bits))
+                        arg = ValueFromBits(new HConst(bits, _long), type, Math.Max(1, _p.Layouts.SizeOf(type).Size));
+                    else if (p.Pass == PassKind.Float) arg = FloatAt(call, position, p.IsDouble);
                     else if (p.Pass is PassKind.IntegerPair or PassKind.FloatAggregate)
                     {
                         List<Node?> registers = ArgumentRegisters(call, p, position, out Carried how);
@@ -1530,9 +1768,9 @@ public sealed partial class HirBuilder
                         else
                         {
                             arg = ValueFor(node, type);
-                            if (IsReference(type) && _castTypes.TryGetValue(node, out List<TypeSig>? casts) && casts.Count == 1 &&
-                                !IsAssignable(arg.Type, type) && IsAssignable(casts[0], type))
-                                arg = new HTypeExpr(HTypeOp.CastClass, casts[0], arg) { Type = casts[0] };
+                            if (IsReference(type) && CheckedClassHere(node) is { } checkedAs &&
+                                !IsAssignable(arg.Type, type) && IsAssignable(checkedAs, type))
+                                arg = new HTypeExpr(HTypeOp.CastClass, checkedAs, arg) { Type = checkedAs };
                         }
                     }
                     args[p.ArgumentIndex] = arg;
@@ -1548,8 +1786,11 @@ public sealed partial class HirBuilder
 
         // A constructor call on a freshly allocated object is "new T(args)".
         Node? receiver = receiverOverride ?? (abi.This != null ? IntAt(call, abi.This.Position + shift) : null);
-        if (method.Name == ".ctor" && receiver != null && Eval(receiver) is SNewObject { Constructed: false } fresh)
+        if (method.Name == ".ctor" && receiver != null && Eval(receiver) is SNewObject fresh &&
+            (!fresh.Constructed || (!NoEarlyCopiedObjects && fresh.Claims.Count > 0)))
         {
+            // A second constructor call on an allocation one already claimed: one allocation, a call on each arm.
+            if (fresh.Constructed) fresh.Shared = true;
             fresh.Constructed = true;
             bool inlined = false;
             if (fresh.Type.Definition is { } allocated && !ReferenceEquals(allocated, method.DeclaringType))
@@ -1582,16 +1823,34 @@ public sealed partial class HirBuilder
             }
             if (!inlined)
             {
-                if (fresh.Allocation != null)
-                {
-                    if (!_cur.Statements.Remove(fresh.Allocation))
-                        foreach (HBlock block in _h.Blocks)
-                            if (block.Statements.Remove(fresh.Allocation))
-                                break;
-                    fresh.Allocation = null;
-                }
                 var created = new HNewObject { Constructor = method, DeclaringType = declaring, Arguments = args, Type = fresh.Type };
-                Emit(new HAssign(new HLocal(fresh.Variable) { Type = fresh.Type }, created), call.Addr);
+                var made = new HAssign(new HLocal(fresh.Variable) { Type = fresh.Type }, created);
+                if (NoEarlyCopiedObjects)
+                {
+                    if (fresh.Allocation != null)
+                    {
+                        if (!_cur.Statements.Remove(fresh.Allocation))
+                            foreach (HBlock block in _h.Blocks)
+                                if (block.Statements.Remove(fresh.Allocation))
+                                    break;
+                        fresh.Allocation = null;
+                    }
+                }
+                else
+                {
+                    // Whether "new T(args)" can stand for the allocation and this call is settled once every block
+                    // is built (SettleNewObjects): until then the allocation stays.
+                    fresh.ClaimSites.Add((_block, _nodeClock));
+                    fresh.Claims.Add((_cur, made, new HCall
+                    {
+                        Method = method,
+                        DeclaringType = declaring,
+                        This = new HLocal(fresh.Variable) { Type = fresh.Type },
+                        Arguments = args,
+                        Type = abi.ReturnType,
+                    }));
+                }
+                Emit(made, call.Addr);
                 if (tail) Emit(new HReturn(null), call.Addr);
                 return;
             }
@@ -1700,6 +1959,45 @@ public sealed partial class HirBuilder
         return ways;
     }
 
+    private static readonly bool NoNestedMergedTargets = Environment.GetEnvironmentVariable("REWIND_NO_NESTED_MERGED_TARGETS") != null;
+
+    /// <summary>
+    /// A merged code pointer some of whose ways in are merges themselves (ways that met before this point), each
+    /// way at the end taking the same virtual method's code from the class of the object it is called on: that
+    /// method, called on that object. (Where the ways pick different methods, only a merge of plain ways is
+    /// taken apart, above.)
+    /// </summary>
+    private MethodDef? OneMergedVirtualTarget(Node phi, Node? callReceiver)
+    {
+        var leaves = new List<Node>();
+        var seen = new HashSet<Node>();
+        bool Collect(Node n, int depth)
+        {
+            if (!seen.Add(n)) return true;
+            if (n.Op != Op.Phi) { leaves.Add(n); return true; }
+            if (depth > 4 || n.In.Length > 16) return false;
+            foreach (Node input in n.In)
+                if (!Collect(input, depth + 1)) return false;
+            return true;
+        }
+        if (!Collect(phi, 0) || leaves.Count < 2 || leaves.Count > 32) return null;
+        MethodDef? only = null;
+        Node? receiver = null;
+        foreach (Node leaf in leaves)
+        {
+            if (Peek(leaf) is not SVTable { MethodInfo: false, Interface: null } vt) return null;
+            TypeSig? receiverType = Peek(vt.Object) is SVal { Type: { } t } ? t : null;
+            if (_castTypes.TryGetValue(vt.Object, out List<TypeSig>? casts) && casts.Count == 1) receiverType = casts[0];
+            MethodDef? method = receiverType != null ? FindVirtual(Declared(receiverType), vt.Slot) : null;
+            if (method == null || method.IsStatic || method.GenericParameters.Length != 0 || method.DeclaringType.GenericParameters.Length != 0) return null;
+            // (One object throughout: the call's receiver is then the object every way read the class of.)
+            if ((only != null && !ReferenceEquals(only, method)) || (receiver != null && !ReferenceEquals(receiver, vt.Object))) return null;
+            only = method;
+            receiver = vt.Object;
+        }
+        return callReceiver != null && ReferenceEquals(callReceiver, receiver) ? only : null;
+    }
+
     /// <summary>
     /// The call of a merged code pointer whose ways in each picked a virtual method: a branch (or a switch) on the
     /// number of the method, each arm calling its method with the call's arguments, all meeting again after it.
@@ -1780,6 +2078,11 @@ public sealed partial class HirBuilder
                     DispatchPhis[targetNode] = ways;
                     DispatchRefined = true;
                 }
+            }
+            else if (!NoNestedMergedTargets && OneMergedVirtualTarget(targetNode, IntAt(call, 0)) is { } only)
+            {
+                BuildCall(call, only, [], [], isVirtual: true, tail, null, skipFirst: false);
+                return;
             }
         }
         Sem target = Eval(targetNode);
@@ -2096,6 +2399,7 @@ public sealed partial class HirBuilder
                     {
                         Allocation = new HAssign(new HLocal(variable) { Type = type }, new HTypeExpr(HTypeOp.Allocate, type, null) { Type = type }),
                     };
+                    _freshObjects.Add(fresh);
                     Emit(fresh.Allocation, call.Addr);
                     _sem[result] = fresh;
                 }
@@ -2160,6 +2464,7 @@ public sealed partial class HirBuilder
                 if (a0 == null || a1 == null || EvalKlass(a1) is not { } boxedType) break;
                 if (!_castTypes.TryGetValue(a0, out List<TypeSig>? known)) _castTypes[a0] = known = [];
                 if (!known.Contains(boxedType)) known.Insert(0, boxedType);
+                AddCastPlace(a0, _block, call);
                 if (result != null) _sem[result] = new SUnboxed(a0);
                 return;
             }

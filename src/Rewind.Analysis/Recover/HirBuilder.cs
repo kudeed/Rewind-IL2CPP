@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): virtual calls through merged class pointers, gaps always marked, small structs as numbers, floating-point negation, bits read as float/double, merged struct returns, long stack slots that held a reference and a number, struct addresses typed as their target, merged statics pointers, objects copied into a merge before their constructor runs.
 using Rewind.Analysis.Abi;
 using Rewind.Analysis.Hir;
 using Rewind.Analysis.Ir;
@@ -34,6 +35,12 @@ public sealed partial class HirBuilder
     private readonly HashSet<Node> _materialize = [];
     private readonly Dictionary<Node, int> _position = [];
     private readonly Dictionary<Node, List<TypeSig>> _castTypes = [];
+    /// <summary>Where each object's class checks are (CastFact's At and From): a check holds only past its place.</summary>
+    private readonly Dictionary<Node, List<(Block At, Node? From, IReadOnlyList<Node>? Over)>> _castPlaces = [];
+    /// <summary>CastHoldsAtStart's answers, per object and block.</summary>
+    private readonly Dictionary<(Node, Block), bool> _castAtStart = [];
+    /// <summary>The node ProcessBlock is building: where in _block a use is.</summary>
+    private Node? _node;
     private readonly Dictionary<(int Offset, string TypeKey), HVar> _frameVars = [];
     private readonly Dictionary<int, TypeSig> _frameTypes = [];
     /// <summary>Untyped stack slots accessed at overlapping ranges of different widths: start -> width (up to 8 bytes).</summary>
@@ -231,12 +238,19 @@ public sealed partial class HirBuilder
                             TypeSig wanted = _m.Sigs.Substitute(declared is ByRefSig r ? r.ElementType : declared, classArgs, call.MethodArguments);
                             HExpr given = call.Arguments[i];
                             TypeSig? passed = given.Type is ByRefSig byRef ? byRef.ElementType : given.Type;
+                            // (An address is typed as what the call takes; what it points to is the local's own type.)
+                            if (!NoAddressTargetTypes && given is HAddressOf { Target: HLocal { Type: { } targetType } }) passed = targetType;
                             if (Open(wanted) || !IsStruct(wanted) || !IsStruct(passed) || wanted.Key == passed!.Key) continue;
                             // (One C# converts on its own, with the same bytes: a Span where a ReadOnlySpan is taken.)
                             if (SameBytesConversion(passed, wanted)) continue;
                             Problem($"a {passed.ShortName} handed where a {wanted.ShortName} is taken");
                             HExpr place = given is HAddressOf { Target: var t } ? t : given;
-                            if (place is HLocal { Variable: var v } && offsetOf.TryGetValue(v, out int at)) FrameConflicts.Add(at);
+                            if (place is HLocal { Variable: var v } && offsetOf.TryGetValue(v, out int at))
+                            {
+                                FrameConflicts.Add(at);
+                                // (What a call captures of the slot without taking it is no read of either struct.)
+                                if (!NoAddressTargetTypes) ScalarSlotConflicts.Add(at);
+                            }
                         }
                     });
         if (NoScalarConflicts) return;
@@ -269,6 +283,39 @@ public sealed partial class HirBuilder
                 if (held is HConst) continue;
                 if ((IsSmallNumber(place.Type) && IsReference(held.Type)) || (IsReference(place.Type) && IsSmallNumber(held.Type))) FrameConflicts.Add(where);
             }
+        // A long slot is what an untyped slot is taken for, so a long alone says nothing; but one given both a
+        // reference and a number computed as a number (bits merged into it: the bools of one call's stack
+        // arguments, then an object for the next call) held two variables as well.
+        if (!NoLongSlotConflicts)
+        {
+            var references = new HashSet<int>();
+            var numbers = new HashSet<int>();
+            foreach (HBlock block in _h.Blocks)
+                foreach (HStmt s in block.Statements)
+                {
+                    if (s is not HAssign { Target: HLocal { Variable: var slot }, Value: var held } || !offsetOf.TryGetValue(slot, out int where) ||
+                        held.Type == null || held is HConst) continue;
+                    if (IsReference(held.Type)) references.Add(where);
+                    else if (IsNumber(held.Type) && held is not HLocal) numbers.Add(where);
+                }
+            // (Handed where a reference is taken counts as holding one: null is the constant 0 of the slot.)
+            foreach (HBlock block in _h.Blocks)
+                foreach (HStmt s in block.Statements)
+                    FinallyFolding.Visit(s, e =>
+                    {
+                        if (e is not HCall call || call.Method.Parameters.Length != call.Arguments.Length) return;
+                        for (int i = 0; i < call.Arguments.Length; i++)
+                            if (call.Arguments[i] is HLocal { Variable: var v } && offsetOf.TryGetValue(v, out int at) &&
+                                call.Method.Parameters[i].Type is { IsValueType: false } wanted && wanted is not ByRefSig && IsReference(wanted))
+                                references.Add(at);
+                    });
+            foreach (int where in references)
+                if (numbers.Contains(where))
+                {
+                    FrameConflicts.Add(where);
+                    ScalarSlotConflicts.Add(where);
+                }
+        }
         // A struct kept in a number's slot (a struct that is one number, where an int was before): stored there,
         // or boxed from there as the struct. C# converts neither way; the slot held two variables.
         if (!NoStructSlots)
@@ -327,6 +374,8 @@ public sealed partial class HirBuilder
         IsBoolType(e.Type) || e is HConst { Value: false or true or 0 or 1 or 0L or 1L or (byte)0 or (byte)1 };
 
     private static readonly bool NoScalarConflicts = Environment.GetEnvironmentVariable("REWIND_NO_SCALAR_CONFLICTS") != null;
+    private static readonly bool NoAddressTargetTypes = Environment.GetEnvironmentVariable("REWIND_NO_ADDRESS_TARGET_TYPES") != null;
+    private static readonly bool NoLongSlotConflicts = Environment.GetEnvironmentVariable("REWIND_NO_LONG_SLOT_CONFLICTS") != null;
     private const string LostRegisterUsed = "a value kept in a callee-saved register is used after a caught exception";
     private static readonly bool NoLazyLostRegisters = Environment.GetEnvironmentVariable("REWIND_NO_LAZY_LOST_REGISTERS") != null;
     private static readonly bool NoStructSlots = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_SLOTS") != null;
@@ -446,6 +495,137 @@ public sealed partial class HirBuilder
     /// The type an object is known to have here because a type test on every way to this point succeeded.
     /// (After "if (o is Goblin)" the compiled code keeps using o itself, as a Goblin.)
     /// </summary>
+    /// <summary>
+    /// Whether a class check of obj that a guard removed holds at the node being built: every way from the entry to it
+    /// passes a check. A method that checks this's class on one path only (a field of a subclass read when a level
+    /// number says so) uses this unchecked everywhere else, and a cast there would throw; a read in the check's own
+    /// block before the check would throw before what the native code did first. A check the CFG no longer reaches
+    /// (a constant-false arm) proves nothing. Outside the building of blocks (the planning passes): true.
+    /// </summary>
+    private bool CastHoldsHere(Node obj)
+    {
+        if (_cfg == null || _block == null) return true;
+        if (!_castPlaces.TryGetValue(obj, out List<(Block At, Node? From, IReadOnlyList<Node>? Over)>? places) || !_cfg.IsReachable(_block)) return false;
+        foreach (var (at, from, over) in places)
+        {
+            if (!ReferenceEquals(at, _block) || _node == null || !_position.TryGetValue(_node, out int here)) continue;
+            int checkAt = CheckPosition(_block, from, over);
+            // Past the check; or before it, the use included, with nothing the cast's throw would skip or come before:
+            // the compiler loads fields before the class test it doesn't depend on, and the source's cast came first.
+            if (checkAt <= here || SafeToReorder(_block, here, checkAt, obj)) return true;
+        }
+        return CastHoldsAtStart(obj, _block, places);
+    }
+
+    /// <summary>
+    /// The one class obj is checked as, where the node being built uses it (CastHoldsHere), or null. A check on another
+    /// path proves nothing here: a cast to its class at a call's receiver or argument, a store or a merge would throw
+    /// where the native code doesn't. REWIND_NO_CAST_DOMINANCE: anywhere, as before.
+    /// </summary>
+    private TypeSig? CheckedClassHere(Node obj) =>
+        _castTypes.TryGetValue(obj, out List<TypeSig>? casts) && casts.Count == 1 && (NoCastDominance || CastHoldsHere(obj)) ? casts[0] : null;
+
+    /// <summary>
+    /// As CheckedClassHere, for the value a merge takes on the edge from block from to block to: the check holds at
+    /// from's end, or it is in to before anything there that the cast's throw would skip or come before (the class test
+    /// of the merged object right after the merge, as PoliceHelicopter.start and HaxeException's constructor have it).
+    /// </summary>
+    private TypeSig? CheckedClassOnEdge(Node obj, Block from, Block to)
+    {
+        if (!_castTypes.TryGetValue(obj, out List<TypeSig>? casts) || casts.Count != 1) return null;
+        if (NoCastDominance || CastHoldsAtEnd(obj, from)) return casts[0];
+        if (_cfg != null && _castPlaces.TryGetValue(obj, out List<(Block At, Node? From, IReadOnlyList<Node>? Over)>? places))
+            foreach (var (at, check, over) in places)
+                if (ReferenceEquals(at, to) && _cfg.IsReachable(to) && SafeToReorder(to, 0, CheckPosition(to, check, over), obj))
+                    return casts[0];
+        return null;
+    }
+
+    /// <summary>Whether a class check of obj holds at block's end: a check in block, or one on every way into it.</summary>
+    private bool CastHoldsAtEnd(Node obj, Block block)
+    {
+        if (_cfg == null) return true;
+        if (!_castPlaces.TryGetValue(obj, out List<(Block At, Node? From, IReadOnlyList<Node>? Over)>? places) || !_cfg.IsReachable(block)) return false;
+        foreach (var (at, _, _) in places)
+            if (ReferenceEquals(at, block)) return true;
+        return CastHoldsAtStart(obj, block, places);
+    }
+
+    /// <summary>
+    /// Where in block a check is: its From node; if a later pass took that out (a spill it removed), the first node
+    /// left of those it covers (Over, MergeLinearBlocks's record); else the block's end, the latest it can be.
+    /// </summary>
+    private int CheckPosition(Block block, Node? from, IReadOnlyList<Node>? over)
+    {
+        if (from != null && _position.TryGetValue(from, out int at) && at < block.Nodes.Count && ReferenceEquals(block.Nodes[at], from)) return at;
+        int first = block.Nodes.Count;
+        if (over != null)
+            foreach (Node n in over)
+                if (_position.TryGetValue(n, out int p) && p < first && ReferenceEquals(block.Nodes[p], n)) first = p;
+        return first;
+    }
+
+    /// <summary>
+    /// Whether a cast of obj at node here of block may come before the check at checkAt: nothing from the use itself up
+    /// to the check is a store or a call (which the native code performed before the check threw), or could fault
+    /// first (a load other than of obj's own fields, a division), so the cast's throw is the first thing that happens
+    /// either way. Before (Nov 2026) only stores and calls strictly between the two counted: a store as the use, or a
+    /// load through null between, came before the check's throw natively and after it with the cast.
+    /// </summary>
+    private static bool SafeToReorder(Block block, int here, int checkAt, Node obj)
+    {
+        for (int i = here; i < checkAt && i < block.Nodes.Count; i++)
+        {
+            Node n = block.Nodes[i];
+            if (n.Dead) continue;
+            switch (n.Op)
+            {
+                case Op.Store or Op.Call or Op.Return or Op.TailCall or Op.Unreachable:
+                case Op.DivS or Op.DivU or Op.RemS or Op.RemU:
+                    return false;
+                case Op.Load when !OfObject(n.In[0], obj):
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    /// <summary>Whether an address is obj itself or obj plus a constant: one of its fields.</summary>
+    private static bool OfObject(Node address, Node obj) =>
+        ReferenceEquals(address, obj) ||
+        address.Op == Op.Add && address.In.Length == 2 &&
+        (ReferenceEquals(address.In[0], obj) && address.In[1].IsConst || ReferenceEquals(address.In[1], obj) && address.In[0].IsConst);
+
+    /// <summary>Whether every way from the entry to block's first node passes the end of a block that checks obj.</summary>
+    private bool CastHoldsAtStart(Node obj, Block block, List<(Block At, Node? From, IReadOnlyList<Node>? Over)> places)
+    {
+        if (_castAtStart.TryGetValue((obj, block), out bool known)) return known;
+        var checks = new HashSet<Block>();
+        foreach (var (at, _, _) in places)
+            if (_cfg.IsReachable(at)) checks.Add(at);
+        var seen = new HashSet<Block> { _fn.Entry };
+        var pending = new Stack<Block>();
+        pending.Push(_fn.Entry);
+        bool reached = false;
+        while (pending.Count > 0 && !reached)
+        {
+            Block b = pending.Pop();
+            if (ReferenceEquals(b, block)) reached = true;
+            else if (!checks.Contains(b))
+                foreach (Block s in b.Succs)
+                    if (seen.Add(s)) pending.Push(s);
+        }
+        return _castAtStart[(obj, block)] = !reached;
+    }
+
+    /// <summary>A class check found while building (an unboxing's): it holds from node on.</summary>
+    private void AddCastPlace(Node obj, Block at, Node? from, IReadOnlyList<Node>? over = null)
+    {
+        if (!_castPlaces.TryGetValue(obj, out List<(Block At, Node? From, IReadOnlyList<Node>? Over)>? places)) _castPlaces[obj] = places = [];
+        places.Add((at, from, over));
+        foreach (var key in _castAtStart.Keys.Where(k => ReferenceEquals(k.Item1, obj)).ToList()) _castAtStart.Remove(key);
+    }
+
     private TypeSig? TestedType(Node obj)
     {
         int guard = 0;
@@ -515,6 +695,7 @@ public sealed partial class HirBuilder
     private static readonly bool NoParamHalves = Environment.GetEnvironmentVariable("REWIND_NO_PARAM_HALVES") != null;
     private static readonly bool NoRefParamHalves = Environment.GetEnvironmentVariable("REWIND_NO_REF_PARAM_HALVES") != null;
     private static readonly bool NoStaticRefs = Environment.GetEnvironmentVariable("REWIND_NO_STATIC_REFS") != null;
+    private static readonly bool NoMergedStructBits = Environment.GetEnvironmentVariable("REWIND_NO_MERGED_STRUCT_BITS") != null;
     private static readonly bool NoArgumentConflicts = Environment.GetEnvironmentVariable("REWIND_NO_ARGUMENT_CONFLICTS") != null;
     private static readonly bool NoWideSwitches = Environment.GetEnvironmentVariable("REWIND_NO_WIDE_SWITCHES") != null;
 
@@ -592,7 +773,10 @@ public sealed partial class HirBuilder
             while (work.Count > 0)
             {
                 Node phi = work.Dequeue();
-                if (!settled.Add(phi) || !_phiInputs.TryGetValue(phi, out List<Node>? inputs)) continue;
+                if (!settled.Add(phi)) continue;
+                // (What its copies could not say counts now: see PhiCopies.)
+                Release(phi);
+                if (!_phiInputs.TryGetValue(phi, out List<Node>? inputs)) continue;
                 foreach (Node input in inputs)
                 {
                     if (input.Op == Op.Phi) _phiRead.Add(input);
@@ -664,6 +848,17 @@ public sealed partial class HirBuilder
             block.Statements.RemoveAll(s => s is HAssign { Target: HLocal { Variable: var target } } && unread.Contains(target));
     }
 
+    /// <summary>
+    /// The marker standing in for what <paramref name="problem"/> (just reported) is about: when the marker is not
+    /// in the finished method, neither is the problem (see HMethod.SiteProblems).
+    /// </summary>
+    private HOpaque Site(HOpaque marker, string problem)
+    {
+        marker.Problem = problem;
+        _h.SiteProblems.Add(problem);
+        return marker;
+    }
+
     private void Problem(string text)
     {
         if (_peeking > 0 && (_computing ?? _peekSubject) is { } subject)
@@ -705,11 +900,15 @@ public sealed partial class HirBuilder
             for (int i = 0; i < b.Nodes.Count; i++) _position[b.Nodes[i]] = i;
         }
 
+        // A check in a block the CFG no longer reaches (or no longer has) was on a path that is gone: no fact at all,
+        // neither a cast type nor a place.
+        var reach = new Cfg(_fn);
         foreach (CastFact cast in _l.Normalization.Casts)
         {
-            if (EvalKlass(cast.Klass) is not { } type) continue;
+            if (!reach.IsReachable(cast.At) || EvalKlass(cast.Klass) is not { } type) continue;
             if (!_castTypes.TryGetValue(cast.Object, out List<TypeSig>? list)) _castTypes[cast.Object] = list = [];
             if (!list.Contains(type)) list.Add(type);
+            AddCastPlace(cast.Object, cast.At, cast.From, cast.Over);
         }
 
         BindParameters();
@@ -727,7 +926,10 @@ public sealed partial class HirBuilder
         FindPieceCopies();
         FindPieceFills();
         foreach (Block b in cfg.ReversePostOrder) DeclarePhis(b);
+        _building = true;
         foreach (Block b in cfg.ReversePostOrder) ProcessBlock(b);
+        _building = false;
+        SettleNewObjects();
         SettlePhis();
         RefineFloatPhis();
         RefinePhiJoins();
@@ -741,6 +943,58 @@ public sealed partial class HirBuilder
         HirCleanup.Run(_h);
         if (HirCleanup.CheckTryRegions(_h) is { } broken) Problem("exception handling not reconstructed: " + broken);
         return _h;
+    }
+
+    private readonly List<SNewObject> _freshObjects = [];
+    // A clock of the nodes as ProcessBlock reaches them, for the order of an object's reads and its constructor call
+    // within a block (SNewObject.Uses, ClaimSites); _building while the blocks are built.
+    private long _clock, _nodeClock;
+    private bool _building;
+
+    /// <summary>
+    /// "o = new T(args)" stands for an allocation and the constructor call that claimed it only when nothing else
+    /// saw the object between them: no merge took a copy of it before the call (SNewObject.CopiedEarly), and no
+    /// other constructor call, on another path, ran on the same allocation (SNewObject.Shared). Then the bare
+    /// allocation goes. Otherwise it stays where it was, and each constructor runs on it as a call: what the code
+    /// does (MarkRawConstructors notes it).
+    /// </summary>
+    private void SettleNewObjects()
+    {
+        foreach (SNewObject fresh in _freshObjects)
+        {
+            if (fresh.Claims.Count == 0 || fresh.Allocation == null) continue;
+            if (!fresh.CopiedEarly && !fresh.Shared && (NoClaimDominance || ClaimComesFirst(fresh)))
+            {
+                foreach (HBlock block in _h.Blocks)
+                    if (block.Statements.Remove(fresh.Allocation))
+                        break;
+                fresh.Allocation = null;
+                continue;
+            }
+            foreach (var (block, made, onRaw) in fresh.Claims)
+            {
+                int at = block.Statements.IndexOf(made);
+                if (at >= 0) block.Statements[at] = new HEval(onRaw) { Address = made.Address };
+            }
+        }
+    }
+
+    /// <summary>
+    /// Whether the one constructor call that claimed the object comes before every read of it: in its own block after
+    /// the call's node, in any other block only where the call's block dominates it. A read anywhere else (a field
+    /// initialized inline on another path, a copy into a merge on the way to a block the call doesn't dominate) sees
+    /// the object as allocated, before or without that call; with "new T(args)" at the call it would read whatever
+    /// the variable held before, null or the object of a loop's previous turn. Whether a merge's copy came before
+    /// the call was told by the order the blocks were built in (SNewObject.CopiedEarly), which this doesn't depend on.
+    /// </summary>
+    private bool ClaimComesFirst(SNewObject fresh)
+    {
+        if (fresh.ClaimSites.Count != 1) return false;
+        var (at, clock) = fresh.ClaimSites[0];
+        foreach (var (block, first) in fresh.Uses)
+            if (ReferenceEquals(block, at) ? first < clock : !_cfg.Dominates(at, block))
+                return false;
+        return true;
     }
 
     /// <summary>The record of try region <paramref name="index"/>, made on first use.</summary>
@@ -1112,8 +1366,9 @@ public sealed partial class HirBuilder
                 // A piece of a stack struct that did not turn out to be part of a struct copy: the bytes are
                 // likely other data in a reused slot (see StackSplitting).
                 if (s is SChunk && n.Op == Op.Load && IsFrameAddress(n.In[0], out int pieceAt)) FrameConflicts.Add(pieceAt);
-                Problem($"{s.GetType().Name[1..]} value used as data (%{n.Id} {n.Op})");
-                return new HOpaque(s.GetType().Name[1..].ToLowerInvariant()) { Type = TypeForBits(n.Type) };
+                string asData = $"{s.GetType().Name[1..]} value used as data (%{n.Id} {n.Op})";
+                Problem(asData);
+                return Site(new HOpaque(s.GetType().Name[1..].ToLowerInvariant()) { Type = TypeForBits(n.Type) }, asData);
         }
     }
 
@@ -1144,6 +1399,13 @@ public sealed partial class HirBuilder
             if (_refPhis.TryGetValue(phi, out Node? bound) && _sem.TryGetValue(bound, out Sem? boundSem))
             {
                 _sem[phi] = boundSem;
+                continue;
+            }
+            // One class's static data whichever way in: the compiler merged the paths after each read the
+            // pointer (tail merging), and the field reads after the merge are of that class's statics.
+            if (!NoMergedStatics && MergedStatics(phi) is { } statics)
+            {
+                _sem[phi] = statics;
                 continue;
             }
             // The address of one stack object or another, by the way in: a reference variable.
@@ -1178,6 +1440,28 @@ public sealed partial class HirBuilder
             _sem[phi] = new SVal(new HLocal(variable) { Type = type });
             if (type != null) PhiTypes[phi] = type;
         }
+    }
+
+    private static readonly bool NoMergedStatics = Environment.GetEnvironmentVariable("REWIND_NO_MERGED_STATICS") != null;
+
+    /// <summary>The static data of one class, when every way into the merge gives that pointer; null otherwise.</summary>
+    private SStatics? MergedStatics(Node phi)
+    {
+        SStatics? found = null;
+        foreach (Node input in phi.In)
+        {
+            if (ReferenceEquals(input, phi)) continue;
+            // (Only a read of a class's static data pointer is looked at here, before the blocks are built: the
+            // class, a constant of the image, and the offset of its static data.)
+            Sem? s = input.Op == Op.Phi ? _sem.GetValueOrDefault(input)
+                : input.Op == Op.Load && input.In[0] is { Op: Op.Add } address && address.In[1].IsConst &&
+                  address.In[1].Imm == _p.Klass.StaticFields && address.In[0].Op is Op.SlotValue or Op.Load &&
+                  Peek(address.In[0]) is SKlass klass ? new SStatics(klass.Type) : null;
+            if (s is not SStatics statics) return null;
+            if (found == null) found = statics;
+            else if (found.Type.Key != statics.Type.Key) return null;
+        }
+        return found;
     }
 
     /// <summary>Assignments that give a successor's merged values their value along the edge from this block.</summary>
@@ -1237,7 +1521,19 @@ public sealed partial class HirBuilder
             {
                 s = Eval(input);
                 if (s is SJunk) continue;
-                value = Value(input);
+                // A copy of an object no constructor has run on yet (see SNewObject.CopiedEarly).
+                if (!NoEarlyCopiedObjects && s is SNewObject { Constructed: false } raw) raw.CopiedEarly = true;
+                // What cannot be said about the value as the merged value's copy (a class pointer is no data) is
+                // held with the merged value: it counts when that is read, not when the value itself is used
+                // for what it is (the class's methods read through it, the merge given back to each way in).
+                if (!NoCopyProblemsOnPhi) _peekSubject = phi;
+                // A merged struct that travels in a register (a struct of 8 bytes returned in RAX): what a way in
+                // gives as the register's bits is the struct those bits are, not a number made into it.
+                value = !NoMergedStructBits && IsStructType(variable.Type) && input.Type is VT.I32 or VT.I64 &&
+                    (s is SPair || s is SVal { Expr: not HConst, Type: PrimitiveSig bits } && !IsReference(bits) && BitsOf(bits) is > 0 and <= 64) &&
+                    _p.Layouts.Of(variable.Type) is { Known: true, Size: > 0 and <= 8 }
+                    ? StructFromBits(input, variable.Type)
+                    : Value(input);
             }
             finally
             {
@@ -1259,7 +1555,9 @@ public sealed partial class HirBuilder
             // code has checked to be of a class counts as that class.)
             if (value is not HConst && IsStructType(value.Type) && IsStructType(variable.Type) && !Open(value.Type))
                 _phiStructs[phi] = _phiStructs.TryGetValue(phi, out TypeSig? seen) && (seen == null || seen.Key != value.Type!.Key) ? null : value.Type;
-            TypeSig? incoming = _castTypes.TryGetValue(input, out List<TypeSig>? checkedAs) && checkedAs.Count == 1 ? checkedAs[0] : value.Type;
+            // A check counts on this edge only if it holds there (CheckedClassOnEdge): one on another way in proves
+            // nothing about what this edge gives.
+            TypeSig? incoming = CheckedClassOnEdge(input, from, to) ?? value.Type;
             if (value is not HConst && incoming != null && IsReference(incoming) && !Open(incoming))
                 _phiJoins[phi] = _phiJoins.TryGetValue(phi, out TypeSig? soFar) ? JoinTypes(soFar, incoming) : incoming;
             if (value is not HConst && incoming != null && IsReference(incoming) && IsReference(variable.Type) && !Open(incoming) &&
@@ -1290,6 +1588,10 @@ public sealed partial class HirBuilder
         if (value.Type != VT.I64) return false;
         return ReferenceEquals(to, from.Succs[cond.Op == Op.CmpEq ? 0 : 1]);
     }
+
+    private static readonly bool NoEarlyCopiedObjects = Environment.GetEnvironmentVariable("REWIND_NO_EARLY_COPIED_OBJECTS") != null;
+    private static readonly bool NoClaimDominance = Environment.GetEnvironmentVariable("REWIND_NO_CLAIM_DOMINANCE") != null;
+    private static readonly bool NoCopyProblemsOnPhi = Environment.GetEnvironmentVariable("REWIND_NO_COPY_PROBLEMS_ON_PHI") != null;
 
     private readonly Dictionary<HVar, Node> _phiOfVar = [];
     /// <summary>The nearest common type of the references each merged value was given in this build.</summary>
@@ -1352,12 +1654,13 @@ public sealed partial class HirBuilder
         if (ReferenceEquals(e.Type, _float))
         {
             if (e is HConst { Value: float f }) return new HConst(BitConverter.SingleToInt32Bits(f), _int);
-            if (SingleBits(e) is { } asInt) return asInt;
+            if ((SingleBits(e) ?? BitCast(e, _int)) is { } asInt) return asInt;
             Problem("float reinterpreted as bits (no BitConverter in this build)");
             return new HOpaque("float_bits", e) { Type = _int };
         }
         if (e is HConst { Value: double d }) return new HConst(BitConverter.DoubleToInt64Bits(d), _long);
         if (BitConverterMethod("DoubleToInt64Bits", _double) is { } toLong) return new HCall { Method = toLong, Arguments = [e], Type = _long };
+        if (BitCast(e, _long) is { } asLong) return asLong;
         Problem("double reinterpreted as bits (no BitConverter in this build)");
         return new HOpaque("double_bits", e) { Type = _long };
     }
@@ -1486,6 +1789,8 @@ public sealed partial class HirBuilder
         foreach (Node n in b.Nodes)
         {
             if (n.Dead) continue;
+            _node = n;
+            _nodeClock = ++_clock;
             switch (n.Op)
             {
                 case Op.Store:
@@ -1585,6 +1890,8 @@ public sealed partial class HirBuilder
     {
         if (_sem.TryGetValue(n, out Sem? s))
         {
+            // A read of a freshly allocated object, for where its constructor call stands (ClaimComesFirst).
+            if (_building && s is SNewObject seen && !NoClaimDominance) seen.NoteUse(_block, _nodeClock);
             if (n.Op == Op.Phi)
             {
                 if (_peeking == 0) _phiRead.Add(n);
@@ -1734,6 +2041,11 @@ public sealed partial class HirBuilder
                     Emit(new HReturn(lo.Whole), ret.Addr);
                     return;
                 }
+                if (ret.In.Length == 2 && SignedLanes(ret.In[0], ret.In[1]) is { } signed)
+                {
+                    Emit(new HReturn(signed), ret.Addr);
+                    return;
+                }
                 // The two halves come from different places: the double is whatever those 64 bits spell.
                 HExpr bits = CombineParts([new Part(0, 4, HalfBits(ret.In[0])), new Part(4, 4, ret.In.Length > 1 ? HalfBits(ret.In[1]) : new HConst(0, _int))], 8);
                 Emit(new HReturn(ValueFromBits(bits, _double, 8)), ret.Addr);
@@ -1842,6 +2154,14 @@ public sealed partial class HirBuilder
         {
             HExpr bits = FloatBits(e);
             return ReferenceEquals(target, _ulong) ? new HConv(HConvKind.U8, bits) { Type = _ulong } : bits;
+        }
+        // A number where a struct goes, or a struct where a number goes, with nothing above that told which
+        // fields the bits are: no conversion IL has. (A struct that is one number is that number.)
+        if (IsStructType(target) && from is PrimitiveSig && !IsStructType(from)) return NumberAsStruct(e, target);
+        if (IsStructType(from) && target is PrimitiveSig)
+        {
+            HExpr scalar = ScalarOf(e, BitsOf(target));
+            return IsStructType(scalar.Type) ? StructAsNumber(e, target) : scalar;
         }
         return e;
     }

@@ -65,6 +65,10 @@ public static class Decompiler
 
         var selected = new HashSet<AssemblyModel>(model.Assemblies.Where(a => options.Assemblies?.Invoke(a) ?? true));
         var report = new StringBuilder();
+        // A row names the method in full: the assembly and the parameter types tell overloads and same-named types
+        // in different assemblies apart, which "Type::Method" alone does not.
+        static string Row(string kind, MethodDef method, string reason) =>
+            $"{kind}\t{method.FullName}\t{reason}\t{method.DeclaringType.Assembly.Name}\t{method.FullName}({string.Join(", ", method.Parameters.Select(p => p.Type.DisplayName))})";
 
         if (program != null)
         {
@@ -116,17 +120,17 @@ public static class Decompiler
                             HMethod generic = recovered.Recovered!;
                             if (generic.Problems.Count != 0)
                             {
-                                report.AppendLine($"generic, gaps\t{method.FullName}\t{string.Join(" | ", generic.Problems.Distinct().Take(6))}");
+                                report.AppendLine(Row("generic, gaps", method, string.Join(" | ", generic.Problems.Distinct().Take(6))));
                                 if (!genericGaps) return;
                             }
                             string? refused = bodies.Emit(method, generic);
-                            if (refused != null) report.AppendLine($"generic, not emitted\t{method.FullName}\t{refused}");
+                            if (refused != null) report.AppendLine(Row("generic, not emitted", method, refused));
                             else if (generic.Problems.Count == 0) result.GenericClean++;
                             else result.GenericWithGaps++;
                         }
                         catch (Exception e)
                         {
-                            report.AppendLine($"generic, failed\t{method.FullName}\t{e.GetType().Name}: {e.Message}");
+                            report.AppendLine(Row("generic, failed", method, $"{e.GetType().Name}: {e.Message}"));
                         }
                         return;
                     }
@@ -141,19 +145,19 @@ public static class Decompiler
                         {
                             result.NotEmitted++;
                             result.EmitFailures[why] = result.EmitFailures.GetValueOrDefault(why) + 1;
-                            report.AppendLine($"not emitted\t{method.FullName}\t{why}");
+                            report.AppendLine(Row("not emitted", method, why));
                         }
                         else if (h.Problems.Count == 0) result.Clean++;
                         else
                         {
                             result.WithGaps++;
-                            report.AppendLine($"gaps\t{method.FullName}\t{string.Join(" | ", h.Problems.Distinct().Take(6))}");
+                            report.AppendLine(Row("gaps", method, string.Join(" | ", h.Problems.Distinct().Take(6))));
                         }
                     }
                     catch (Exception e)
                     {
                         result.Crashed++;
-                        report.AppendLine($"failed\t{method.FullName}\t{e.GetType().Name}: {e.Message}");
+                        report.AppendLine(Row("failed", method, $"{e.GetType().Name}: {e.Message}"));
                     }
                 });
             options.Log($"method bodies: {result.Methods} with native code, {result.Clean} recovered completely, {result.WithGaps} with gaps marked in the output, " +

@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): wide stores over inherited fields, gaps always marked, bits read as float/double.
 using Rewind.Analysis.Hir;
 using Rewind.Analysis.Ir;
 using Rewind.Model;
@@ -43,8 +44,7 @@ public sealed partial class HirBuilder
     private bool Leaves(HExpr owner, TypeSig type, int offset, int size, int baseOffset, List<Part> output, int depth = 0)
     {
         if (depth > 8) return false;
-        TypeLayout layout = _p.Layouts.Of(type);
-        foreach (FieldSlot slot in layout.Fields)
+        foreach (FieldSlot slot in InstanceFields(type))
         {
             int start = Math.Max(offset, slot.Offset), end = Math.Min(offset + size, slot.Offset + slot.Size);
             if (start >= end) continue;
@@ -64,7 +64,28 @@ public sealed partial class HirBuilder
         return true;
     }
 
-    private static readonly bool NoUnions = Environment.GetEnvironmentVariable("REWIND_NO_UNION_PARTS") != null;
+    private static readonly bool NoInheritedParts = Environment.GetEnvironmentVariable("REWIND_NO_INHERITED_PARTS") != null;
+
+    /// <summary>
+    /// The instance fields an object of <paramref name="type"/> has, by offset: a struct's own, a class's own and
+    /// those of each class it derives from (one wide write can set the last field a base class declares and the
+    /// first of the class below, or two flags side by side in a base class).
+    /// </summary>
+    private IEnumerable<FieldSlot> InstanceFields(TypeSig type)
+    {
+        TypeLayout layout = _p.Layouts.Of(type);
+        if (NoInheritedParts || type.Definition is not { IsValueType: false } definition || definition.BaseType == null) return layout.Fields;
+        var chain = new List<FieldSlot>();
+        for (TypeSig? current = type; current?.Definition is { } def;)
+        {
+            chain.AddRange(_p.Layouts.Of(current).Fields);
+            if (def.BaseType == null) break;
+            current = _m.Sigs.Substitute(def.BaseType, current is GenericInstSig g ? g.Arguments : [], []);
+        }
+        return chain.OrderBy(f => f.Offset);
+    }
+
+    private static readonly bool NoUnions =Environment.GetEnvironmentVariable("REWIND_NO_UNION_PARTS") != null;
 
     /// <summary>
     /// The fields that fill a struct whose fields lie over each other (a union, as Color32's "rgba" over "r",
@@ -127,9 +148,23 @@ public sealed partial class HirBuilder
         return null;
     }
 
+    private static readonly bool NoBitCasts = Environment.GetEnvironmentVariable("REWIND_NO_BIT_CASTS") != null;
+
+    /// <summary>
+    /// The value whose bits are those of <paramref name="value"/>, read as <paramref name="type"/> (a number of
+    /// the same size), where the class library has no call for it: the value's own memory read as the other
+    /// type, "*(double*)&amp;bits" (emitted as ldloca and ldobj). Null when that is off or the sizes differ.
+    /// </summary>
+    private HExpr? BitCast(HExpr value, TypeSig type)
+    {
+        if (NoBitCasts || value.Type is not PrimitiveSig || BitsOf(value.Type) is not (32 or 64) || BitsOf(value.Type) != BitsOf(type)) return null;
+        return new HDeref(new HAddressOf(value) { Type = _m.Sigs.Pointer(value.Type) }) { Type = type };
+    }
+
     /// <summary>Matches what SingleBits and SingleFromBits build (whichever way): the value whose bits are read as the other type.</summary>
     private static bool IsReinterpreted(HExpr e, string direct, string reader, out HExpr original)
     {
+        if (e is HDeref read && read.IsBitCast(out original)) return true;
         original = e;
         if (e is not HCall { This: null, Method: { DeclaringType: { Name: "BitConverter", Namespace: "System" } } method } call) return false;
         if (method.Name == direct && call.Arguments.Length == 1)
@@ -150,17 +185,18 @@ public sealed partial class HirBuilder
         if (ReferenceEquals(t, _float))
         {
             if (e is HConst { Value: float f }) return new HConst((long)(uint)BitConverter.SingleToInt32Bits(f), _long);
-            if (SingleBits(e) is { } asInt)
+            if ((SingleBits(e) ?? BitCast(e, _int)) is { } asInt)
                 return new HConv(HConvKind.U8, new HConv(HConvKind.U4, asInt) { Type = _uint }) { Type = _ulong };
             Problem("float reinterpreted as bits (no BitConverter in this build)");
-            return new HOpaque("float_bits", e) { Type = _long };
+            return Site(new HOpaque("float_bits", e) { Type = _long }, "float reinterpreted as bits (no BitConverter in this build)");
         }
         if (ReferenceEquals(t, _double))
         {
             if (e is HConst { Value: double d }) return new HConst(BitConverter.DoubleToInt64Bits(d), _long);
             if (BitConverterMethod("DoubleToInt64Bits", _double) is { } toBits) return new HCall { Method = toBits, Arguments = [e], Type = _long };
+            if (BitCast(e, _long) is { } asLong) return asLong;
             Problem("double reinterpreted as bits (no BitConverter in this build)");
-            return new HOpaque("double_bits", e) { Type = _long };
+            return Site(new HOpaque("double_bits", e) { Type = _long }, "double reinterpreted as bits (no BitConverter in this build)");
         }
         if (e is HConst { Value: int or long or bool } c)
         {
@@ -183,17 +219,20 @@ public sealed partial class HirBuilder
                 // The bits of a float, read as a float again, are that float.
                 HExpr narrow = Shortened(HConvKind.I4, _int, bits, 32);
                 if (IsReinterpreted(narrow, "SingleToInt32Bits", "ToInt32", out HExpr original) && ReferenceEquals(original.Type, _float)) return original;
-                if (SingleFromBits(narrow) is { } asFloat) return asFloat;
+                if ((SingleFromBits(narrow) ?? BitCast(narrow, _float)) is { } asFloat) return asFloat;
             }
             Problem("bits reinterpreted as float (no BitConverter in this build)");
-            return new HOpaque("bits_to_float", bits) { Type = _float };
+            return Site(new HOpaque("bits_to_float", bits) { Type = _float }, "bits reinterpreted as float (no BitConverter in this build)");
         }
         if (ReferenceEquals(type, _double))
         {
             if (bits is HConst { Value: int or long } c) return new HConst(BitConverter.Int64BitsToDouble(Convert.ToInt64(c.Value)), _double);
             if (BitConverterMethod("Int64BitsToDouble", _long) is { } fromBits) return new HCall { Method = fromBits, Arguments = [bits], Type = _double };
+            // The bits of a double, read as a double again, are that double.
+            if (!NoBitCasts && IsReinterpreted(bits, "DoubleToInt64Bits", "", out HExpr original) && ReferenceEquals(original.Type, _double)) return original;
+            if (BitCast(BitsOf(bits.Type) == 64 ? bits : new HConv(HConvKind.U8, bits) { Type = _ulong }, _double) is { } asDouble) return asDouble;
             Problem("bits reinterpreted as double (no BitConverter in this build)");
-            return new HOpaque("bits_to_double", bits) { Type = _double };
+            return Site(new HOpaque("bits_to_double", bits) { Type = _double }, "bits reinterpreted as double (no BitConverter in this build)");
         }
         if (bits is HConst { Value: int or long } k)
         {

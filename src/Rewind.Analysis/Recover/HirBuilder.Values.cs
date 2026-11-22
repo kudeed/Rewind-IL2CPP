@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): virtual calls through merged class pointers, string indexer, gaps always marked, inlined object hash, small structs as numbers, floating-point negation, merged struct returns, low halves of 64-bit fields, casts of stored objects, unboxed reads after a type test, a class entry's address merged from several paths.
 using Rewind.Analysis.Hir;
 using Rewind.Analysis.Ir;
 using Rewind.Analysis.X64;
@@ -267,7 +268,30 @@ public sealed partial class HirBuilder
         return call is HCall ? call : null;
     }
 
-    private static readonly bool NoWideShifts = Environment.GetEnvironmentVariable("REWIND_NO_WIDE_SHIFTS") != null;
+    /// <summary>
+    /// A double in the two 32-bit lanes of a register, its top lane under the sign mask ("xorps x, m" with m
+    /// loaded once and used lane by lane): "-x" or "Abs(x)". Null when the lanes are not that.
+    /// </summary>
+    private HExpr? SignedLanes(Node lo, Node hi)
+    {
+        if (NoSignedLanes || hi.Op is not (Op.Xor or Op.And) || hi.In.Length != 2) return null;
+        Node top = hi.In[0], mask = hi.In[1];
+        if (!mask.IsConst) (top, mask) = (mask, top);
+        if (!mask.IsConst || top.IsConst) return null;
+        bool negate = hi.Op == Op.Xor && (uint)mask.UImm == 0x80000000u, absolute = hi.Op == Op.And && (uint)mask.UImm == 0x7FFFFFFFu;
+        if (!negate && !absolute) return null;
+        // (The bottom lane under the same mask's bottom half: nothing changed.)
+        if (lo.Op == hi.Op && lo.In.Length == 2 && lo.In[1].IsConst && !lo.In[0].IsConst && (uint)lo.In[1].UImm == (negate ? 0u : uint.MaxValue)) lo = lo.In[0];
+        if (Eval(lo) is not SHalf { High: false, Part: null } low || Eval(top) is not SHalf { High: true, Part: null } high ||
+            !SameValue(low.Whole, high.Whole) || !ReferenceEquals(low.Whole.Type, _double))
+            return null;
+        if (negate) return new HUnary(HUnaryOp.Neg, low.Whole) { Type = _double };
+        return MathCall("Abs", true, low.Whole) is HCall abs ? abs : null;
+    }
+
+    private static readonly bool NoSignedLanes = Environment.GetEnvironmentVariable("REWIND_NO_SIGNED_LANES") != null;
+
+    private static readonly bool NoWideShifts =Environment.GetEnvironmentVariable("REWIND_NO_WIDE_SHIFTS") != null;
 
     private Sem BinarySem(Node n)
     {
@@ -310,6 +334,7 @@ public sealed partial class HirBuilder
         }
 
         if (n.Op is Op.Xor or Op.And && SignOperation(n) is { } signed) return new SVal(signed);
+        if (n.Op == Op.Mul && ObjectHash(n) is { } hash) return new SVal(hash);
 
         // Values that travel together, moved down by whole bytes: the ones that lay above are what is left.
         if (n.Op == Op.ShrU && n.Type == VT.I64 && n.In[1].IsConst && n.In[1].UImm is > 0 and < 64 && n.In[1].UImm % 8 == 0 && !n.In[0].IsConst &&
@@ -359,6 +384,15 @@ public sealed partial class HirBuilder
             }
             return new SVal(new HBinary(op, left, right) { Type = _bool });
         }
+        // A reference is no number: arithmetic on one (other than the idioms above) is marked.
+        if (!NoReferenceArithmetic && (IsReference(left.Type) || IsReference(right.Type)))
+        {
+            Problem(ReferenceArithmetic);
+            return new SVal(Site(new HOpaque("reference_arithmetic", new HBinary(op, left, right) { Type = TypeForBits(n.Type) }) { Type = TypeForBits(n.Type) }, ReferenceArithmetic));
+        }
+        // Nor is a struct whose fields were not found in the bits computed with.
+        if (IsStructType(left.Type)) left = StructAsNumber(left, TypeForBits(n.Type));
+        if (IsStructType(right.Type)) right = StructAsNumber(right, TypeForBits(n.Type));
         TypeSig type = isShift ? ResultIntType(n, n.In[0]) : ResultIntType(n, n.In[0], n.In[1]);
         if (n.Op is Op.DivU or Op.RemU or Op.ShrU && ReferenceEquals(type, _int)) type = _uint;
         if (n.Op is Op.DivU or Op.RemU or Op.ShrU && ReferenceEquals(type, _long)) type = _ulong;
@@ -388,6 +422,61 @@ public sealed partial class HirBuilder
             if (left is HConst { Value: int or long } nothing && Convert.ToInt64(nothing.Value) == 0 && op is HBinaryOp.Or or HBinaryOp.Xor or HBinaryOp.Add && right is not HConst) return new SVal(right);
         }
         return new SVal(new HBinary(op, left, right) { Type = type });
+    }
+
+    private static readonly bool NoWholeStructTruncation = Environment.GetEnvironmentVariable("REWIND_NO_WHOLE_STRUCT_TRUNCATION") != null;
+    private static readonly bool NoStructNumbers = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_NUMBERS") != null;
+
+    /// <summary>
+    /// A struct (not one number: see ScalarOf) whose bytes are computed with as a number. Which of its fields
+    /// those bits are was not found; IL has no such conversion, so it is marked.
+    /// </summary>
+    private HExpr StructAsNumber(HExpr e, TypeSig type)
+    {
+        if (NoStructNumbers) return e;
+        string problem = $"{e.Type!.DisplayName} used as a number";
+        Problem(problem);
+        return Site(new HOpaque("struct_bits", e) { Type = type }, problem);
+    }
+
+    private HExpr NumberAsStruct(HExpr e, TypeSig structType)
+    {
+        if (NoStructNumbers) return e;
+        string problem = $"could not rebuild {structType.DisplayName} from a {e.Type?.DisplayName ?? "number"}";
+        Problem(problem);
+        return Site(new HOpaque("struct_from_value", e) { Type = structType }, problem);
+    }
+
+    private static readonly bool NoReferenceArithmetic = Environment.GetEnvironmentVariable("REWIND_NO_REFERENCE_ARITHMETIC") != null;
+    private static readonly bool NoObjectHash = Environment.GetEnvironmentVariable("REWIND_NO_OBJECT_HASH") != null;
+    internal const string ReferenceArithmetic = "a reference used as a number";
+
+    /// <summary>
+    /// The runtime's hash of an object - what object.GetHashCode and RuntimeHelpers.GetHashCode give - pasted in:
+    /// the object's address moved down by 3 and multiplied by 2654435761 (Knuth's multiplicative hash), in 32
+    /// bits. On "this" it is "base.GetHashCode()" of object (a direct call of object's method); on another
+    /// object RuntimeHelpers.GetHashCode(o). Null for anything else.
+    /// </summary>
+    private HExpr? ObjectHash(Node n)
+    {
+        if (NoObjectHash || n.Type != VT.I32 || !n.In[1].IsConst || (uint)n.In[1].UImm != 0x9E3779B1u) return null;
+        Node shifted = n.In[0];
+        while (shifted.Op is Op.Trunc or Op.ZExt or Op.SExt) shifted = shifted.In[0];
+        if (shifted.Op != Op.ShrU || !shifted.In[1].IsConstValue(3)) return null;
+        Node address = shifted.In[0];
+        while (address.Op is Op.Trunc or Op.ZExt or Op.SExt) address = address.In[0];
+        HExpr obj = Value(address);
+        if (!IsReference(obj.Type)) return null;
+        if (obj is HArg { Index: < 0 } && !_method.DeclaringType.IsValueType &&
+            _m.FindType("System.Object")?.Methods.FirstOrDefault(m => m.Name == "GetHashCode" && !m.IsStatic && m.Parameters.Length == 0) is { } own &&
+            !ReferenceEquals(own, _method))
+            return new HCall { Method = own, This = obj, Virtual = false, Type = _int };
+        // (Not in the method that is the hash itself: there it would call itself.)
+        if (_m.FindType("System.Runtime.CompilerServices.RuntimeHelpers")?.Methods.FirstOrDefault(m =>
+                m.Name == "GetHashCode" && m.IsStatic && m.Parameters.Length == 1 && m.Parameters[0].Type is PrimitiveSig { Element: Il2CppTypeEnum.Object }) is { } helper &&
+            !ReferenceEquals(helper, _method))
+            return new HCall { Method = helper, Arguments = [obj], Type = _int };
+        return null;
     }
 
     /// <summary>
@@ -722,6 +811,8 @@ public sealed partial class HirBuilder
                 FieldSlot? slot = _p.Layouts.FieldAt(e.Type, 0);
                 if (slot is { } fs && fs.Offset == 0 && fs.Size * 8 == to)
                     return new SVal(new HField { Object = e, Field = fs.Field, DeclaringType = e.Type, Type = fs.Type });
+                // All of the struct fits: the truncation only drops the register bits above it.
+                if (!NoWholeStructTruncation && _p.Layouts.Of(e.Type) is { Known: true, Size: > 0 } whole && whole.Size * 8 <= to) return v;
                 // A struct that is one wider number: its low bytes are that number's ("(byte)delta" is (byte)delta.packed).
                 if (!NoNarrowScalars && ScalarOf(e, 64) is { } scalar && !ReferenceEquals(scalar, e))
                 {
@@ -729,6 +820,7 @@ public sealed partial class HirBuilder
                     known = BitsOf(e.Type);
                     if (known != 0 && known <= to) return new SVal(e);
                 }
+                if (IsStructType(e.Type)) return new SVal(StructAsNumber(e, TypeForBits(n.Type)));
             }
             if (known == 0 && inner.Type == VT.I64 && to == 32 && e.Type == null) return v; // untyped 32-bit value in a 64-bit register
             // The low bytes of a float or double are part of its bits, not the number converted.
@@ -743,6 +835,7 @@ public sealed partial class HirBuilder
     general:
         {
             HExpr e = IntValue(inner);
+            if (IsStructType(e.Type)) return new SVal(StructAsNumber(e, TypeForBits(n.Type)));
             HConvKind kind = to switch { 8 => HConvKind.U1, 16 => HConvKind.U2, 32 => HConvKind.I4, _ => HConvKind.I8 };
             TypeSig type = to switch { 8 => _byte, 16 => _ushort, 32 => _int, _ => _long };
             if (to is 8 or 16 or 32) return new SVal(Shortened(kind, type, PartOfCombined(e, 0, to) ?? e, to));
@@ -820,7 +913,7 @@ public sealed partial class HirBuilder
     /// <summary>The pointer to a runtime generic context (of a class or a method), and one entry of such a context.</summary>
     private sealed record PRgctx(SRgctx Context) : Place;
     private sealed record PRgctxItem(SRgctx Context, int Index) : Place;
-    private sealed record PUnboxed(Node Object, int Offset) : Place;
+    private sealed record PUnboxed(Node Object, int Offset, TypeSig? Type = null) : Place;
     private record PUnknown(string Why) : Place;
     /// <summary>
     /// Bytes of a struct that are not one of its fields nor a run of whole fields: [Offset, Offset + Size) of the
@@ -831,6 +924,27 @@ public sealed partial class HirBuilder
     private sealed record PBits(HVar Variable, int Shift, int Size) : Place;
 
     private readonly record struct AddressParts(Node? Base, Sem? BaseSem, long Offset, Node? Index, long Scale);
+
+    private static readonly bool NoStringChars = Environment.GetEnvironmentVariable("REWIND_NO_STRING_CHARS") != null;
+
+    /// <summary>
+    /// A character of a string read by index ("s[i]" inlined: the two bytes at the string's first character
+    /// plus twice the index), as the string's indexer reads it. Reads only: a string is not written.
+    /// </summary>
+    private Place? StringChar(HExpr text, TypeSig type, AddressParts a, int size)
+    {
+        if (type.Key != _string.Key || size != 2 || a.Scale != 2 || a.Index == null) return null;
+        FieldSlot? first = null;
+        foreach (FieldSlot slot in _p.Layouts.Of(_string).Fields)
+            if (slot.Type.Key == _char.Key && slot.Size == 2)
+                first = slot;
+        if (first is not { } chars || a.Offset < chars.Offset || (a.Offset - chars.Offset) % 2 != 0) return null;
+        MethodDef? indexer = _string.Definition?.Methods.FirstOrDefault(m => m.Name == "get_Chars" && !m.IsStatic && m.Parameters.Length == 1 &&
+                                                                            m.Parameters[0].Type.Key == _int.Key);
+        if (indexer == null) return null;
+        HExpr index = IndexValue(a.Index, (a.Offset - chars.Offset) / 2);
+        return new PChosenValue(new HCall { Method = indexer, This = text, Arguments = [index], Type = _char });
+    }
 
     private static readonly bool NoChosenFields = Environment.GetEnvironmentVariable("REWIND_NO_CHOSEN_FIELDS") != null;
     private static readonly bool NoFloatPhiBits = Environment.GetEnvironmentVariable("REWIND_NO_FLOAT_PHI_BITS") != null;
@@ -960,7 +1074,14 @@ public sealed partial class HirBuilder
         foreach (var (node, scale) in terms)
         {
             if (scale != 1) continue;
-            Sem s = Eval(node);
+            Sem s;
+            if (node.Op == Op.Phi && MergedObjKlass(node) is { } merged) s = merged;
+            else if (node.Op == Op.Phi && MergedObjKlassEntry(node) is ({ } entryOf, var past))
+            {
+                s = entryOf;
+                offset += past;
+            }
+            else s = Eval(node);
             if (!IsPointerLike(s) && !(s is SVal { Type: { } wrapper } && IsReferenceWrapper(wrapper))) continue;
             baseNode = node;
             baseSem = s;
@@ -1014,6 +1135,90 @@ public sealed partial class HirBuilder
             _combinedIndexes[address] = sum;
         }
         return sum == null ? parts : new AddressParts(baseNode, baseSem, offset, sum, unit);
+    }
+
+    private static readonly bool NoMergedKlass = Environment.GetEnvironmentVariable("REWIND_NO_MERGED_KLASS") != null;
+    private static readonly bool NoMergedEntries = Environment.GetEnvironmentVariable("REWIND_NO_MERGED_VTABLE_ENTRIES") != null;
+
+    /// <summary>
+    /// The same as <see cref="MergedObjKlass"/> one step further: each way in computed the address of one entry
+    /// of the object's class ("class + 0x228", the same entry on every way), and the call after the merge reads
+    /// the method and its description through the merged address. That is the object's class, plus the entry's
+    /// offset. Ways that met before count as one, as there.
+    /// </summary>
+    private (SObjKlass Klass, long Offset)? MergedObjKlassEntry(Node phi, int depth = 0)
+    {
+        if (NoMergedEntries || phi.Block == null || phi.In.Length < 2 || depth > 4) return null;
+        var objects = new Node[phi.In.Length];
+        long? past = null;
+        for (int i = 0; i < phi.In.Length; i++)
+        {
+            Node input = phi.In[i];
+            Node obj;
+            long at = 0;
+            if (input.Op == Op.Phi)
+            {
+                if (MergedObjKlassEntry(input, depth + 1) is not ({ } inner, var innerAt)) return null;
+                (obj, at) = (inner.Object, innerAt);
+            }
+            else
+            {
+                Node klass = input;
+                if (input.Op == Op.Add && input.In[1].IsConst)
+                {
+                    klass = input.In[0];
+                    at = IrBuilder.SImm(input.In[1]);
+                }
+                if (!_sem.TryGetValue(klass, out Sem? s) || s is not SObjKlass known) return null;
+                obj = known.Object;
+            }
+            if (past != null && past != at) return null;
+            past = at;
+            objects[i] = obj;
+        }
+        if (past is not { } offset || offset == 0) return null;
+        if (objects.All(o => ReferenceEquals(o, objects[0]))) return (new SObjKlass(objects[0]), offset);
+        foreach (Node other in phi.Block.Phis)
+        {
+            if (ReferenceEquals(other, phi) || other.Dead || other.In.Length != objects.Length || other.Type != VT.I64) continue;
+            bool same = true;
+            for (int i = 0; i < objects.Length && same; i++) same = ReferenceEquals(other.In[i], objects[i]);
+            if (same) return (new SObjKlass(other), offset);
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// The class of an object, merged from ways in that each read it: the compiler moves the read of the class
+    /// pointer of a virtual call into the code before the point where several ways meet, and the call after it
+    /// takes its method from the merged pointer. Where every way in read the class of the same object, it is
+    /// that object's class; where each read the class of the object another merged value is given on the same
+    /// way in (the receiver, merged alongside), it is the class of that merged value. Only ways in already
+    /// translated are looked at; the merged value itself is not read (its copies go, see SettlePhis). Ways in
+    /// that met before (a merge of such merges) count as one.
+    /// </summary>
+    private SObjKlass? MergedObjKlass(Node phi, int depth = 0)
+    {
+        if (NoMergedKlass || phi.Block == null || phi.In.Length < 2 || depth > 4) return null;
+        var objects = new Node[phi.In.Length];
+        for (int i = 0; i < phi.In.Length; i++)
+        {
+            Node input = phi.In[i];
+            // (A way in that is itself such a merge: ways that met before this point.)
+            SObjKlass? klass = input.Op == Op.Phi ? MergedObjKlass(input, depth + 1)
+                : _sem.TryGetValue(input, out Sem? s) ? s as SObjKlass : null;
+            if (klass == null) return null;
+            objects[i] = klass.Object;
+        }
+        if (objects.All(o => ReferenceEquals(o, objects[0]))) return new SObjKlass(objects[0]);
+        foreach (Node other in phi.Block.Phis)
+        {
+            if (ReferenceEquals(other, phi) || other.Dead || other.In.Length != objects.Length || other.Type != VT.I64) continue;
+            bool same = true;
+            for (int i = 0; i < objects.Length && same; i++) same = ReferenceEquals(other.In[i], objects[i]);
+            if (same) return new SObjKlass(other);
+        }
+        return null;
     }
 
     private static long Gcd(long a, long b)
@@ -1543,7 +1748,10 @@ public sealed partial class HirBuilder
     {
         HExpr e = v.Expr;
         TypeSig? type = e.Type;
-        if (_castTypes.TryGetValue(a.Base!, out List<TypeSig>? casts) && casts.Count == 1 && IsReference(casts[0]))
+        // Only where the check holds (CastHoldsHere): a field the static type lacks, read where no check proves the
+        // class, stays unresolved rather than read through a cast to a class the object may not have (a sibling's).
+        if (_castTypes.TryGetValue(a.Base!, out List<TypeSig>? casts) && casts.Count == 1 && IsReference(casts[0]) &&
+            (NoCastDominance || CastHoldsHere(a.Base!)))
         {
             // A checked cast guards this use: view the object as the cast type.
             e = new HTypeExpr(HTypeOp.CastClass, casts[0], e) { Type = casts[0] };
@@ -1645,6 +1853,7 @@ public sealed partial class HirBuilder
         if (IsReference(type))
         {
             if (a.Index != null && a.Scale > 0 && !NoChosenFields && ChosenField(e, type, a, size) is { } chosen) return chosen;
+            if (a.Index != null && !NoStringChars && StringChar(e, type, a, size) is { } character) return character;
             if (a.Index != null) return new PUnknown($"indexed access into {type.DisplayName}");
             if (a.Offset == 0) return new PObjKlass(a.Base!);
             Place direct = FieldPlace(e, type, (int)a.Offset, size);
@@ -1655,6 +1864,10 @@ public sealed partial class HirBuilder
                 Place refined = FieldPlace(cast, tested, (int)a.Offset, size);
                 if (refined is not PUnknown) return refined;
             }
+            // Past the object header of an object known to be a boxed value: the value inside (an unbox whose
+            // class check the compiler dropped, since a test on the way here settled it).
+            if (direct is PUnknown && !NoTestedUnboxes && a.Offset >= _header && BoxedType(a.Base!) is { } boxed)
+                return new PUnboxed(a.Base!, (int)(a.Offset - _header), boxed);
             return direct;
         }
         return new PUnknown($"memory access through a {type.DisplayName} value");
@@ -1702,6 +1915,20 @@ public sealed partial class HirBuilder
     }
 
     private static readonly bool NoUnboxedWords = Environment.GetEnvironmentVariable("REWIND_NO_UNBOXED_WORDS") != null;
+    private static readonly bool NoTestedUnboxes = Environment.GetEnvironmentVariable("REWIND_NO_TESTED_UNBOXES") != null;
+
+    /// <summary>
+    /// The value type an object is known here to be a boxed instance of: a type test on every way here ("if (o
+    /// is int)"), an exact class comparison, or the class check of a cast the normalizer took out.
+    /// </summary>
+    private TypeSig? BoxedType(Node obj)
+    {
+        static bool Boxed(TypeSig t) => t.IsValueType && t is not SzArraySig and not ArraySig && !t.IsVoid;
+        if (TestedType(obj) is { } tested && Boxed(tested)) return tested;
+        if (ProvenClass(obj, _block) is { } proven && Boxed(proven)) return proven;
+        if (_castTypes.TryGetValue(obj, out List<TypeSig>? casts) && casts.Count == 1 && Boxed(casts[0])) return casts[0];
+        return null;
+    }
 
     /// <summary>
     /// The value type an object is known to be a boxed instance of where <paramref name="at"/> runs: an exact
@@ -1774,6 +2001,8 @@ public sealed partial class HirBuilder
 
     private static readonly bool NoBoxedTests = Environment.GetEnvironmentVariable("REWIND_NO_BOXED_TESTS") != null;
     private static readonly bool NoFlaggedCasts = Environment.GetEnvironmentVariable("REWIND_NO_FLAGGED_CASTS") != null;
+    private static readonly bool NoStoredCasts = Environment.GetEnvironmentVariable("REWIND_NO_STORED_CASTS") != null;
+    private static readonly bool NoCastDominance = Environment.GetEnvironmentVariable("REWIND_NO_CAST_DOMINANCE") != null;
     private static readonly bool NoStructPieces = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_PIECES") != null;
     private static readonly bool NoStructTops = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_TOPS") != null;
     private static readonly bool FlaggedTrace = Environment.GetEnvironmentVariable("REWIND_FLAGGED_TRACE") != null;
@@ -1894,7 +2123,14 @@ public sealed partial class HirBuilder
                 // Reading through a selected address is selecting between the two values.
                 return new SVal(new HSelect(either.Condition, first.Target, second.Target) { Type = picked.Type });
             case PLocation loc:
-                return new SVal(loc.Location is { Type: null } ? WithType(loc.Location, loc.Type) : loc.Location);
+            {
+                HExpr read = loc.Location is { Type: null } ? WithType(loc.Location, loc.Type) : loc.Location;
+                // The low half of a 64-bit integer ("(int)l" read as the first four bytes of a long field): the
+                // field cut to what was read, as the register holds it (32 bits, compared or extended as the code says).
+                if (!NoNarrowReads && n.Type == VT.I32 && loc.Type is PrimitiveSig { Element: Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8 })
+                    return new SVal(new HConv(HConvKind.I4, read) { Type = _int });
+                return new SVal(read);
+            }
             case PPair pair:
                 return new SPair(pair.Low, pair.High);
             case PParts parts:
@@ -1921,7 +2157,7 @@ public sealed partial class HirBuilder
                 return RgctxValue(entry.Context, entry.Index);
             case PUnboxed u:
             {
-                TypeSig? type = _castTypes.TryGetValue(u.Object, out List<TypeSig>? casts) && casts.Count != 0 ? casts[0] : null;
+                TypeSig? type = u.Type ?? (_castTypes.TryGetValue(u.Object, out List<TypeSig>? casts) && casts.Count != 0 ? casts[0] : null);
                 if (type == null && n.Block != null) type = ProvenClass(u.Object, n.Block);
                 if (type == null)
                 {
@@ -1939,7 +2175,7 @@ public sealed partial class HirBuilder
                 if (isStruct && !NoUnboxedWords && StructLeaves(unboxed, type, u.Offset, n.Type.Bytes()) is { } words)
                     return new SParts(words, n.Type.Bytes());
                 Problem("partial read of an unboxed value");
-                return new SVal(new HOpaque("unbox_part", unboxed) { Type = TypeForBits(n.Type) });
+                return new SVal(Site(new HOpaque("unbox_part", unboxed) { Type = TypeForBits(n.Type) }, "partial read of an unboxed value"));
             }
             case PBits bits:
             {
@@ -1954,7 +2190,7 @@ public sealed partial class HirBuilder
                 return new SChunk(SnapshotOf(chunk.Owner, chunk.OwnerType, n.Addr), chunk.OwnerType, chunk.Offset, chunk.Size);
             case PUnknown unknown:
                 Problem("load: " + unknown.Why);
-                return new SVal(new HOpaque("load" + n.Type.Bytes(), Value(n.In[0])) { Type = TypeForBits(n.Type) });
+                return new SVal(Site(new HOpaque("load" + n.Type.Bytes(), Value(n.In[0])) { Type = TypeForBits(n.Type) }, "load: " + unknown.Why));
             default:
                 return SJunk.Instance;
         }
@@ -2014,6 +2250,7 @@ public sealed partial class HirBuilder
     }
 
     private static readonly bool NoLowHalves = Environment.GetEnvironmentVariable("REWIND_NO_LOW_HALVES") != null;
+    private static readonly bool NoNarrowReads = Environment.GetEnvironmentVariable("REWIND_NO_NARROW_READS") != null;
     private static readonly bool NoUnreadHalves = Environment.GetEnvironmentVariable("REWIND_NO_UNREAD_HALVES") != null;
 
     /// <summary>A struct of four bytes or fewer: in a 64-bit slot it is in the low half.</summary>
@@ -2083,7 +2320,13 @@ public sealed partial class HirBuilder
                     Emit(new HAssign(new HDeref(through.Pointer) { Type = written }, ValueFor(valueNode, written)), n.Addr);
                     return;
                 }
-                Emit(new HAssign(loc.Location, ValueFor(valueNode, loc.Type)), n.Addr);
+                HExpr stored = ValueFor(valueNode, loc.Type);
+                // An object checked as a class before it is stored where only that class goes (the check pasted
+                // in and taken out): the store is of the cast object, as for an argument.
+                if (!NoStoredCasts && IsReference(loc.Type) && CheckedClassHere(valueNode) is { } storedAs &&
+                    stored.Type != null && !IsAssignable(stored.Type, loc.Type) && IsAssignable(storedAs, loc.Type))
+                    stored = new HTypeExpr(HTypeOp.CastClass, storedAs, stored) { Type = storedAs };
+                Emit(new HAssign(loc.Location, stored), n.Addr);
                 return;
             case PPair pair:
             {
@@ -2197,6 +2440,9 @@ public sealed partial class HirBuilder
         var parts = new List<(FieldSlot Slot, HExpr Value)>();
         bool ok = true;
         bool Direct(HExpr given, TypeSig field) => NoLowHalves || !IsStructType(field) || ReferenceEquals(given.Type, field);
+        // 32 bits widened without their sign: the first half, and nothing above it.
+        if (!NoMergedStructBits && s is SVal { Expr: not HConst } && n.Op == Op.ZExt && n.In[0].Type == VT.I32)
+            s = new SPair(Shortened(HConvKind.I4, _int, Value(n), 32), new HConst(0, _int));
         if (s is SPair pair && layout.Fields.Length == 2 && layout.Fields[0].Size == 4 && layout.Fields[1].Size == 4 &&
             Direct(pair.Low, layout.Fields[0].Type) && Direct(pair.High, layout.Fields[1].Type))
         {
@@ -2234,8 +2480,9 @@ public sealed partial class HirBuilder
 
         if (!ok)
         {
-            Problem($"could not rebuild {structType.DisplayName} from register bits");
-            return new HOpaque("struct_from_bits", Value(n)) { Type = structType };
+            string fromBits = $"could not rebuild {structType.DisplayName} from register bits";
+            Problem(fromBits);
+            return Site(new HOpaque("struct_from_bits", Value(n)) { Type = structType }, fromBits);
         }
         HVar temp = _h.NewLocal(structType, "s");
         temp.AddressTaken = true;
@@ -2273,7 +2520,12 @@ public sealed partial class HirBuilder
                     return SJunk.Instance;
             }
             if (a.BaseSem is SVal { Type: PrimitiveSig { Element: Il2CppTypeEnum.I or Il2CppTypeEnum.U } }) return BinarySem(n);
-            Problem("address computation: " + (place is PUnknown unknown ? unknown.Why : place.GetType().Name[1..]));
+            // An address into something no managed location was found in: the arithmetic stays, as the operand
+            // of a marker (a number added to a reference is no value IL has).
+            string what = "address computation: " + (place is PUnknown unknown ? unknown.Why : place.GetType().Name[1..]);
+            Problem(what);
+            Sem arithmetic = BinarySem(n);
+            return arithmetic is SVal { Expr: var computed } ? new SVal(Site(new HOpaque("address", computed) { Type = TypeForBits(n.Type) }, what)) : arithmetic;
         }
         return BinarySem(n);
     }

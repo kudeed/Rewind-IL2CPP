@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): floating-point negation, engine-method lookups merged from several paths.
 using Rewind.Model;
 using Rewind.Analysis.Ir;
 using Rewind.Analysis.Passes;
@@ -8,8 +9,14 @@ namespace Rewind.Analysis.Recover;
 
 public enum ThrowKind { None, NullReference, IndexOutOfRange, DivideByZero, InvalidCast, Overflow, ArrayTypeMismatch, StackCheck }
 
-/// <summary>A type check the native code performed with "throw InvalidCastException" on failure: a castclass.</summary>
-public sealed record CastFact(Block At, Node Object, Node Klass);
+/// <summary>
+/// A type check the native code performed with "throw InvalidCastException" on failure: a castclass. It holds from From,
+/// a node of At, to At's end, and in what At's end leads to; From null: only past At's last node (the check was At's
+/// branch). MergeLinearBlocks keeps the place: a check merged into the block before it doesn't hold over that block's
+/// own nodes, which come before it. Over: the nodes of At the check covers, recorded by MergeLinearBlocks so the place
+/// survives a later pass taking From out (a spill it removes): the check is before the first of them left.
+/// </summary>
+public sealed record CastFact(Block At, Node Object, Node Klass, Node? From = null, IReadOnlyList<Node>? Over = null);
 
 public sealed class NormalizeResult
 {
@@ -629,6 +636,23 @@ public sealed partial class Normalizer(ProgramAnalysis program)
                     changed = true;
                     continue;
                 }
+                // Two halves under one mask each are the whole under the mask made of both: "xorps x, m" on a
+                // double whose mask was loaded once (ahead of a loop) is a 32-bit operation per lane, with
+                // constants known only now. The whole, its halves put together, folds or merges as above.
+                if (n.Op == Op.Concat && !NoMaskedHalves && MaskedHalves(n) is var (op, wholeHigh, wholeLow, mask))
+                {
+                    _b.Current = b;
+                    _b.InsertIndex = i;
+                    _b.CurrentAddr = n.Addr;
+                    int count = b.Nodes.Count;
+                    Node masked = _b.Binary(op, _b.Concat(wholeHigh, wholeLow), _b.Const(VT.I64, (long)mask));
+                    _b.InsertIndex = -1;
+                    i += b.Nodes.Count - count;
+                    _replace[n] = masked;
+                    n.Dead = true;
+                    changed = true;
+                    continue;
+                }
                 if (n.Op != Op.Trunc) continue;
                 Node operand = Resolve(n.In[0]);
                 if (operand.Op is not (Op.Or or Op.And or Op.Const)) continue;
@@ -650,6 +674,67 @@ public sealed partial class Normalizer(ProgramAnalysis program)
         foreach (Block b in _fn.Blocks) b.Nodes.RemoveAll(n => n.Dead);
         ApplyReplacements();
         return true;
+    }
+
+    private static readonly bool NoMaskedHalves = Environment.GetEnvironmentVariable("REWIND_NO_MASKED_HALVES") != null;
+
+    /// <summary>
+    /// A Concat whose top half is under a bitwise mask and whose bottom half is not (or is under the op's
+    /// identity, a constant known only now): the op, the two unmasked halves and the 64-bit mask. That is the
+    /// sign or magnitude of a double; two masked halves are two floats (a Vector2 negated), left as they are.
+    /// </summary>
+    private (Op Op, Node High, Node Low, ulong Mask)? MaskedHalves(Node concat)
+    {
+        Node high = Resolve(concat.In[0]), low = Resolve(concat.In[1]);
+        if (high.Op is not (Op.Xor or Op.And or Op.Or) || high.In.Length != 2 || high.Type != VT.I32 || low.Type != VT.I32 || low.IsConst) return null;
+        Node value = Resolve(high.In[0]), mask = Resolve(high.In[1]);
+        if (value.IsConst && !mask.IsConst) (value, mask) = (mask, value);
+        if (!mask.IsConst || value.IsConst) return null;
+        uint identity = high.Op == Op.And ? uint.MaxValue : 0u;
+        if (low.Op == high.Op && low.In.Length == 2)
+        {
+            Node a = Resolve(low.In[0]), b = Resolve(low.In[1]);
+            if (a.IsConst && !b.IsConst) (a, b) = (b, a);
+            if (b.IsConst && !a.IsConst)
+            {
+                if ((uint)b.UImm != identity) return null;
+                low = a;
+            }
+        }
+        // Only where the halves are those of a double: a struct of two floats with its second one negated
+        // looks the same.
+        if (!HalfOfDouble(value, []) && !HalfOfDouble(low, [])) return null;
+        return (high.Op, value, low, (mask.UImm & 0xFFFFFFFFUL) << 32 | identity);
+    }
+
+    /// <summary>Is this a half of the bits of a double: cut out of them, returned in the top lane, or merged from such halves (and constants)?</summary>
+    private bool HalfOfDouble(Node n, HashSet<Node> seen)
+    {
+        n = Resolve(n);
+        // (Met again: its answer is the one already being given - every part must be such a half.)
+        if (!seen.Add(n)) return true;
+        if (seen.Count > 64) return false;
+        switch (n.Op)
+        {
+            case Op.FToBits: return n.In[0].Type == VT.F64;
+            // The second lane of what a call returns in a vector register: only a double fills it.
+            case Op.Proj when n.Imm == CallResult.FloatLane1: return true;
+            case Op.Trunc: return HalfOfDouble(n.In[0], seen);
+            case Op.ShrU when n.In[1].IsConstValue(32): return HalfOfDouble(n.In[0], seen);
+            case Op.Phi:
+            {
+                bool any = false;
+                foreach (Node input in n.In)
+                {
+                    Node value = Resolve(input);
+                    if (value.IsConst || ReferenceEquals(value, n)) continue;
+                    if (!HalfOfDouble(value, seen)) return false;
+                    any = true;
+                }
+                return any;
+            }
+            default: return false;
+        }
     }
 
     private static readonly bool NoKnownZeros = Environment.GetEnvironmentVariable("REWIND_NO_KNOWN_ZEROS") != null;
@@ -870,7 +955,7 @@ public sealed partial class Normalizer(ProgramAnalysis program)
         var statics = new Dictionary<ulong, Node>();
         foreach (Block b in _fn.Blocks)
             foreach (Node n in b.Nodes)
-                if (n.Op == Op.Store && n.In[0].IsConst && resolved.TryGetValue(n.In[1], out Node? idiom))
+                if (n.Op == Op.Store && n.In[0].IsConst && LookedUp(n.In[1], resolved, 0) is { } idiom)
                 {
                     statics[(ulong)n.In[0].Imm] = idiom;
                     n.Dead = true;
@@ -910,6 +995,27 @@ public sealed partial class Normalizer(ProgramAnalysis program)
     }
 
     private static bool IsLazyTarget(Node n) => n.Op == Op.Idiom && (IdiomKind)n.Imm is IdiomKind.InternalCall or IdiomKind.PInvokeTarget;
+
+    private static readonly bool NoMergedLookups = Environment.GetEnvironmentVariable("REWIND_NO_MERGED_ICALL_LOOKUPS") != null;
+
+    /// <summary>
+    /// The engine method a value is the looked-up pointer of: the lookup's result, or - where the compiler
+    /// merged the ends of several paths that each look the same method up (two inlined copies of one call into
+    /// the engine) - a merge of such results, all of the same name.
+    /// </summary>
+    private static Node? LookedUp(Node value, Dictionary<Node, Node> resolved, int depth)
+    {
+        if (resolved.TryGetValue(value, out Node? idiom)) return idiom;
+        if (NoMergedLookups || value.Op != Op.Phi || depth > 4 || value.In.Length == 0) return null;
+        Node? common = null;
+        foreach (Node input in value.In)
+        {
+            if (ReferenceEquals(input, value)) continue;
+            if (LookedUp(input, resolved, depth + 1) is not { } one || (common != null && !ReferenceEquals(common, one))) return null;
+            common = one;
+        }
+        return common;
+    }
 
     /// <summary>
     /// An interface call in tail position is compiled as the search with a jump at each end: one where the
@@ -1602,6 +1708,7 @@ public sealed partial class Normalizer(ProgramAnalysis program)
                 }
                 join.Preds.RemoveAt(Math.Max(ia, ib));
                 join.Preds[Math.Min(ia, ib)] = p;
+                KeepNullSkippedChecks(term.In[0], viaA, viaB, p);
                 MakeJump(p, join);
                 if (viaA != null) _fn.Blocks.Remove(viaA);
                 if (viaB != null) _fn.Blocks.Remove(viaB);
@@ -1821,6 +1928,21 @@ public sealed partial class Normalizer(ProgramAnalysis program)
                     phi.Dead = true;
                 }
                 s.Phis.Clear();
+                // A class check that held past p's end (its removed branch was p's) holds from s's first node on; one
+                // from a node of p holds over s's nodes too. Over keeps which nodes those are (CastFact).
+                for (int c = 0; c < _result.Casts.Count; c++)
+                {
+                    CastFact cast = _result.Casts[c];
+                    if (!ReferenceEquals(cast.At, p)) continue;
+                    if (cast.From == null || ReferenceEquals(cast.From, jump))
+                        _result.Casts[c] = cast with { From = s.Nodes.Count > 0 ? s.Nodes[0] : null, Over = s.Nodes.Count > 0 ? s.Nodes.ToList() : null };
+                    else
+                    {
+                        List<Node> over = cast.Over?.ToList() ?? p.Nodes.Skip(Math.Max(0, p.Nodes.IndexOf(cast.From))).Where(n => !ReferenceEquals(n, jump)).ToList();
+                        over.AddRange(s.Nodes);
+                        _result.Casts[c] = cast with { Over = over };
+                    }
+                }
                 p.Nodes.RemoveAt(p.Nodes.Count - 1);
                 foreach (Node n in s.Nodes)
                 {
@@ -1837,6 +1959,14 @@ public sealed partial class Normalizer(ProgramAnalysis program)
                 s.Succs.Clear();
                 s.Preds.Clear();
                 _fn.Blocks.Remove(s);
+                // A class check found in s is in p now, still from the same node (or past the end, s's end) on.
+                for (int c = 0; c < _result.Casts.Count; c++)
+                {
+                    CastFact cast = _result.Casts[c];
+                    if (!ReferenceEquals(cast.At, s)) continue;
+                    IReadOnlyList<Node>? over = cast.Over ?? (cast.From != null && s.Nodes.IndexOf(cast.From) is int at and >= 0 ? s.Nodes.Skip(at).ToList() : null);
+                    _result.Casts[c] = cast with { At = p, Over = over };
+                }
                 ApplyReplacements();
                 progress = changed = true;
                 break;
@@ -1845,6 +1975,30 @@ public sealed partial class Normalizer(ProgramAnalysis program)
         if (changed)
             for (int i = 0; i < _fn.Blocks.Count; i++) _fn.Blocks[i].Id = i;
         return changed;
+    }
+
+    /// <summary>
+    /// A class check in an arm that goes: the arm's check holds past p when p's branch is a null test of the checked
+    /// object (castclass's "if (o != null) check o's class") and the arm is the one taken when the object isn't null,
+    /// since null passes any cast and that arm is every non-null way past p; any other check held on one way only,
+    /// and goes with its block (HirBuilder drops a check the CFG doesn't reach). Before (Nov 2026) a check in the null
+    /// arm was kept as well, and held at the join for an object that hadn't been checked.
+    /// </summary>
+    private void KeepNullSkippedChecks(Node condition, Block? viaA, Block? viaB, Block p)
+    {
+        if (condition.Op is not (Op.CmpEq or Op.CmpNe) || p.Succs.Count != 2) return;
+        Node x = Resolve(condition.In[0]), y = Resolve(condition.In[1]);
+        Node? tested = y.IsConst && y.UImm == 0 ? x : x.IsConst && x.UImm == 0 ? y : null;
+        if (tested == null) return;
+        // A branch goes to Succs[0] when its condition holds: "o == null" leaves for a non-null o by Succs[1].
+        Block nonNull = p.Succs[condition.Op == Op.CmpEq ? 1 : 0];
+        if (!ReferenceEquals(nonNull, viaA) && !ReferenceEquals(nonNull, viaB)) return;
+        for (int c = 0; c < _result.Casts.Count; c++)
+        {
+            CastFact cast = _result.Casts[c];
+            if (ReferenceEquals(cast.At, nonNull) && ReferenceEquals(Resolve(cast.Object), tested))
+                _result.Casts[c] = cast with { At = p, From = null, Over = null };
+        }
     }
 
     private static void MakeJump(Block p, Block target)

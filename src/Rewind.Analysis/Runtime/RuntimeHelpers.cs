@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): NewSpecific/NewAllocSpecific helper rules.
 namespace Rewind.Analysis.Runtime;
 
 /// <summary>The libil2cpp support functions that generated code calls, by what they mean in managed terms.</summary>
@@ -297,6 +298,11 @@ public sealed class RuntimeHelpers
         // Its overload with a class to check against is something else.
         if (name == "?UnBox@@YAPEAXPEAUIl2CppObject@@@Z") return new HelperInfo(HelperKind.Unbox, 1, false, true, name);
         if (core == "il2cpp_codegen_resolve") return new HelperInfo(HelperKind.ResolvePInvoke, 1, false, true, name);
+        // The runtime's allocators behind SZArrayNew and il2cpp_codegen_object_new, which whole-program optimized
+        // code calls directly once the codegen wrapper is inlined: Array::NewSpecific(klass, length),
+        // Object::New(klass) and Object::NewAllocSpecific(klass).
+        if (core == "NewSpecific@Array@vm@il2cpp") return new HelperInfo(HelperKind.SzArrayNew, 2, false, true, name);
+        if (core is "New@Object@vm@il2cpp" or "NewAllocSpecific@Object@vm@il2cpp") return new HelperInfo(HelperKind.ObjectNew, 1, false, true, name);
         if (core is "IsInstClass" or "IsInstSealed") return new HelperInfo(HelperKind.IsInst, 2, false, true, name);
         // (Plain Castclass - any class or interface - is pasted in place by MSVC, but clang keeps it a function.)
         if (core is "CastclassClass" or "CastclassSealed" or "Castclass") return new HelperInfo(HelperKind.CastClass, 2, false, true, name);

@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): stack arguments of calls to targets not yet known, switches through byte-indexed jump tables, jump-table registers dead after the jump, volatile registers a direct callee leaves alone kept across the call.
 using Iced.Intel;
 using Rewind.Analysis.Ir;
 using Rewind.Binary;
@@ -208,7 +209,8 @@ public sealed class X64Lifter : IMachineLifter
                 }
                 if (from < raw.Instructions.Count)
                 {
-                    var rest = new RawBlock { Start = raw.Instructions[from].IP, End = raw.End, Successors = raw.Successors };
+                    var rest = new RawBlock { Start = raw.Instructions[from].IP, End = raw.End, Successors = raw.Successors,
+                        SwitchByteTable = raw.SwitchByteTable, SwitchTable = raw.SwitchTable };
                     rest.Instructions.AddRange(raw.Instructions.GetRange(from, raw.Instructions.Count - from));
                     Block block = Make(rest);
                     tails.Add((block, rest));
@@ -1239,6 +1241,7 @@ public sealed class X64Lifter : IMachineLifter
         // A call pushes the return address on top of them; a jump to another function leaves the caller's
         // return address where it is, so there they sit one slot further up already.
         int first = tail && !NoTailStackFix ? 0x28 : 0x20;
+        if (shape == null && !NoStoredStackArguments) stackSlots = Math.Max(stackSlots, StoredStackSlots(sp, first));
         for (int i = 0; i < stackSlots; i++)
         {
             inputs.Add(_b.Load(_b.Add(sp, _b.Const(VT.I64, first + 8 * i)), VT.I64));
@@ -1247,7 +1250,63 @@ public sealed class X64Lifter : IMachineLifter
         return inputs.ToArray();
     }
 
-    private void AfterCall(Node call, CallReturn returns)
+    private static readonly bool NoStoredStackArguments = Environment.GetEnvironmentVariable("REWIND_NO_STORED_STACK_ARGUMENTS") != null;
+
+    /// <summary>
+    /// How many stack argument slots, from the first on, the code just before a call writes: each of them
+    /// written since the previous call, on every way to it. A call whose target is not known yet (a virtual
+    /// call, say) has as many stack arguments as that run is long; a method with many parameters has more than
+    /// the few slots captured on speculation, and the rest would be lost. Locals sit above the outgoing area,
+    /// so a run that starts at the first slot and has no hole is the arguments being set up. The writes can
+    /// start in the blocks before (the arguments two calls share, written before the branch between them).
+    /// </summary>
+    private int StoredStackSlots(Node sp, int first)
+    {
+        Node root = sp;
+        long bias = 0;
+        if (sp.Op == Op.Add && sp.In[1].IsConst)
+        {
+            root = sp.In[0];
+            bias = IrBuilder.SImm(sp.In[1]);
+        }
+        HashSet<int> Stored(Block block, int depth)
+        {
+            var stored = new HashSet<int>();
+            List<Node> nodes = block.Nodes;
+            for (int i = nodes.Count - 1; i >= 0; i--)
+            {
+                Node n = nodes[i];
+                if (n.Op is Op.Call or Op.TailCall) return stored;
+                if (n.Op != Op.Store) continue;
+                Node address = n.In[0];
+                long offset;
+                if (ReferenceEquals(address, root)) offset = 0;
+                else if (address.Op == Op.Add && ReferenceEquals(address.In[0], root) && address.In[1].IsConst) offset = IrBuilder.SImm(address.In[1]);
+                else continue;
+                offset -= bias + first;
+                if (offset < 0 || offset >= 8 * 64) continue;
+                stored.Add((int)(offset / 8));
+            }
+            // (A block not lifted yet - one that loops back here - has no nodes and adds nothing.)
+            if (depth == 0 || block.Preds.Count == 0 || block.Preds.Any(p => p.Nodes.Count == 0)) return stored;
+            HashSet<int>? before = null;
+            foreach (Block p in block.Preds)
+            {
+                HashSet<int> set = Stored(p, depth - 1);
+                if (before == null) before = set;
+                else before.IntersectWith(set);
+            }
+            stored.UnionWith(before!);
+            return stored;
+        }
+        HashSet<int> all = Stored(_b.Current, 4);
+        int count = 0;
+        while (all.Contains(count)) count++;
+        return count;
+    }
+
+    /// <param name="clobbered">The volatile registers the callee can change (<see cref="CalleeRegisters"/>); the others keep their values.</param>
+    private void AfterCall(Node call, CallReturn returns, uint clobbered = CalleeRegisters.Volatile)
     {
         Node Proj(int which, VT type)
         {
@@ -1255,21 +1314,37 @@ public sealed class X64Lifter : IMachineLifter
             p.Imm = which;
             return p;
         }
+        // bit: the register's bit in clobbered (CalleeRegisters' numbering).
+        void Kill(int v, VT type, int bit)
+        {
+            if ((clobbered & 1u << bit) != 0) SetVar(v, _b.Undef(type));
+        }
+        const int Xmm = CalleeRegisters.XmmBit;
         // Registers the callee does not return anything in hold nothing meaningful afterwards.
         bool any = returns == CallReturn.Unknown;
-        SetVar(0, any || returns == CallReturn.Integer ? Proj(CallResult.IntReturn, VT.I64) : _b.Undef(VT.I64));
-        SetVar(VarXmm + 0, any || returns is CallReturn.Float or CallReturn.Double ? Proj(CallResult.FloatLane0, VT.I32) : _b.Undef(VT.I32));
-        SetVar(VarXmm + 1, any || returns == CallReturn.Double ? Proj(CallResult.FloatLane1, VT.I32) : _b.Undef(VT.I32));
-        SetVar(VarXmm + 2, _b.Undef(VT.I32));
-        SetVar(VarXmm + 3, _b.Undef(VT.I32));
-        // Caller-saved registers hold nothing meaningful afterwards.
-        foreach (int v in (int[])[1, 2, 8, 9, 10, 11]) SetVar(v, _b.Undef(VT.I64));
+        if (any || returns == CallReturn.Integer) SetVar(0, Proj(CallResult.IntReturn, VT.I64));
+        else Kill(0, VT.I64, 0);
+        if (any || returns is CallReturn.Float or CallReturn.Double) SetVar(VarXmm + 0, Proj(CallResult.FloatLane0, VT.I32));
+        else Kill(VarXmm + 0, VT.I32, Xmm);
+        if (any || returns == CallReturn.Double) SetVar(VarXmm + 1, Proj(CallResult.FloatLane1, VT.I32));
+        else Kill(VarXmm + 1, VT.I32, Xmm);
+        Kill(VarXmm + 2, VT.I32, Xmm);
+        Kill(VarXmm + 3, VT.I32, Xmm);
+        // Caller-saved registers hold nothing meaningful afterwards, unless the callee's code leaves them alone.
+        foreach (int v in (int[])[1, 2, 8, 9, 10, 11]) Kill(v, VT.I64, v);
         for (int x = 1; x <= 5; x++)
             for (int lane = 0; lane < 4; lane++)
-                SetVar(VarXmm + x * 4 + lane, _b.Undef(VT.I32));
+                Kill(VarXmm + x * 4 + lane, VT.I32, Xmm + x);
         SetVar(VarFlags, _b.Undef(VT.Flags));
         _rdxSignExtends = 0;
     }
+
+    /// <summary>Set REWIND_NO_CALLEE_REGISTERS to take every call as changing every volatile register.</summary>
+    private static readonly bool NoCalleeRegisters = Environment.GetEnvironmentVariable("REWIND_NO_CALLEE_REGISTERS") != null;
+
+    /// <summary>The volatile registers a call can change: for a direct call, the ones its target's code writes.</summary>
+    private uint ClobberedBy(in Instruction ins) =>
+        NoCalleeRegisters || ins.Op0Kind != OpKind.NearBranch64 ? CalleeRegisters.Volatile : CalleeRegisters.Clobbered(_image, ins.NearBranchTarget);
 
     /// <summary>Return convention of the call most recently emitted.</summary>
     private CallReturn _lastCallReturn;
@@ -1398,12 +1473,18 @@ public sealed class X64Lifter : IMachineLifter
                 // The index is whatever the table load was indexed by; recover it from the jump's operand
                 // expression: target = imageBase + load32(imageBase + rva + index * 4).
                 Node target = ReadOp(ins, 0, VT.I64);
-                Node? index = FindSwitchIndex(target);
+                Node? index = raw.SwitchByteTable != 0
+                    ? FindByteSwitchIndex(target, raw.SwitchByteTable - _image.ImageBase, raw.SwitchTable - _image.ImageBase)
+                    : FindSwitchIndex(target);
                 if (index == null)
                 {
                     _fn.Problems.Add($"jump table index not recovered at 0x{ins.IP:X}");
                     index = _b.Undef(VT.I64);
                 }
+                // The jump's register holds a code address in every case, which no C# value is: left as it is, it
+                // turns up as an argument register of a call whose arity is not known yet and keeps the table load
+                // alive as an opaque statement.
+                if (!KeepJumpTargets && ins.Op0Kind == OpKind.Register) WriteReg(ins.Op0Register, _b.Undef(VT.I64));
                 Node sw = _b.Raw(Op.Switch, VT.None, index);
                 sw.Aux = new List<Block>(block.Succs);
                 return true;
@@ -1426,6 +1507,79 @@ public sealed class X64Lifter : IMachineLifter
             default:
                 return false;
         }
+    }
+
+    /// <summary>
+    /// The case value of a switch through a byte table: target = imageBase + load32(imageBase + tableRva + 4 *
+    /// zext(load8(imageBase + bytesRva + value))). The image base is a constant or a value (the "lea base, [rip - x]"
+    /// of another block); whatever the outer address adds besides the slot is the image base plus tableRva, so the
+    /// byte's address less that, less bytesRva and plus tableRva is the value. The builder folds constants together
+    /// ("value - 1 + bytesRva" is one constant), which is why the constants are worked out instead of matched.
+    /// </summary>
+    /// <summary>Off (REWIND_NO_DEAD_JUMP_TARGETS): the register a jump table jumps through keeps the target after the jump.</summary>
+    private static readonly bool KeepJumpTargets = Environment.GetEnvironmentVariable("REWIND_NO_DEAD_JUMP_TARGETS") != null;
+
+    private Node? FindByteSwitchIndex(Node target, ulong bytesRva, ulong tableRva)
+    {
+        var pending = new Stack<Node>();
+        pending.Push(target);
+        int budget = 32;
+        Node? load = null;
+        while (pending.Count > 0 && budget-- > 0)
+        {
+            Node n = pending.Pop();
+            if (n.Op == Op.Load && n.Type == VT.I32)
+            {
+                load = n;
+                break;
+            }
+            foreach (Node input in n.In) pending.Push(input);
+        }
+        if (load == null) return null;
+
+        var outer = new List<Node>();
+        if (!AddTerms(load.In[0], outer, out long outerConst)) return null;
+        int scaled = outer.FindIndex(t => t.Op == Op.Mul && t.In[1].IsConstValue(4) || t.Op == Op.Shl && t.In[1].IsConstValue(2));
+        if (scaled < 0) return null;
+        Node slot = outer[scaled].In[0];
+        outer.RemoveAt(scaled);
+        while (slot.Op is Op.ZExt or Op.SExt) slot = slot.In[0];
+        if (slot.Op != Op.Load || slot.Type != VT.I8) return null;
+
+        var inner = new List<Node>();
+        if (!AddTerms(slot.In[0], inner, out long innerConst)) return null;
+        foreach (Node b in outer)
+        {
+            int at = inner.IndexOf(b);
+            if (at < 0) return null;
+            inner.RemoveAt(at);
+        }
+        if (inner.Count != 1) return null;
+        long delta = innerConst - outerConst + (long)tableRva - (long)bytesRva;
+        Node value = inner[0];
+        return delta == 0 ? value : _b.Add(value, _b.Const(value.Type, delta));
+    }
+
+    /// <summary>Splits a sum into its terms that are not constants and the sum of those that are.</summary>
+    private static bool AddTerms(Node sum, List<Node> terms, out long constant)
+    {
+        constant = 0;
+        var pending = new Stack<Node>();
+        pending.Push(sum);
+        int budget = 16;
+        while (pending.Count > 0)
+        {
+            if (budget-- <= 0) return false;
+            Node t = pending.Pop();
+            if (t.Op == Op.Add)
+            {
+                pending.Push(t.In[1]);
+                pending.Push(t.In[0]);
+            }
+            else if (t.IsConst) constant += t.Imm;
+            else terms.Add(t);
+        }
+        return true;
     }
 
     private static Node? FindSwitchIndex(Node target)
@@ -1810,7 +1964,7 @@ public sealed class X64Lifter : IMachineLifter
                     n.Op1Kind == OpKind.Register && n.Op1Register == Register.RAX)
                     return;
                 Node call = EmitCall(ins, tail: false, noReturn: false);
-                AfterCall(call, _lastCallReturn);
+                AfterCall(call, _lastCallReturn, ClobberedBy(ins));
                 return;
             }
 

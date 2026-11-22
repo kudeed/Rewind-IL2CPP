@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): gaps always marked, floating-point negation.
 using Rewind.Analysis.Abi;
 using Rewind.Analysis.Hir;
 using Rewind.Analysis.Ir;
@@ -88,6 +89,7 @@ public sealed partial class HirBuilder
         if (!isDouble) return AsFloat(FloatValue(lo), type);
         if (Eval(lo) is SHalf { High: false } l && hi != null && Eval(hi) is SHalf { High: true } h && SameValue(l.Whole, h.Whole))
             return l.Whole;
+        if (hi != null && SignedLanes(lo, hi) is { } signed) return signed;
         if (Eval(lo) is SVal { Expr: HConst { Value: int low } } && hi != null && Eval(hi) is SVal { Expr: HConst { Value: int high } })
             return new HConst(BitConverter.Int64BitsToDouble((long)(uint)high << 32 | (uint)low), _double);
         HExpr bits = CombineParts([new Part(0, 4, HalfBits(lo)), new Part(4, 4, hi != null ? HalfBits(hi) : new HConst(0, _int))], 8);
@@ -138,8 +140,9 @@ public sealed partial class HirBuilder
         if (leaves == null || !Fits(leaves, how, nodes.Count))
         {
             _h.Locals.Remove(whole);
-            Problem($"could not rebuild {structType.DisplayName} from its registers");
-            return new HOpaque("struct_from_registers") { Type = structType };
+            string fromRegisters = $"could not rebuild {structType.DisplayName} from its registers";
+            Problem(fromRegisters);
+            return Site(new HOpaque("struct_from_registers") { Type = structType }, fromRegisters);
         }
 
         // The sources of the fields, where each one is known on its own.

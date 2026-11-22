@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): gaps always marked, base constructor calls, inlined constructor folding.
 using Rewind.Analysis.Abi;
 using Rewind.Analysis.Hir;
 using Rewind.Analysis.Ir;
@@ -582,6 +583,8 @@ public sealed class MethodPipeline
         AccessorFolding.Run(result, _program);
         LibraryInternals.Run(result, _program);
         HiddenImplementations.Run(result, _program);
+        BaseConstructorCalls.Run(result, this, _program);
+        ConstructorFolding.MarkRawConstructors(result);
         InitializerOrder.Run(result);
         UnsetLocals.Run(result);
         FlagMarkers(result);
@@ -592,10 +595,17 @@ public sealed class MethodPipeline
     /// Whatever is still expressed as a native operation in the finished method is a gap, whether or not the
     /// step that left it there said so: the rebuilt code stops when it gets there. Only the filler after a
     /// call that never returns is exempt, since nothing reaches it.
+    ///
+    /// The other way round, a problem reported with a marker at its site (HMethod.SiteProblems) whose markers
+    /// are all gone went with the code that had it: what is left was recovered, and a note saying otherwise
+    /// would point at no gap in it.
     /// </summary>
+    private static readonly bool NoSiteProblems = Environment.GetEnvironmentVariable("REWIND_NO_SITE_PROBLEMS") != null;
+
     private static void FlagMarkers(HMethod method)
     {
         HashSet<string>? found = null;
+        HashSet<string>? sited = null;
         void Visit(HExpr? e)
         {
             switch (e)
@@ -603,6 +613,7 @@ public sealed class MethodPipeline
                 case null: return;
                 case HOpaque o:
                     if (o.Text != "unreachable") (found ??= []).Add(o.Text);
+                    if (o.Problem != null) (sited ??= []).Add(o.Problem);
                     foreach (HExpr a in o.Operands) Visit(a);
                     return;
                 case HField f: Visit(f.Object); return;
@@ -636,6 +647,9 @@ public sealed class MethodPipeline
                 }
             }
         }
+        // (Not when problems were dropped for want of room: then it cannot be told which are left.)
+        if (!NoSiteProblems && method.SiteProblems.Count != 0 && method.Problems.Count < 64)
+            method.Problems.RemoveAll(p => method.SiteProblems.Contains(p) && !(sited?.Contains(p) ?? false));
         if (found == null || method.Problems.Count != 0) return;
         // Nothing reported this method as incomplete, yet it is.
         foreach (string text in found) method.Problems.Add($"native operation left in the code ({text})");

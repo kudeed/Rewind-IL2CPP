@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): gaps always marked, inlined constructor folding, bits read as float/double.
 using System.Globalization;
 using System.Text;
 using Rewind.Model;
@@ -84,6 +85,23 @@ public sealed class HAddressOf(HExpr target) : HExpr
 public sealed class HDeref(HExpr pointer) : HExpr
 {
     public HExpr Pointer = pointer;
+
+    /// <summary>
+    /// Whether this reads a value's own memory as another number of the same size ("*(double*)&amp;bits", the
+    /// reinterpretation where the class library has no BitConverter call for it); <paramref name="original"/> is
+    /// the value.
+    /// </summary>
+    public bool IsBitCast(out HExpr original)
+    {
+        original = this;
+        if (Pointer is not HAddressOf { Target: { } target } || target.Type is not PrimitiveSig from || Type is not PrimitiveSig to || ReferenceEquals(from, to))
+            return false;
+        static bool Number(PrimitiveSig p) => p.Element is Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4 or Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8 or Il2CppTypeEnum.R4 or Il2CppTypeEnum.R8;
+        static bool Wide(PrimitiveSig p) => p.Element is Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8 or Il2CppTypeEnum.R8;
+        if (!Number(from) || !Number(to) || Wide(from) != Wide(to)) return false;
+        original = target;
+        return true;
+    }
 }
 
 public sealed class HUnary(HUnaryOp op, HExpr operand) : HExpr
@@ -200,6 +218,13 @@ public sealed class HOpaque(string text, params HExpr[] operands) : HExpr
 {
     public string Text = text;
     public HExpr[] Operands = operands;
+    /// <summary>The problem reported where this marker was made, if any (see HMethod.SiteProblems).</summary>
+    public string? Problem;
+    /// <summary>
+    /// A statement that marks code which runs as it stands but is not what was written in a form IL accepts:
+    /// written as a note where it is (__Rewind.Note, which does nothing) instead of a stop (__Rewind.Effect).
+    /// </summary>
+    public bool Remark;
 }
 
 // ---- statements ----------------------------------------------------------------------------------------------
@@ -287,6 +312,13 @@ public sealed class HMethod
     public List<HBlock> Blocks = [];
     /// <summary>Things the recovery could not express faithfully; an empty list means a clean translation.</summary>
     public List<string> Problems = [];
+    /// <summary>
+    /// Problems that are each reported together with the marker (HOpaque.Problem) standing in for what was not
+    /// recovered. When no such marker is left in the finished method, the code that had the problem is no part
+    /// of it (a copy into a merged value nothing reads, a register a call turned out not to take), and the
+    /// problem goes with it.
+    /// </summary>
+    public HashSet<string> SiteProblems = [];
     /// <summary>Remarks that do not affect what the code does (for instance: it contains inlined code).</summary>
     public List<string> Notes = [];
     /// <summary>The methods whose statements, pasted in here, were put back as a call of the method.</summary>
