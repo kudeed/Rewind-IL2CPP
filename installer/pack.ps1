@@ -47,7 +47,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$repoUrl = 'https://github.com/ratman-bit/Rewind-IL2CPP-Decompiler'
+# Publish to the repository the build runs in: a fork's token can only write to the fork. GITHUB_REPOSITORY is set
+# by Actions; outside CI, fall back to origin so a local build from a fork does not try to publish upstream.
+$repo = if ($env:GITHUB_REPOSITORY) { $env:GITHUB_REPOSITORY } else {
+    $origin = (git -C $root remote get-url origin 2>$null)
+    if ($origin -match 'github\.com[:/](.+?)(?:\.git)?$') { $Matches[1] } else { 'ratman-bit/Rewind-IL2CPP-Decompiler' }
+}
+$repoUrl = "https://github.com/$repo"
 
 function Run([string] $what, [scriptblock] $command) {
     Write-Host "== $what"
@@ -124,7 +130,6 @@ if ($Upload) {
 
     # A new release becomes the "Latest release". Once main has one, that badge stays on main's newest build.
     $env:GH_TOKEN = $env:GITHUB_TOKEN
-    $repo = 'ratman-bit/Rewind-IL2CPP-Decompiler'
     $mainTags = @(gh release list -R $repo --limit 100 --json tagName --jq '.[].tagName' | Where-Object { $_ -notlike '*-experimental' })
     if ($mainTags.Count -gt 0) {
         $newestMain = $mainTags | Sort-Object { [version]($_.TrimStart('v')) } -Descending | Select-Object -First 1
