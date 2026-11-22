@@ -1,5 +1,7 @@
 // Added by xob0t (2026): helpers behind widening wrappers, array accessors by shape.
 using Iced.Intel;
+using Rewind.Analysis.Arm64;
+using Rewind.Binary;
 using Rewind.Model;
 using Decoder = Iced.Intel.Decoder;
 
@@ -16,8 +18,16 @@ public static class HelperShapes
     /// <summary>Adds what the code shows to <paramref name="helpers"/>; returns a line for the log, or null.</summary>
     public static string? Identify(Il2CppModel model, ModelCodeContext context, CodeIndex code, RuntimeHelpers helpers)
     {
-        if (model.Image.Arch != Rewind.Binary.CpuArch.X64) return null;
+        if (model.Image.Arch is not (CpuArch.X64 or CpuArch.Arm64)) return null;
         var found = new List<string>();
+        if (model.Image.Arch == CpuArch.Arm64)
+        {
+            if (!NoArm64Thunks && AddArm64Thunks(model, context, helpers) is > 0 and var thunks)
+                found.Add($"{thunks} thunks of support functions");
+            if (!NoArm64Exceptions && AddArm64ExceptionStubs(model, context, helpers) is > 0 and var exceptions)
+                found.Add($"{exceptions} exception throwers");
+            return found.Count == 0 ? null : "shapes:   found by their code: " + string.Join("; ", found);
+        }
         if (!NoWidened && AddWidenedTargets(model, context, code, helpers) is > 0 and var widened)
             found.Add($"{widened} called through a function that only widens arguments");
         if (!NoAccessors && AddArrayAccessors(model, context, code, helpers) is { Count: > 0 } accessors)
@@ -26,6 +36,115 @@ public static class HelperShapes
     }
 
     private static readonly bool NoAccessors = Environment.GetEnvironmentVariable("REWIND_NO_ACCESSOR_SHAPES") != null;
+    private static readonly bool NoArm64Thunks = Environment.GetEnvironmentVariable("REWIND_NO_ARM64_THUNKS") != null;
+
+    /// <summary>
+    /// The compiler leaves small functions that do nothing but hand their arguments to a support function: a
+    /// bare branch, a branch after setting a flag the generated code passes, or a call whose result is dropped
+    /// before returning. They are the same helper; the signature library only has room for a few of them.
+    /// </summary>
+    private static int AddArm64Thunks(Il2CppModel model, ModelCodeContext context, RuntimeHelpers helpers)
+    {
+        int added = 0;
+        for (int pass = 0; pass < 4; pass++)
+        {
+            int before = added;
+            foreach (ulong start in context.FunctionStarts)
+            {
+                if (context.IsManaged(start) || helpers.At(start) != null) continue;
+                if (Arm64Stub(model, start) is not { } stub || helpers.At(stub.Target) is not { } info) continue;
+                HelperInfo? alias = stub.Kind switch
+                {
+                    // A branch is the helper itself.
+                    Arm64StubKind.Branch => info,
+                    // "mov w1, #1; b initializer": a flag the initializer's managed meaning does not have.
+                    Arm64StubKind.FlagBranch when info.Kind == HelperKind.MetadataInitInline => info,
+                    // "bl initializer; dmb; ret": the initializer whose result is not used.
+                    Arm64StubKind.CallBarrierReturn when info.Kind == HelperKind.MetadataInitInline =>
+                        info with { Kind = HelperKind.MetadataInit, NoReturn = false, ReturnsValue = false },
+                    _ => null,
+                };
+                if (alias == null) continue;
+                helpers.Add(start, alias with { Name = info.Name + " (thunk)" });
+                added++;
+            }
+            if (added == before) break;
+        }
+        return added;
+    }
+
+    private static readonly bool NoArm64Exceptions = Environment.GetEnvironmentVariable("REWIND_NO_ARM64_EXCEPTIONS") != null;
+
+    /// <summary>
+    /// An out-of-line throw: the runtime keeps a function per exception and message ("Arithmetic operation
+    /// resulted in an overflow."), which builds the exception and jumps to the raiser. The message says which.
+    /// </summary>
+    private static int AddArm64ExceptionStubs(Il2CppModel model, ModelCodeContext context, RuntimeHelpers helpers)
+    {
+        int added = 0;
+        foreach (ulong start in context.FunctionStarts)
+        {
+            if (context.IsManaged(start) || helpers.At(start) != null) continue;
+            if (Arm64ExceptionStub(model, start) is not { } info) continue;
+            helpers.Add(start, info);
+            added++;
+        }
+        return added;
+    }
+
+    private static HelperInfo? Arm64ExceptionStub(Il2CppModel model, ulong start)
+    {
+        ReadOnlySpan<byte> bytes = model.Image.SpanToSectionEnd(start);
+        if (bytes.Length < 20) return null;
+        ulong page = 0, text = 0;
+        bool call = false, tail = false;
+        for (int i = 0; i < 8 && (i + 1) * 4 <= bytes.Length; i++)
+        {
+            A64Instruction ins = A64Decoder.Decode(BitConverter.ToUInt32(bytes[(i * 4)..]), start + (ulong)(i * 4));
+            if (ins.Op == A64Op.Adrp) page = ins.Target;
+            else if (ins.Op == A64Op.AddImm && ins.Rn == ins.Rd && page != 0) text = page + (ulong)ins.Imm;
+            else if (ins.Op == A64Op.Bl) call = true;
+            else if (ins.Op == A64Op.B && i != 0) { tail = true; break; }
+        }
+        if (!call || !tail || text == 0 || model.Image.TryCString(text, 200) is not { Length: > 10 } message) return null;
+        HelperKind kind;
+        if (message.Contains("overflow", StringComparison.OrdinalIgnoreCase)) kind = HelperKind.GetOverflowException;
+        else if (message.Contains("Object reference not set", StringComparison.Ordinal)) kind = HelperKind.ThrowNullReference;
+        else if (message.Contains("outside the bounds", StringComparison.Ordinal)) kind = HelperKind.ThrowIndexOutOfRange;
+        else if (message.Contains("divide by zero", StringComparison.OrdinalIgnoreCase)) kind = HelperKind.ThrowDivideByZero;
+        else if (message.Contains("cast is not valid", StringComparison.OrdinalIgnoreCase)) kind = HelperKind.ThrowInvalidCast;
+        else return null;
+        // (The overflow helper is otherwise the one that makes the exception; this one raises it.)
+        return new HelperInfo(kind, 0, true, false, "exception thrower (by its code)");
+    }
+
+    private enum Arm64StubKind { Branch, FlagBranch, CallBarrierReturn }
+
+    private static (Arm64StubKind Kind, ulong Target)? Arm64Stub(Il2CppModel model, ulong start)
+    {
+        ReadOnlySpan<byte> bytes = model.Image.SpanToSectionEnd(start);
+        if (bytes.Length < 8) return null;
+        A64Instruction first = A64Decoder.Decode(BitConverter.ToUInt32(bytes), start);
+        if (first.Op == A64Op.B && first.Target != start) return (Arm64StubKind.Branch, first.Target);
+        if (first.Op == A64Op.MovZ && first.Rd >= 1 && first.Rd <= 7)
+        {
+            A64Instruction second = A64Decoder.Decode(BitConverter.ToUInt32(bytes[4..]), start + 4);
+            if (second.Op == A64Op.B && second.Target != start) return (Arm64StubKind.FlagBranch, second.Target);
+            return null;
+        }
+        if (first.Op != A64Op.Bl) return null;
+        A64Instruction next = A64Decoder.Decode(BitConverter.ToUInt32(bytes[4..]), start + 4);
+        if (next.Op == A64Op.Barrier)
+        {
+            if (bytes.Length < 12) return null;
+            A64Instruction last = A64Decoder.Decode(BitConverter.ToUInt32(bytes[8..]), start + 8);
+            if (last.Op == A64Op.Ret) return (Arm64StubKind.CallBarrierReturn, first.Target);
+            return null;
+        }
+        // "bl helper; ret": the result is returned as it is.
+        if (next.Op == A64Op.Ret) return (Arm64StubKind.Branch, first.Target);
+        return null;
+    }
 
     /// <summary>
     /// An array type's own element accessors (GetAt, SetAt, GetAddressAt), which the compiler keeps as functions

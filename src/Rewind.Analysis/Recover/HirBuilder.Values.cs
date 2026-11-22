@@ -27,15 +27,19 @@ public sealed partial class HirBuilder
     {
         ulong va = (ulong)n.Imm;
         if (_p.Defaults.Slots.TryGetValue(va, out TypeDef? def)) return new SKlass(def.Sig);
-        MetadataUsage? usage = _m.ResolveUsageSlot(va);
-        if (usage == null) return SJunk.Instance;
+        return _m.ResolveUsageSlot(va) is { } usage ? UsageSem(usage) : SJunk.Instance;
+    }
+
+    /// <summary>The managed value a metadata usage stands for.</summary>
+    private Sem UsageSem(MetadataUsage usage)
+    {
         switch (usage.Kind)
         {
             case UsageKind.TypeInfo: return new SKlass(usage.Type!);
             case UsageKind.Il2CppType: return new SType(usage.Type!);
             case UsageKind.MethodDef: return new SMethod(usage.Method!, null);
             case UsageKind.MethodRef: return new SMethod(usage.Method!, usage.MethodInst);
-            case UsageKind.FieldInfo or UsageKind.FieldRva: return new SFieldInfo(usage.Field!);
+            case UsageKind.FieldInfo or UsageKind.FieldRva: return new SFieldInfo(usage.Field!, usage.Type);
             case UsageKind.StringLiteral: return new SVal(new HConst(usage.String ?? "", _string));
             default: return SJunk.Instance;
         }

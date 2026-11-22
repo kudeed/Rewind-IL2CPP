@@ -118,9 +118,11 @@ internal sealed class SType(TypeSig type) : Sem
 }
 
 /// <summary>FieldInfo* constant (what ldtoken yields for a field).</summary>
-internal sealed class SFieldInfo(FieldDef field) : Sem
+internal sealed class SFieldInfo(FieldDef field, TypeSig? declaringType = null) : Sem
 {
     public FieldDef Field = field;
+    /// <summary>The instantiated type the field was taken from, when the metadata usage names one.</summary>
+    public TypeSig? DeclaringType = declaringType;
 }
 
 /// <summary>Raw address inside the stack frame that has not (yet) been tied to a typed local.</summary>

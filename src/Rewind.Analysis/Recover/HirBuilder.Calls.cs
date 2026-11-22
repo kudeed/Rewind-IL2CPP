@@ -667,6 +667,16 @@ public sealed partial class HirBuilder
         return FloatAt(call, position, isDouble);
     }
 
+    /// <summary>The address of a metadata slot a value is: a constant, or a slot read the normalizer folded.</summary>
+    private static bool MetadataSlot(Node n, out ulong address)
+    {
+        address = 0;
+        if (n.IsConst) address = (ulong)n.Imm;
+        else if (n.Op == Op.SlotValue) address = (ulong)n.Imm;
+        else return false;
+        return address != 0;
+    }
+
     private void EmitCall(Node call, bool tail)
     {
         var info = (CallInfo)call.Aux!;
@@ -700,6 +710,16 @@ public sealed partial class HirBuilder
         if (target.Helper != null)
         {
             EmitHelperCall(call, target.Helper, tail);
+            return;
+        }
+        // A function no table lists that is handed a metadata slot: the runtime's metadata initializer. Its
+        // result is the slot's content (the class, method, field or string), and calling it only makes sure
+        // that content exists. (Unity 6 keeps one such initializer per code shape, so the signature library
+        // cannot list them all.)
+        if (!tail && IntAt(call, 0) is { } slot && MetadataSlot(slot, out ulong slotAddress) && _m.ResolveUsageSlot(slotAddress) is { } usage)
+        {
+            _h.Notes.Add($"call to 0x{info.Target:X} with a metadata slot: treated as the runtime's metadata initializer");
+            if (Projections(call).TryGetValue(CallResult.IntReturn, out Node? held) && IsUsed(held)) _sem[held] = UsageSem(usage);
             return;
         }
         Problem($"call to unidentified native function 0x{info.Target:X}");
@@ -2343,6 +2363,29 @@ public sealed partial class HirBuilder
         return new HOpaque(name.ToLowerInvariant(), args) { Type = type };
     }
 
+    /// <summary>
+    /// The field a runtime FieldInfo* names, as an access on the object it was handed. Shared generic code reaches
+    /// instance fields this way: the field belongs to the definition, its type is written with the definition's
+    /// type parameters, and the class the call was made on is what those parameters stand for.
+    /// </summary>
+    private HField? InstanceField(Node obj, Node fieldNode)
+    {
+        if (Eval(fieldNode) is not SFieldInfo info)
+        {
+
+                Console.Error.WriteLine($"[field] node {fieldNode.Id} op {fieldNode.Op} type {fieldNode.Type} sem {Eval(fieldNode).GetType().Name}");
+            return null;
+        }
+        FieldDef field = info.Field;
+        TypeSig owner = info.DeclaringType ?? field.DeclaringType.Sig;
+        TypeSig fieldType = field.Type;
+        if (owner is GenericInstSig generic && ReferenceEquals(generic.Definition, field.DeclaringType))
+            fieldType = _m.Sigs.Substitute(fieldType, generic.Arguments, []);
+        HExpr? target = LocationOf(obj, owner);
+        target ??= Value(obj);
+        return new HField { Object = target, Field = field, DeclaringType = owner, Type = fieldType };
+    }
+
     private void EmitHelperCall(Node call, HelperInfo helper, bool tail)
     {
         Dictionary<int, Node> projs = Projections(call);
@@ -2580,6 +2623,27 @@ public sealed partial class HirBuilder
                 if (result != null) _sem[result] = new SFrame(boxAt);
                 return;
             }
+            case HelperKind.GetInstanceFieldDataPointer:
+            {
+                // il2cpp_codegen_get_instance_field_data_pointer(obj, field): the field of a generic class or
+                // struct that shared code reaches through its runtime FieldInfo.
+                if (a0 == null || a1 == null || InstanceField(a0, a1) is not { } field) break;
+                if (tail)
+                {
+                    TypeSig pointer = _m.Sigs.Pointer(field.Type!);
+                    FinishCall(call, new HAddressOf(field) { Type = pointer }, ReturnKind.Integer, pointer, tail: true);
+                    return;
+                }
+                if (result != null) _sem[result] = new SRef(field, field.Type!);
+                return;
+            }
+            case HelperKind.WriteInstanceFieldData:
+            {
+                if (a0 == null || a1 == null || a2 == null || InstanceField(a0, a1) is not { Type: { } fieldType } field) break;
+                Emit(new HAssign(field, ValueFor(a2, fieldType)), call.Addr);
+                if (tail) Emit(new HReturn(null), call.Addr);
+                return;
+            }
             case HelperKind.RaiseProfileException:
             {
                 TypeDef? exceptionType = _m.FindType("System.NotSupportedException");
@@ -2612,6 +2676,9 @@ public sealed partial class HirBuilder
                 return;
             case HelperKind.ThrowInvalidCast:
                 Emit(new HThrow(NewException("System.InvalidCastException")), call.Addr);
+                return;
+            case HelperKind.GetOverflowException when helper.NoReturn:
+                Emit(new HThrow(NewException("System.OverflowException")), call.Addr);
                 return;
             case HelperKind.GetOverflowException:
                 FinishCall(call, NewException("System.OverflowException"), ReturnKind.Integer, _object, tail);
