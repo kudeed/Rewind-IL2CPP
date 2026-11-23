@@ -50,6 +50,9 @@ public static partial class Decompiler
         text = Regex.Replace(text, @"([\w.]+)\._version\b", "0");
         text = Regex.Replace(text, @"([\w.]+)\._items\b", "$1.ToArray()");
 
+        // Nullable<T> is a struct with a field "value" that the runtime names; C# names it Value.
+        text = Regex.Replace(text, @"\.value\b", ".Value");
+
         // A struct enumerator's current element has a public name.
         text = Regex.Replace(text, @"\benumerator(\d*)\._current\b", "enumerator$1.Current");
 
