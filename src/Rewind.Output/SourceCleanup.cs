@@ -35,5 +35,14 @@ public static partial class Decompiler
 
         // The version bump the append did is not needed once the append is the public call.
         text = Regex.Replace(text, @"[ \t]*\w+\._version\+\+;\n", "");
+
+        // int v = list._version; list._size = 0; list._version = v + 1;
+        // -> list.Clear();
+        text = Regex.Replace(text,
+            @"(?<mi>[ \t]*)int (?<v>\w+) = (?<lst>\w+)\._version;\n[ \t]*\k<lst>\._size = 0;\n[ \t]*\k<lst>\._version = \k<v> \+ 1;\n",
+            m => m.Groups["mi"].Value + m.Groups["lst"].Value + ".Clear();\n");
+
+        // A struct enumerator's current element has a public name.
+        text = Regex.Replace(text, @"\benumerator(\d*)\._current\b", m => "enumerator" + m.Groups[1].Value + ".Current");
     }
 }
