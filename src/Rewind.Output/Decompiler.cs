@@ -53,7 +53,7 @@ public sealed class DecompileResult
 }
 
 /// <summary>Runs the whole pipeline: recover method bodies, rebuild the assemblies with them, write C# source.</summary>
-public static class Decompiler
+public static partial class Decompiler
 {
     public static DecompileResult Run(Il2CppModel model, ProgramAnalysis? program, DecompileOptions options)
     {
@@ -349,6 +349,8 @@ public static class Decompiler
                         text = DecompileMemberwise(decompiler, item.Name, e);
                     }
                     if (MarkFailedMembers(ref text)) failed = true;
+                    SanitizeIdentifiers(ref text);
+                    SourceCleanup(ref text);
                     if (failed) Interlocked.Increment(ref errors);
                     string file = Path.Combine(targetDirectory, item.File);
                     Directory.CreateDirectory(Path.GetDirectoryName(file)!);
