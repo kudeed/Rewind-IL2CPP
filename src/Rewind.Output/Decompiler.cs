@@ -291,7 +291,7 @@ public static partial class Decompiler
             return;
         }
 
-        int errors = 0, iteratorsKept = 0, closuresKept = 0;
+        int errors = 0, iteratorsKept = 0, closuresKept = 0, markersUsed = 0;
         var work = new ConcurrentQueue<(string File, FullTypeName Name)>(types);
         int workers = Math.Max(1, Math.Min(Environment.ProcessorCount, 1 + types.Count / 64));
         var threads = new List<Thread>();
@@ -351,6 +351,7 @@ public static partial class Decompiler
                     if (MarkFailedMembers(ref text)) failed = true;
                     SanitizeIdentifiers(ref text);
                     SourceCleanup(ref text);
+                    if (text.Contains("__Rewind.", StringComparison.Ordinal)) Interlocked.Exchange(ref markersUsed, 1);
                     if (failed) Interlocked.Increment(ref errors);
                     string file = Path.Combine(targetDirectory, item.File);
                     Directory.CreateDirectory(Path.GetDirectoryName(file)!);
@@ -361,6 +362,9 @@ public static partial class Decompiler
             threads.Add(thread);
         }
         foreach (Thread t in threads) t.Join();
+        // The marker calls the written bodies make (__Rewind.Note, .Opaque, .Effect) name a type the body writer
+        // adds to the rebuilt assembly; it is not written from the metadata, so the file that declares it is.
+        if (markersUsed != 0) File.WriteAllText(Path.Combine(targetDirectory, "__Rewind.cs"), MarkerHelper);
         if (iteratorsKept != 0)
             log($"note:     {iteratorsKept} types written with their iterators as state machine classes: the C# decompiler's \"yield return\" for them could not advance");
         if (closuresKept != 0)
@@ -376,6 +380,21 @@ public static partial class Decompiler
     private static readonly bool NoIteratorCheck = Environment.GetEnvironmentVariable("REWIND_NO_ITERATOR_CHECK") != null;
 
     private const string FailedMember = "// ILSpy could not decompile this member";
+
+    /// <summary>
+    /// The type the marker calls in the written bodies need. Its members say what the decompiler could not put back:
+    /// <c>Note</c> does nothing (a gap whose code is not needed to compile), <c>Opaque</c> and <c>Effect</c> throw if
+    /// the method is ever called, because the value or the call they stand for was not recovered.
+    /// </summary>
+    private const string MarkerHelper = """
+        internal static class __Rewind
+        {
+            internal static T Opaque<T>(string what) { throw new System.NotSupportedException(what); }
+            internal static void Effect(string what) { throw new System.NotSupportedException(what); }
+            internal static void Note(string what) { }
+            internal static uint StringHash(string s) { uint num = 0u; if (s != null) { num = 2166136261u; for (int i = 0; i < s.Length; i++) num = (s[i] ^ num) * 16777619u; } return num; }
+        }
+        """ + "\n";
 
     /// <summary>
     /// A member the C# decompiler gave up on comes out as a body of comments: an empty method, which compiles and
