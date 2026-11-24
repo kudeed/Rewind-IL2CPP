@@ -54,6 +54,9 @@ public static partial class Decompiler
         // a legal conversion; infer the source enumerator type instead.
         text = Regex.Replace(text, @"List<(\w+)>\.Enumerator (\w+) = \(List<\1>\.Enumerator\)(\w+)\.GetEnumerator\(\);", "var $2 = $3.GetEnumerator();");
 
+        // "new T? { hasValue = c, value = {...} }" is a nullable built from a condition and a payload.
+        RewriteNullableInitializers(ref text);
+
         // Nullable<T> stores its payload in a field the runtime calls "value"; C# exposes it as Value.
         // Only rename on receivers that are nullable payloads (Min/Max/vectorN), so we do not break
         // types that legitimately declare a lowercase "value" field (LayerMask, Vector3, ...).
@@ -125,7 +128,9 @@ public static partial class Decompiler
         // "x = ref expr" is not C# for a local; the value it points at is.
         text = Regex.Replace(text, @"(\b[A-Za-z_][\w.]*) = ref ([^;]+);", "$1 = $2;");
 
-        // Returning a reference to a readonly variable: Unsafe.AsRef gives the writable reference C# asks for.
+        // Returning a reference to a readonly variable (or to a member of one): Unsafe.AsRef gives the writable
+        // reference C# asks for.
+        text = Regex.Replace(text, @"return ref (\w+)\.(\w+);", "return ref System.Runtime.CompilerServices.Unsafe.AsRef(in $1.$2);");
         text = Regex.Replace(text, @"return ref (\w+);", "return ref System.Runtime.CompilerServices.Unsafe.AsRef(in $1);");
 
         // A field that is written outside a constructor was not readonly in the source.
@@ -203,6 +208,7 @@ public static partial class Decompiler
             if (!text.Contains("using Vector3 = ")) aliases.Add("using Vector3 = UnityEngine.Vector3;");
             if (!text.Contains("using Vector2 = ")) aliases.Add("using Vector2 = UnityEngine.Vector2;");
             if (!text.Contains("using Quaternion = ") && text.Contains("Quaternion")) aliases.Add("using Quaternion = UnityEngine.Quaternion;");
+            if (!text.Contains("using Matrix4x4 = ") && text.Contains("Matrix4x4")) aliases.Add("using Matrix4x4 = UnityEngine.Matrix4x4;");
             if (!text.Contains("using Debug = ") && text.Contains("Debug")) aliases.Add("using Debug = UnityEngine.Debug;");
             if (aliases.Count > 0) text = string.Join("\n", aliases) + "\n" + text;
         }
@@ -249,6 +255,32 @@ public static partial class Decompiler
 
         // A boxed integer shifted as if it were the integer it holds: drop the box.
         text = Regex.Replace(text, @"\(object\)(\d+)(\s*(?:>>|<<)\s*)", "$1$2");
+        text = Regex.Replace(text, @"\(object\)([A-Za-z_][\w.\[\]]*)(\s*(?:>>|<<)\s*)", "$1$2");
+        // A local typed object that is shifted holds the integer the shift wants, so unbox it.
+        var objectLocals = new HashSet<string>();
+        foreach (Match m in Regex.Matches(text, @"\bobject (\w+)\b")) objectLocals.Add(m.Groups[1].Value);
+        if (objectLocals.Count > 0)
+            text = Regex.Replace(text, @"\b(\w+)(\s*(?:>>|<<)\s*)",
+                m => objectLocals.Contains(m.Groups[1].Value)
+                    ? "((long)" + m.Groups[1].Value + ")" + m.Groups[2].Value
+                    : m.Value);
+
+        // __ldftn is a metadata name, not a C# expression; the address it stood for is not recoverable.
+        text = Regex.Replace(text, @"__ldftn\([^()]*\)", "0");
+
+        // ProfilerMarker keeps its handle in a readonly field no initializer can write; leave it default.
+        text = Regex.Replace(text, @"new\s+ProfilerMarker\s*\{[^;{}]*\}", "default(ProfilerMarker)");
+        text = Regex.Replace(text, @"(?m)^[ \t]*[\w.]+\.m_Ptr\s*=[^;]*;[ \t]*\r?\n?", "");
+
+        // C# only catches Exception, not a boxed value.
+        text = Regex.Replace(text, @"\bcatch \(object\b", "catch (Exception");
+
+        // A delegate built from its (target, method pointer) constructor: C# cannot call that ctor.
+        text = Regex.Replace(text, @"new\s+([A-Za-z_][\w.]*(?:<[^<>()]*>)?)\(null, \(nint\)__Rewind\.Opaque<nint>\(""[^""]*""\)\)", "default($1)");
+
+        // A by-reference argument must be an lvalue; a recovered call result becomes one through the helper.
+        text = Regex.Replace(text, @"\bref (BitConverter\.\w+\([^()]*(?:\([^()]*\)[^()]*)*\))", "ref __Rewind.Ref($1)");
+        text = Regex.Replace(text, @"\bref (__Rewind\.Opaque<[^<>]+>\(""[^""]*""\)(?:\s*[|&^+\-*/]\s*[^,()\n]+)?)", "ref __Rewind.Ref($1)");
 
         // Unboxing a primitive to a class needs an intermediate object cast.
         text = Regex.Replace(text, @"\(Exception\)(\d+)", "(Exception)(object)$1");
@@ -277,9 +309,74 @@ public static partial class Decompiler
         // HasValue is read-only on nullable; drop assignments to it.
         text = Regex.Replace(text, @"(?m)^\s*[^\n]*\.HasValue\s*=.*;\s*\r?\n?", "", RegexOptions.Multiline);
 
+        // BigInteger's internal sign field is read in inlined arithmetic; the public property is Sign.
+        text = Regex.Replace(text, @"(\w+)\._sign\b(?!\s*=(?!=))", "__Rewind.Sign($1)");
+
+        // BigInteger built from (sign, magnitude array) in inlined code: C# takes the sign alone.
+        text = Regex.Replace(text, @"new BigInteger\(((?:[^,()]|\([^()]*\))+),\s*(?:\(uint\[\]\))?(?:null|\w+)\)", "new BigInteger($1)");
+
+
+        // A decimal field copy that survived the earlier sweep: the whole value is what it meant.
+        text = Regex.Replace(text, @"(?m)^[ \t]*\w+\.hi\s*=\s*\w+\.hi;[ \t]*\r?\n?", "");
+
         // Opaque placeholders for __frame/__rgctx used as LHS of assignment collapsed to 0; drop those lines.
         text = Regex.Replace(text, @"(?m)^\s*0\s*=\s*\(nint\)__Rewind\.Opaque[^\n]*;\s*\r?\n?", "", RegexOptions.Multiline);
 
+    }
+
+    /// <summary>
+    /// "new T? { hasValue = c, value = { ... } }" is how the body recovery spells a nullable built from a
+    /// condition and a payload; C# has no such initializer, so this writes the conditional that it stands for.
+    /// </summary>
+    private static void RewriteNullableInitializers(ref string text)
+    {
+        int search = 0;
+        while (search < text.Length)
+        {
+            Match m = Regex.Match(text.Substring(search), @"new\s+([A-Za-z_][\w.]*)\?\s*\{");
+            if (!m.Success) return;
+            int start = search + m.Index;
+            int open = start + m.Length - 1;
+            int close = MatchingBrace(text, open);
+            if (close < 0) { search = open + 1; continue; }
+            string body = text.Substring(open + 1, close - open - 1);
+            Match has = Regex.Match(body, @"hasValue\s*=\s*(.+?)\s*,\s*value\s*=\s*", RegexOptions.Singleline);
+            if (!has.Success) { search = close + 1; continue; }
+            int valueOpen = open + 1 + has.Index + has.Length;
+            if (valueOpen >= close || text[valueOpen] != '{') { search = close + 1; continue; }
+            int valueClose = MatchingBrace(text, valueOpen);
+            if (valueClose < 0) { search = close + 1; continue; }
+            string type = m.Groups[1].Value;
+            string condition = has.Groups[1].Value;
+            string payload = text.Substring(valueOpen, valueClose - valueOpen + 1);
+            string replacement = "((" + condition + ") ? new " + type + " " + payload + " : default(" + type + "?))";
+            text = text.Substring(0, start) + replacement + text.Substring(close + 1);
+            search = start + replacement.Length;
+        }
+    }
+
+    private static int MatchingBrace(string text, int open)
+    {
+        int depth = 0;
+        for (int i = open; i < text.Length; i++)
+        {
+            char c = text[i];
+            if (c == '"')
+            {
+                i++;
+                while (i < text.Length && text[i] != '"') { if (text[i] == '\\') i++; i++; }
+                continue;
+            }
+            if (c == '\'')
+            {
+                i++;
+                while (i < text.Length && text[i] != '\'') { if (text[i] == '\\') i++; i++; }
+                continue;
+            }
+            if (c == '{') depth++;
+            else if (c == '}' && --depth == 0) return i;
+        }
+        return -1;
     }
 }
 

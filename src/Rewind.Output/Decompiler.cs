@@ -392,6 +392,9 @@ public static partial class Decompiler
             internal static T Opaque<T>(string what) { throw new System.NotSupportedException(what); }
             internal static void Effect(string what) { throw new System.NotSupportedException(what); }
             internal static void Note(string what) { }
+            internal static ref T Ref<T>(T value) => ref RefCell<T>.Value;
+            internal static int Sign(System.Numerics.BigInteger value) => value.Sign;
+            private static class RefCell<T> { internal static T Value; }
             internal static uint StringHash(string s) { uint num = 0u; if (s != null) { num = 2166136261u; for (int i = 0; i < s.Length; i++) num = (s[i] ^ num) * 16777619u; } return num; }
         }
         """ + "\n";
