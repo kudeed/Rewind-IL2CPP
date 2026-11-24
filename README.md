@@ -44,6 +44,10 @@ Each release also has a `Portable.zip` that runs without installing, but doesn't
 
 The installers aren't code-signed, so Windows SmartScreen may ask you to confirm the first time.
 
+On Linux, each release also carries `Rewind-main-linux-x64.tar.gz` (or `Rewind-experimental-linux-x64.tar.gz`): a
+self-contained `rewind` command with no .NET install needed, extracted anywhere and run from there. The desktop
+app is WPF, so it is Windows-only; on Linux the command-line decompiler is the whole product.
+
 ## The desktop app
 
 The app is a window over the `rewind` command: it runs the same `rewind.exe` and shows what it prints, so it gives

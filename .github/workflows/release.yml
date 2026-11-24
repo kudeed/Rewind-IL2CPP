@@ -41,3 +41,26 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHANNEL: ${{ github.ref_name }}
         run: ./installer/pack.ps1 -Channel $env:CHANNEL -Download -Upload
+
+  # The desktop app is WPF, so the release's installer stays Windows-only. The command-line decompiler is plain
+  # .NET, so this job adds a self-contained Linux x64 build of it to the release the Windows job just published.
+  linux:
+    needs: release
+    if: github.ref_name == 'main' || github.ref_name == 'experimental'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build and attach the Linux x64 build
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANNEL: ${{ github.ref_name }}
+          UPLOAD: '1'
+        run: ./installer/pack-linux.sh

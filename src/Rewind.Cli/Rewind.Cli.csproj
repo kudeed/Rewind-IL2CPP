@@ -13,5 +13,9 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="..\..\signatures\*.sig" Link="signatures\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <!-- The licenses travel with the command too, so a standalone build has them. -->
+    <None Include="..\..\LICENSE" Link="licenses\LICENSE.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\NOTICE" Link="licenses\NOTICE.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\THIRD-PARTY-NOTICES.md" Link="licenses\THIRD-PARTY-NOTICES.md" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
