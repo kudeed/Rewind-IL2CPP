@@ -32,6 +32,17 @@ foreach(var c in cases){
 }
 var x=new CodeImage(new[]{Kill,Ret});
 if(Arm64ReceiverProof.IsUnused(x,0x1001,0x1008)||Arm64ReceiverProof.IsUnused(x,0x1000,0x1010)||Arm64ReceiverProof.IsUnused(x,0x1000,0x1000))failed++;
+var warmCold=new (string Name,bool Expected,uint[] Words)[]{
+ ("incoming scalar ignored in cold/warm metadata paths",true,new[]{0xD10043FFu,0xAA0203F3u,0xB4000068u,0x90000000u,Ret,0x910003E0u,Ret}),
+ ("cold path observes x0 before overwrite",false,new[]{0xD10043FFu,0xAA0203F3u,0xB4000068u,0x90000000u,Ret,0xAA0003E1u,0x910003E0u,Ret}),
+ ("warm path observes x0 before overwrite",false,new[]{0xD10043FFu,0xAA0203F3u,0xB4000088u,0xF90003E0u,0x90000000u,Ret,0x910003E0u,Ret}),
+ ("callee forwards stale x0 to call",false,new[]{0xAA0203F3u,0x94000002u,0x910003E0u,Ret}),
+};
+foreach(var c in warmCold){
+ var im=new CodeImage(c.Words);bool actual=Arm64ReceiverProof.IsUnused(im,0x1000,0x1000+(ulong)c.Words.Length*4);
+ if(actual!=c.Expected){Console.Error.WriteLine(c.Name+": "+actual+" expected "+c.Expected);failed++;}
+}
+Console.WriteLine($"INT32_RECEIVER_ENTRY_SMOKE positive={warmCold.Count(c=>c.Expected)} negative={warmCold.Count(c=>!c.Expected)} failed={failed}");
 var argCases=new (string Name,bool Expected,uint[] Words,bool KnownCall)[]{
  ("x2 direct kill",true,new[]{0xAA1F03E2u,Ret},false),
  ("x2 kill after proven unary metadata helper",true,new[]{0x94000004u,0xAA1F03E2u,Ret},true),

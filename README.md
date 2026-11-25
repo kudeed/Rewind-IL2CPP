@@ -424,3 +424,16 @@ regions. Only the metadata initialization guard is removed; no arbitrary
 pointer or application predicate folding. Disable with
 REWIND_NO_OWN_METHOD_RGCTX=1.
 FsmConstructionSmoke covers one accepted and twelve rejected machine shapes.
+
+### Stale int32 result as an unused instance receiver
+
+The same strict native receiver-independence proof also permits a recovered
+Int32/UInt32 expression in the receiver register of an exact direct same-owner
+instance call. This handles a native optimizer leaving an integer return value
+in x0 when the target never reads the receiver. Emit the current managed this,
+not scalar-as-object IL. Retain all existing exact target, caller/owner,
+virtual dispatch, generic, exception and every-entry-path explicit overwrite
+restrictions. Do not apply this to arbitrary values or calls. Disable this
+extension with REWIND_NO_I32_UNUSED_RECEIVER=1. Arm64ReceiverProofSmoke includes
+one accepted and three rejected cold/warm metadata-prologue cases in addition
+to the original receiver and metadata argument tests.

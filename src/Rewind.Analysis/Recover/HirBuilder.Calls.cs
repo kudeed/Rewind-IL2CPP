@@ -1761,6 +1761,16 @@ public sealed partial class HirBuilder
                         thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
                         _h.Notes.Add($"receiver-independent merged scalar at 0x{call.Addr:X} to 0x{method.Address:X}");
                     }
+                    else if (Environment.GetEnvironmentVariable("REWIND_NO_I32_UNUSED_RECEIVER") == null &&
+                             Eval(node) is SVal { Expr: { } stale } &&
+                             (stale.Type ?? (stale as HLocal)?.Variable.Type) is PrimitiveSig { Element: Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4 } &&
+                             CanRestoreUnusedReceiver(call, method, classArgs, methodArgs, isVirtual, alternatives, receiverOverride, shift))
+                    {
+                        // The original compiler reuses the integer return register
+                        // as an ignored instance receiver. Never emit scalar-as-object IL.
+                        thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                        _h.Notes.Add($"receiver-independent int32 scalar at 0x{call.Addr:X} to 0x{method.Address:X}");
+                    }
                     else
                     {
                         thisExpr = Value(node);
