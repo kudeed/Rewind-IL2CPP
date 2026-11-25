@@ -474,6 +474,63 @@ var wrongHeader30=Cursor30();
 Check(ArrayCursorRecovery.Run(wrongHeader30.fn,16,(_,_)=>44)==0,"wrong header accepted");
 Console.WriteLine("ARRAY_CURSOR_SMOKE_PASS positive=1 negative="+(neg30.Length+2));
 
+
+// Reference-element inlined List.Clear tail with a same-receiver count snapshot.
+var array31=new TypeDef{Index=311,Name="Array",Namespace="System",Assembly=core};array31.Sig=sf.TypeDef(array31);
+var arrayClear31=new MethodDef{Name="Clear",DeclaringType=array31,ReturnType=v,Flags=MethodDef.Static|6,Parameters=[new ParamDef{Type=array31.Sig},new ParamDef{Type=i},new ParamDef{Type=i}]};
+var listClear31=Method("Clear",v);listClear31.Flags=6;
+listDef.Methods=[add,resize,count,listClear31];
+(HMethod h,HBlock pre,HBlock b,HBlock clear,HBlock empty,HVar list,HVar n,HVar ver) Clear31()
+{
+ var h=new HMethod{Method=new MethodDef{Name="Caller",DeclaringType=owner,ReturnType=v}};
+ var list=h.NewLocal(listType);var n=h.NewLocal(i);var ver=h.NewLocal(i);
+ HField LF(FieldDef f)=>new(){Field=f,Object=L(list),DeclaringType=listType,Type=f==items?arrayType:i};
+ var pre=new HBlock{Id=0};var b=new HBlock{Id=1};var clear=new HBlock{Id=2};var empty=new HBlock{Id=3};
+ pre.Statements=[new HAssign(L(list),new HArg(0){Type=listType}),new HAssign(L(n),new HCall{Method=count,This=L(list),DeclaringType=listType,Type=i}),new HJump(b)];
+ b.Statements=[new HAssign(L(ver),LF(version)),new HAssign(LF(sz),new HConst(0,i)),new HAssign(LF(version),new HBinary(HBinaryOp.Add,L(ver),new HConst(1,i)){Type=i}),new HBranch(new HCompare(HCompareOp.Lt,L(n),new HConst(1,i)){Type=bo},empty,clear)];
+ clear.Statements=[new HEval(new HCall{Method=arrayClear31,Arguments=[LF(items),new HConst(0,i),L(n)],Type=v}),new HReturn(null)];
+ empty.Statements=[new HReturn(null)];h.Blocks=[pre,b,clear,empty];
+ return(h,pre,b,clear,empty,list,n,ver);
+}
+var good31=Clear31();
+Check(ListClearFolding.TryFold(good31.h,sf,good31.b)&&good31.h.Blocks.Count==3&&good31.b.Statements[0] is HEval{Expression:HCall clear31}&&clear31.Method==listClear31,"reference list clear");
+var conditional31=Clear31();
+conditional31.pre.Statements[^1]=new HBranch(new HCompare(HCompareOp.Le,L(conditional31.n),new HConst(0,i)),conditional31.b,conditional31.empty);
+Check(ListClearFolding.TryFold(conditional31.h,sf,conditional31.b),"pure count branch");
+var negatives31=new Action<(HMethod h,HBlock pre,HBlock b,HBlock clear,HBlock empty,HVar list,HVar n,HVar ver)>[]{
+ x=>((HAssign)x.b.Statements[1]).Value=new HConst(1,i),
+ x=>((HBinary)((HAssign)x.b.Statements[2]).Value).Right=new HConst(2,i),
+ x=>((HCompare)((HBranch)x.b.Statements[3]).Condition).Right=new HConst(0,i),
+ x=>((HCompare)((HBranch)x.b.Statements[3]).Condition).Op=HCompareOp.Gt,
+ x=>((HCall)((HEval)x.clear.Statements[0]).Expression).Arguments[1]=new HConst(1,i),
+ x=>((HCall)((HEval)x.clear.Statements[0]).Expression).Arguments[2]=new HConst(2,i),
+ x=>((HField)((HCall)((HEval)x.clear.Statements[0]).Expression).Arguments[0]).Object=new HArg(1){Type=listType},
+ x=>x.pre.Statements.Insert(x.pre.Statements.Count-1,new HEval(new HConst(1,i))),
+ x=>x.h.Blocks.Add(new HBlock{Id=4,Statements=[new HJump(x.b)]}),
+ x=>x.h.Blocks.Add(new HBlock{Id=4,Statements=[new HJump(x.clear)]}),
+ x=>x.empty.Statements.Insert(0,new HEval(L(x.ver))),
+ x=>x.n.AddressTaken=true,
+ x=>x.clear.Scope=0,
+ x=>((HCall)((HAssign)x.pre.Statements[1]).Value).This=new HArg(2){Type=listType},
+ x=>x.pre.Statements[^1]=new HBranch(new HCompare(HCompareOp.Lt,new HCall{Method=count,This=L(x.list),Type=i},new HConst(0,i)),x.b,x.empty),
+};
+foreach(var mutate31 in negatives31){var x=Clear31();mutate31(x);Check(!ListClearFolding.TryFold(x.h,sf,x.b),"unsafe list clear accepted");}
+Console.WriteLine("LIST_CLEAR_SMOKE_PASS positive=2 negative="+negatives31.Length);
+
+
+// Synthetic v39 own-MethodInfo RGCTX warm/cold paths with equivalent
+// argument-null tests and one exact identified runtime initializer.
+uint CB31(uint op,int reg,int from,int to)=>op|((uint)((to-from)/4)&0x7ffffu)<<5|(uint)reg;
+uint[] rgctx31=[
+ 0xf9401c28,0xaa0103f4,0xaa0003f3,CB31(0xb4000000,8,12,32),
+ CB31(0xb4000000,19,16,44),0xd503201f,0xd503201f,0xd503201f,
+ 0xaa1403e0,0x94000007,CB31(0xb5000000,19,40,20),0xd65f03c0];
+bool Guard31(uint[] w,int mi=1,int arg=0,bool helper=true)=>Normalizer.OwnRgctxGuardCode(new VectorImage(w),0x100c,mi,arg,x=>helper&&x==0x1040);
+Check(Guard31(rgctx31),"own rgctx metadata guard");
+foreach(int at in new[]{0,1,2,3,4,8,9,10}){var bad=rgctx31.ToArray();bad[at]^=1;Check(!Guard31(bad),"wrong rgctx instruction "+at);}
+Check(!Guard31(rgctx31,mi:2)&&!Guard31(rgctx31,arg:3)&&!Guard31(rgctx31,helper:false)&&!Guard31(rgctx31[..10]),"wrong rgctx arguments/helper/range");
+Console.WriteLine("OWN_RGCTX_GUARD_SMOKE_PASS positive=1 negative=12");
+
 sealed class VectorImage:NativeImage{
  public override ImageFormat Format=>ImageFormat.Elf;
  public VectorImage(params uint[] words){

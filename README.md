@@ -402,3 +402,25 @@ original index loop and calls. This relies on valid managed SZARRAY invariants
 and does not infer arbitrary interior pointers. Disable using
 `REWIND_NO_ARRAY_CURSOR_RECOVERY=1`. FsmConstructionSmoke covers one positive
 and seventeen negative synthetic shapes.
+
+### Exact inlined reference List.Clear and own-MethodInfo RGCTX initialization
+
+Restore public List.Clear for an exact closed reference-element BCL List tail:
+read the old version, zero size, increment version, and clear exactly the
+previous count from the same backing array on the nonempty arm. Require the
+same list's count immediately before the sole predecessor's pure branch or
+jump, equivalent exits, no escaping version temporary or exception regions,
+and a unique public parameterless Clear. Valid managed List invariants are
+assumed. Disable with REWIND_NO_LIST_CLEAR_FOLDING=1. FsmConstructionSmoke
+covers two accepted and fifteen rejected shapes.
+
+For ARM64 metadata v39, recover a narrowly matched lazy own-MethodInfo
+rgctx_data guard. The native instruction sequence must prove the original
+MethodInfo and argument register identities, saved callee-preserved
+registers, the recognized RGCTX initialization helper, and equivalent
+argument null checks in both branches. Require the corresponding SSA entry
+load, exact offsets, matching successors, pure branches and no exception
+regions. Only the metadata initialization guard is removed; no arbitrary
+pointer or application predicate folding. Disable with
+REWIND_NO_OWN_METHOD_RGCTX=1.
+FsmConstructionSmoke covers one accepted and twelve rejected machine shapes.

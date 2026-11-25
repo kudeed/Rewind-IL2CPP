@@ -407,6 +407,7 @@ public sealed class MethodPipeline
         if(classArgs.Length!=0||methodArgs.Length!=0)
         {
             _normalizer.FoldOwnMethodKlass(fn,abi);
+            _normalizer.FoldOwnMethodRgctx(fn,abi);
             _normalizer.Cleanup(fn);
         }
         if (_program.Model.Image.Arch == Rewind.Binary.CpuArch.Arm64 && IndexedBaseMerges.Run(fn))
@@ -1039,6 +1040,7 @@ public sealed class MethodPipeline
         SwitchRanges.Run(result);
         DelegateChoiceFolding.Run(result);
         ListAppendFolding.Run(result, _program.Model.Sigs, _program.Model.Image);
+        ListClearFolding.Run(result, _program.Model.Sigs);
         return result;
     }
 
