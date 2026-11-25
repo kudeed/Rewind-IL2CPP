@@ -276,6 +276,51 @@ var neg22=new Action<(Block B,Node Phi,Node Load,Node Shift,Dictionary<Node,List
 foreach(var mutation in neg22){var fixture22=IndexedFixture22();mutation(fixture22);Check(!Rewind.Analysis.Passes.IndexedBaseMerges.Candidate(fixture22.B,fixture22.Phi,fixture22.Uses),"unsafe indexed merge accepted");}
 Console.WriteLine("INDEXED_BASE_SMOKE_PASS positive=1 negative="+neg22.Length);
 
+// Explicit LSDA no-pad evidence is required, not merely a missing entry.
+static (Function Fn,Block Gate,Block Body,Node Call,Node Park,List<CallSite> Sites) TryPrefix23()
+{
+ var fn=new Function{Regs=RegisterModel.Arm64,Address=0x1000,End=0x1100};
+ var sp=fn.NewNode(Op.Param,VT.I64,null);fn.Params[fn.Regs.StackPointer]=sp;
+ var gate=new Block{Scope=-1};var handler=new Block{Scope=1};var body=new Block{Scope=0};
+ fn.TryRegions.Add(new TryRegionInfo{Index=0,Outer=-1});
+ gate.Succs=[handler,body];handler.Preds=[gate];body.Preds=[gate];fn.Blocks=[gate,body,handler];
+ var raised=fn.NewNode(Op.Idiom,VT.I1,gate);raised.Imm=(long)IdiomKind.TryEntry;raised.Aux=0;
+ gate.Nodes=[raised,fn.NewNode(Op.Branch,VT.None,gate,raised)];
+ Node Const(long k){var n=fn.NewNode(Op.Const,VT.I64,null);n.Imm=k;return n;}
+ Node At(int off)=>fn.NewNode(Op.Add,VT.I64,body,sp,Const(off));
+ var call=fn.NewNode(Op.Call,VT.None,body);call.Aux=new CallInfo{Target=0x2000};call.Addr=0x1000;
+ var proj=fn.NewNode(Op.Proj,VT.I64,body,call);proj.Imm=0;
+ var local=At(-32);var slot=At(-48);
+ var init=fn.NewNode(Op.Store,VT.None,body,local,proj);init.Addr=0x1004;
+ var park=fn.NewNode(Op.Store,VT.None,body,slot,local);park.Addr=0x1008;
+ var protectedCall=fn.NewNode(Op.Call,VT.None,body);protectedCall.Aux=new CallInfo{Target=0x3000};protectedCall.Addr=0x100c;
+ body.Nodes=[call,proj,local,init,slot,park,protectedCall,fn.NewNode(Op.Return,VT.None,body)];
+ handler.Nodes=[fn.NewNode(Op.Return,VT.None,handler)];
+ return(fn,gate,body,call,park,[new CallSite(0x1000,0x100c,0,0),new CallSite(0x100c,0x1010,0x1080,1,1)]);
+}
+var good23=TryPrefix23();
+Check(Rewind.Analysis.Passes.NativeTryPrefix.Run(good23.Fn,good23.Sites)==6,"LSDA prefix positive");
+Check(good23.Gate.Nodes.Contains(good23.Call)&&good23.Call.Block==good23.Gate&&good23.Park.Block==good23.Gate&&
+ good23.Body.Nodes.Count==2&&good23.Body.Nodes[0].Addr==0x100c&&good23.Gate.Terminator?.Op==Op.Branch,"LSDA prefix ordering and ownership");
+var neg23=new Action<(Function Fn,Block Gate,Block Body,Node Call,Node Park,List<CallSite> Sites)>[]{
+ x=>x.Sites.RemoveAt(0),
+ x=>x.Sites[0]=new CallSite(0x1000,0x100c,0x1080,1,1),
+ x=>x.Sites[0]=new CallSite(0x1000,0x100c,0x1080,0),
+ x=>x.Sites.Add(new CallSite(0x1000,0x1004,0,0)),
+ x=>((CallInfo)x.Call.Aux!).Indirect=true,
+ x=>((CallInfo)x.Call.Aux!).NoReturn=true,
+ x=>x.Call.Addr=0,
+ x=>x.Park.Addr=0x100c,
+ x=>x.Park.In[1]=new Node{Op=Op.Const,Type=VT.I64},
+ x=>x.Body.Preds.Add(new Block()),
+ x=>x.Fn.TryRegions.Add(new TryRegionInfo{Index=1}),
+ x=>x.Gate.Scope=1,
+ x=>x.Body.Phis.Add(new Node{Op=Op.Phi,Type=VT.I64}),
+ x=>x.Body.Nodes.Insert(1,new Node{Op=Op.Store,Type=VT.None,Addr=0x1004,In=[new Node{Op=Op.Param,Type=VT.I64},new Node{Op=Op.Const,Type=VT.I64}]})
+};
+foreach(var mutate23 in neg23){var fixture23=TryPrefix23();mutate23(fixture23);var before23=fixture23.Body.Nodes.ToArray();Check(Rewind.Analysis.Passes.NativeTryPrefix.Run(fixture23.Fn,fixture23.Sites)==0&&fixture23.Body.Nodes.SequenceEqual(before23),"unsafe prefix accepted");}
+Console.WriteLine("NATIVE_TRY_PREFIX_SMOKE_PASS positive=1 negative="+neg23.Length);
+
 sealed class VectorImage:NativeImage{
  public override ImageFormat Format=>ImageFormat.Elf;
  public VectorImage(params uint[] words){

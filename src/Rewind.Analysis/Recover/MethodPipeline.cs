@@ -343,6 +343,17 @@ public sealed class MethodPipeline
             DeadCode.Run(fn);
             _normalizer.Cleanup(fn);
         }
+        if (_program.Model.Image is Rewind.Binary.ElfImage elf &&
+            _program.Model.Image.Arch == Rewind.Binary.CpuArch.Arm64 &&
+            fn.TryRegions.Count == 1 && elf.ExceptionTableOf(fn.Address) is { } table)
+        {
+            int moved = NativeTryPrefix.Run(fn, table.CallSites);
+            if (moved > 0)
+            {
+                normalization.ReceiverNotes.Add($"native try prefix: {moved} nodes before protected calls");
+                _normalizer.Cleanup(fn);
+            }
+        }
         if (Environment.GetEnvironmentVariable("REWIND_NO_LEFTOVERS") == null && UndefinedValues.Run(fn, Leftovers(fn, abi), deadArguments: !fn.Regs.SharedPositions))
         {
             DeadCode.Run(fn);
