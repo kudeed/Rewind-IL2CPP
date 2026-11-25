@@ -91,6 +91,7 @@ public static partial class Decompiler
             // Where parts of it are left open they are marked as in any other method (the placeholder said
             // nothing of what the method does; what was recovered around a gap does).
             var work = new List<(MethodDef Method, MethodInst? Shared)>();
+            var sharedGaps = new HashSet<MethodDef>();
             foreach (MethodDef method in model.Methods)
             {
                 if (!selected.Contains(method.DeclaringType.Assembly)) continue;
@@ -127,6 +128,7 @@ public static partial class Decompiler
                             HMethod generic = recovered.Recovered!;
                             if (generic.Problems.Count != 0)
                             {
+                                sharedGaps.Add(method);
                                 report.AppendLine(Row("generic, gaps", method, string.Join(" | ", generic.Problems.Distinct().Take(6))));
                                 if (!genericGaps)
                                 {
@@ -175,6 +177,7 @@ public static partial class Decompiler
                         evidence.Record(method, method.Address, "failed", recovered.Recovered, $"{e.GetType().Name}: {e.Message}");
                     }
                 });
+            ClosedArraySpecializations.Run(model,program,emitter,bodies,work.Select(w=>w.Method),sharedGaps,options);
             options.Log($"method bodies: {result.Methods} with native code, {result.Clean} recovered completely, {result.WithGaps} with gaps marked in the output, " +
                         $"{result.NotEmitted + result.Crashed} left as stubs ({sw.ElapsedMilliseconds} ms)");
             if (result.GenericShared != 0)

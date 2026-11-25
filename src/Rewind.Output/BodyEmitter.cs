@@ -46,7 +46,11 @@ public sealed class BodyEmitter
     /// <summary>Replaces the placeholder body of <paramref name="method"/>. Returns null on success, else why not.</summary>
     public string? Emit(MethodDef method, HMethod h)
     {
-        MethodDefinition target = _emitter[method];
+        return EmitTo(method,h,_emitter[method]);
+    }
+
+    internal string? EmitTo(MethodDef method,HMethod h,MethodDefinition target)
+    {
         MethodBody saved = target.Body;
         try
         {
