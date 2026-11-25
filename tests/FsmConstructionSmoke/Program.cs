@@ -120,3 +120,17 @@ var dep=badDependency.h.NewLocal(i);
 badDependency.block.Statements.Insert(4,new HAssign(L(dep),L(badDependency.n)));
 Check(!ListAppendFolding.TryFold(badDependency.h,sf,badDependency.block),"private count use accepted");
 Console.WriteLine("LIST_APPEND_EXTENDED_SMOKE_PASS positive=4 negative=3");
+
+var phi=Fixture(true);
+var input=phi.h.NewLocal(i);var result=phi.h.NewLocal(i);
+var phiRead=new HLocal(input); // authoritative declared type, no expression annotation
+var phiMath=new HAssign(L(result),new HBinary(HBinaryOp.Add,phiRead,new HConst(-1,i)){Type=i});
+phi.block.Statements.Insert(4,phiMath);
+var phiItem=new HLocal(result);
+((HAssign)phi.fast.Statements[1]).Value=phiItem;
+((HCall)((HEval)phi.slow.Statements[0]).Expression).Arguments[0]=phiItem;
+Check(ListAppendFolding.TryFold(phi.h,sf,phi.block),"typed merge local");
+var conflict=Fixture(true);var local=conflict.h.NewLocal(i);var output=conflict.h.NewLocal(i);
+conflict.block.Statements.Insert(4,new HAssign(L(output),new HBinary(HBinaryOp.Add,new HLocal(local){Type=o},new HConst(-1,i)){Type=i}));
+Check(!ListAppendFolding.TryFold(conflict.h,sf,conflict.block),"conflicting annotation accepted");
+Console.WriteLine("LIST_APPEND_MERGE_TYPE_SMOKE_PASS positive=1 negative=1");

@@ -45,8 +45,14 @@ internal static class ListAppendFolding
             e is HCall c&&c.Method.Name=="get_Count"&&ReferenceEquals(c.Method.DeclaringType,g.Definition)&&
             Local(c.This,list.Variable)&&c.Arguments.Length==0;
         if(!CountRead(readCount))return false;
+        // A phi/merge local can lack its expression annotation after HIR
+        // cleanup. Its declared HVar type is authoritative; conflicting
+        // annotations are not accepted.
+        TypeSig? EffectiveType(HExpr e)=>e is HLocal l
+            ? (e.Type == null || e.Type.Key==l.Variable.Type.Key ? l.Variable.Type : null)
+            : e.Type;
         bool Integer(TypeSig? t)=>t is PrimitiveSig {Element:Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4};
-        bool Plain(HExpr e)=>Integer(e.Type) && (e switch
+        bool Plain(HExpr e)=>Integer(EffectiveType(e)) && (e switch
         {
             HConst {Value:int or long}=>true,
             HArg {Index:>=0}=>true,
@@ -70,7 +76,7 @@ internal static class ListAppendFolding
             resize.Method.Name!="AddWithResize"||!ReferenceEquals(resize.Method.DeclaringType,g.Definition)||
             resize.Method.IsStatic||!Local(resize.This,list.Variable)||resize.Arguments.Length!=1||
             !HirCleanup.Same(item,resize.Arguments[0])||
-            item is not (HArg or HLocal or HConst)||item.Type?.Key!=g.Arguments[0].Key||
+            item is not (HArg or HLocal or HConst)||EffectiveType(item)?.Key!=g.Arguments[0].Key||
             ConstructorFolding.Mentions(item,array.Variable)||ConstructorFolding.Mentions(item,count.Variable))
             return false;
         HStmt continuation;

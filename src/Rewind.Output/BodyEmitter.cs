@@ -725,6 +725,17 @@ public sealed class BodyEmitter
                     return;
                 case HField f:
                 {
+                    if (_model.Image.Arch == Rewind.Binary.CpuArch.Arm64 &&
+                        Environment.GetEnvironmentVariable("REWIND_NO_PUBLIC_COLOR32_OVERLAY") == null &&
+                        f.Object is { } color &&
+                        PublicOverlayRead.TryColor32(f.Field,color.Type,2*_model.Image.PointerSize,out FieldDef[] channels))
+                    {
+                        var snapshot=new VariableDefinition(Ref(color.Type));
+                        _body.Variables.Add(snapshot);
+                        Value(color);
+                        PublicOverlayRead.Emit(_il,snapshot,channels.Select(c=>_e.ImportField(_module,c)).ToArray());
+                        return;
+                    }
                     FieldReference field = _e.ImportField(_module, f.Field, f.DeclaringType);
                     if (f.Object == null)
                     {
