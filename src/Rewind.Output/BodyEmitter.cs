@@ -897,6 +897,15 @@ public sealed class BodyEmitter
                 HBinaryOp.SubOvf => OpCodes.Sub_Ovf, HBinaryOp.SubOvfUn => OpCodes.Sub_Ovf_Un, HBinaryOp.MulOvf => OpCodes.Mul_Ovf,
                 _ => OpCodes.Mul_Ovf_Un,
             });
+            // ARM64 scalar/vector FP32 arithmetic rounds at each instruction.
+            // A CLI runtime may retain excess precision on the evaluation
+            // stack (in particular Mono before widening an operand to R8).
+            // Preserve the native rounding boundary explicitly.
+            if (_model.Image.Arch == Rewind.Binary.CpuArch.Arm64 &&
+                b.Type is PrimitiveSig { Element: Il2CppTypeEnum.R4 } &&
+                b.Op is HBinaryOp.Add or HBinaryOp.Sub or HBinaryOp.Mul or HBinaryOp.Div or HBinaryOp.Rem &&
+                Environment.GetEnvironmentVariable("REWIND_NO_EXPLICIT_FP32_ROUNDING") == null)
+                _il.Emit(OpCodes.Conv_R4);
         }
 
         private void Compare(HCompare c)

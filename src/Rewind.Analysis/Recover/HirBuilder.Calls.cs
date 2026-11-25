@@ -2434,7 +2434,10 @@ public sealed partial class HirBuilder
                 // fmod is the IL "rem" instruction applied to floating point operands.
                 HExpr value = helper.MathName == "fmod" && operands.Length == 2
                     ? new HBinary(HBinaryOp.Rem, operands[0], operands[1]) { Type = type }
-                    : MathCall(helper.MathName, helper.IsDouble, operands);
+                    : helper.MathName == "Exp2" && operands.Length == 1
+                        ? MathCall("Pow", helper.IsDouble,
+                            new HConst(helper.IsDouble ? (object)2.0 : 2f, type), operands[0])
+                        : MathCall(helper.MathName, helper.IsDouble, operands);
                 FinishCall(call, value, helper.IsDouble ? ReturnKind.Double : ReturnKind.Float, type, tail);
                 return;
             }
