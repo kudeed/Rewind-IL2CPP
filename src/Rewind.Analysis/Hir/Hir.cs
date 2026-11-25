@@ -305,6 +305,8 @@ public sealed class HTryRegion
     public bool Finally;
 }
 
+public readonly record struct NativeCallObservation(ulong InstructionAddress, ulong TargetAddress, bool IsTail, bool NoReturn);
+
 public sealed class HMethod
 {
     public MethodDef Method = null!;
@@ -312,6 +314,8 @@ public sealed class HMethod
     public List<HBlock> Blocks = [];
     /// <summary>Things the recovery could not express faithfully; an empty list means a clean translation.</summary>
     public List<string> Problems = [];
+    /// <summary>Unidentified direct calls observed during HIR construction, before dead-code elimination.</summary>
+    public List<NativeCallObservation> UnidentifiedNativeCalls = [];
     /// <summary>
     /// Problems that are each reported together with the marker (HOpaque.Problem) standing in for what was not
     /// recovered. When no such marker is left in the finished method, the code that had the problem is no part

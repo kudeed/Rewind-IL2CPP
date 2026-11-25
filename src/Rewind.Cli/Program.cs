@@ -16,7 +16,7 @@ internal static class Program
           rewind info <input>                 show what the input is and whether it can be read
           rewind dump <input> [-o <dir>]      write dump.cs: every type and member with addresses and offsets
           rewind decompile <input> [-o <dir>] rebuild the .NET assemblies with recovered method bodies and write
-                                              C# source (assemblies/, src/, recovery-report.tsv)
+                                              C# source (assemblies/, src/, recovery-report.tsv, recovery-evidence.jsonl)
 
         <input> may be a game folder, the game's .exe, an APK / XAPK / APKS / AAB, an IPA,
         or the IL2CPP binary itself (GameAssembly.dll, libil2cpp.so, UnityFramework).

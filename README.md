@@ -142,10 +142,15 @@ Running `rewind` with no arguments prints the same list.
 | `assemblies/` | one .NET assembly per original assembly, with every type, member and attribute, and the method bodies Rewind recovered |
 | `src/<Assembly>/` | C# source, one file per top-level type |
 | `recovery-report.tsv` | every method that wasn't fully recovered, and the reason |
+| `recovery-evidence.jsonl` | one machine-readable row per selected method definition, including identity, body address, recovery status, diagnostics and native call observations |
 
 When Rewind can't fully work out part of a method, it doesn't guess. That part shows up as a call to
 `__Rewind.Opaque<T>("...")` or `__Rewind.Effect("...")`, and the method starts with a `__Rewind.Note("...")`
 that says what's missing. That way the gaps are easy to spot.
+
+The evidence ledger uses the original assembly-scoped metadata token and method index rather than a method name alone. A body RVA may differ from the definition address for shared generic bodies. Native ranges and their mapped-byte SHA-256 are reported only where a native function table supplies a range. `clean` means no reported recovery problem, not a verified equivalent implementation. Unidentified native call observations are collected during HIR construction; they need not survive optimization and do not constitute a complete call graph.
+
+The ARM64 helper shape smoke test (`dotnet run --project tests/Arm64CompareExchangeShapeSmoke -c Release`) exercises an outlined compare-exchange wrapper and both atomic implementation paths, including rejected instruction mutations. Set `REWIND_NO_ARM64_COMPARE_EXCHANGE=1` for an A/B run without this discovery rule.
 
 ## How it works
 

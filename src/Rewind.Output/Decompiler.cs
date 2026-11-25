@@ -65,6 +65,7 @@ public static partial class Decompiler
 
         var selected = new HashSet<AssemblyModel>(model.Assemblies.Where(a => options.Assemblies?.Invoke(a) ?? true));
         var report = new StringBuilder();
+        var evidence = new RecoveryEvidence(model, program, selected);
         // A row names the method in full: the assembly and the parameter types tell overloads and same-named types
         // in different assemblies apart, which "Type::Method" alone does not.
         static string Row(string kind, MethodDef method, string reason) =>
@@ -121,9 +122,14 @@ public static partial class Decompiler
                             if (generic.Problems.Count != 0)
                             {
                                 report.AppendLine(Row("generic, gaps", method, string.Join(" | ", generic.Problems.Distinct().Take(6))));
-                                if (!genericGaps) return;
+                                if (!genericGaps)
+                                {
+                                    evidence.Record(method, work[i].Shared!.Address, "generic_gaps_not_emitted", generic);
+                                    return;
+                                }
                             }
                             string? refused = bodies.Emit(method, generic);
+                            evidence.Record(method, work[i].Shared!.Address, refused != null ? "not_emitted" : generic.Problems.Count == 0 ? "clean" : "gaps", generic, refused);
                             if (refused != null) report.AppendLine(Row("generic, not emitted", method, refused));
                             else if (generic.Problems.Count == 0) result.GenericClean++;
                             else result.GenericWithGaps++;
@@ -131,6 +137,7 @@ public static partial class Decompiler
                         catch (Exception e)
                         {
                             report.AppendLine(Row("generic, failed", method, $"{e.GetType().Name}: {e.Message}"));
+                            evidence.Record(method, work[i].Shared!.Address, "failed", recovered.Recovered, $"{e.GetType().Name}: {e.Message}");
                         }
                         return;
                     }
@@ -141,6 +148,7 @@ public static partial class Decompiler
                         HMethod h = recovered.Recovered!;
                         result.Recovered++;
                         string? why = bodies.Emit(method, h);
+                        evidence.Record(method, method.Address, why != null ? "not_emitted" : h.Problems.Count == 0 ? "clean" : "gaps", h, why);
                         if (why != null)
                         {
                             result.NotEmitted++;
@@ -158,6 +166,7 @@ public static partial class Decompiler
                     {
                         result.Crashed++;
                         report.AppendLine(Row("failed", method, $"{e.GetType().Name}: {e.Message}"));
+                        evidence.Record(method, method.Address, "failed", recovered.Recovered, $"{e.GetType().Name}: {e.Message}");
                     }
                 });
             options.Log($"method bodies: {result.Methods} with native code, {result.Clean} recovered completely, {result.WithGaps} with gaps marked in the output, " +
@@ -175,6 +184,7 @@ public static partial class Decompiler
 
         Directory.CreateDirectory(options.OutputDirectory);
         File.WriteAllText(Path.Combine(options.OutputDirectory, "recovery-report.tsv"), report.ToString());
+        evidence.Write(options.OutputDirectory);
 
         if (options.WriteSource)
         {

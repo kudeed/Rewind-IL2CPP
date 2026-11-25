@@ -24,6 +24,17 @@ public static class HelperShapes
         {
             if (!NoArm64Thunks && AddArm64Thunks(model, context, helpers) is > 0 and var thunks)
                 found.Add($"{thunks} thunks of support functions");
+            if (Environment.GetEnvironmentVariable("REWIND_NO_ARM64_COMPARE_EXCHANGE") == null)
+            {
+                int atomics = 0;
+                foreach (ulong start in context.FunctionStarts)
+                {
+                    if (context.IsManaged(start) || helpers.At(start) != null || !Arm64CompareExchangeShape.Matches(model.Image, start)) continue;
+                    helpers.Add(start, new HelperInfo(HelperKind.InterlockedCompareExchange, 3, false, true, "ARM64 outlined compare-exchange (verified shape)"));
+                    atomics++;
+                }
+                if (atomics > 0) found.Add($"{atomics} outlined compare-exchange wrappers");
+            }
             if (!NoArm64Exceptions && AddArm64ExceptionStubs(model, context, helpers) is > 0 and var exceptions)
                 found.Add($"{exceptions} exception throwers");
             return found.Count == 0 ? null : "shapes:   found by their code: " + string.Join("; ", found);

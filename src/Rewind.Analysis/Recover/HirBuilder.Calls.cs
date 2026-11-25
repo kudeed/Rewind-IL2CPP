@@ -722,6 +722,7 @@ public sealed partial class HirBuilder
             if (Projections(call).TryGetValue(CallResult.IntReturn, out Node? held) && IsUsed(held)) _sem[held] = UsageSem(usage);
             return;
         }
+        _h.UnidentifiedNativeCalls.Add(new NativeCallObservation(call.Addr, info.Target, tail, info.NoReturn));
         Problem($"call to unidentified native function 0x{info.Target:X}");
         var args = new List<HExpr>();
         for (int i = 0; i < 4; i++)
