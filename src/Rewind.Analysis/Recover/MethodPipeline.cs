@@ -393,6 +393,16 @@ public sealed class MethodPipeline
             _normalizer.CanonicalizeSlots(fn);
             _normalizer.Cleanup(fn);
         }
+        if(classArgs.Length!=0||methodArgs.Length!=0)
+        {
+            _normalizer.FoldOwnMethodKlass(fn,abi);
+            _normalizer.Cleanup(fn);
+        }
+        if (_program.Model.Image.Arch == Rewind.Binary.CpuArch.Arm64 && IndexedBaseMerges.Run(fn))
+        {
+            _normalizer.Cleanup(fn);
+            normalization.ReceiverNotes.Add("indexed base merge split: exact incoming address load");
+        }
         CheckShape(fn, "class merges");
         if (Environment.GetEnvironmentVariable("REWIND_NO_WIDENED_CONSTANTS") == null) FoldWidenedConstants(fn);
         return new LiftedMethod
@@ -591,6 +601,7 @@ public sealed class MethodPipeline
         LibraryInternals.Run(result, _program);
         HiddenImplementations.Run(result, _program);
         BaseConstructorCalls.Run(result, this, _program);
+        MergedDelegateConstruction.Run(result);
         ConstructorFolding.MarkRawConstructors(result);
         InitializerOrder.Run(result);
         UnsetLocals.Run(result);

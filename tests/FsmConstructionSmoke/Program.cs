@@ -237,6 +237,45 @@ getter19[1]^=1;
 Check(!Arm64ChainedGetter.Matches(getter19,48,32,0x1000,_=>true),"wrong guard register");
 Console.WriteLine("V19_CHAIN_GETTER_SHAPE_PASS positive=1 negative=4");
 
+// Own MethodInfo klass offset and exact TBZ/TBNZ bit-zero shape.
+var mi22=new Node{Op=Op.Param,Type=VT.I64};
+var other22=new Node{Op=Op.Param,Type=VT.I64};
+Node C22(long x)=>new(){Op=Op.Const,Type=VT.I64,Imm=x};
+Node N22(Op op,params Node[] xs)=>new(){Op=op,Type=VT.I64,In=xs};
+Check(Normalizer.OwnMethodKlassLoad(N22(Op.Load,N22(Op.Add,mi22,C22(32))),mi22),"klass positive");
+Check(!Normalizer.OwnMethodKlassLoad(N22(Op.Load,N22(Op.Add,other22,C22(32))),mi22),"wrong info");
+Check(!Normalizer.OwnMethodKlassLoad(N22(Op.Load,N22(Op.Add,mi22,C22(40))),mi22),"wrong offset");
+Check(Normalizer.TryClassInitBranch(0x37000048,0x1000,out var slow22)&&slow22==0x1004,"tbnz");
+Check(Normalizer.TryClassInitBranch(0x36000048,0x1000,out slow22)&&slow22==0x1008,"tbz");
+Check(!Normalizer.TryClassInitBranch(0x36080048,0x1000,out slow22),"wrong bit");
+Check(!Normalizer.TryClassInitBranch(0xb4000048,0x1000,out slow22),"cbz rejected");
+Console.WriteLine("METHOD_KLASS_SHAPE_SMOKE_PASS positive=3 negative=4");
+
+// Exact same-base indexed-address merge: no other effect or pointer uses.
+static (Block B,Node Phi,Node Load,Node Shift,Dictionary<Node,List<Node>> Uses) IndexedFixture22(){
+ Node C(long n)=>new(){Op=Op.Const,Type=VT.I64,Imm=n};
+ Node N(Op op,params Node[] xs)=>new(){Op=op,Type=VT.I64,In=xs};
+ var b=new Block();b.Preds=[new Block(),new Block()];
+ var root=N(Op.Param);var sh=N(Op.Shl,N(Op.Param),C(3));var add=N(Op.Add,root,sh);
+ var phi=N(Op.Phi,root,add);phi.Block=b;b.Phis=[phi];
+ var addr=N(Op.Add,phi,C(32));addr.Block=b;var load=N(Op.Load,addr);load.Block=b;
+ b.Nodes=[addr,load,N(Op.Jump)];
+ return(b,phi,load,sh,new(){[phi]=[addr],[addr]=[load]});
+}
+var ix22=IndexedFixture22();Check(Rewind.Analysis.Passes.IndexedBaseMerges.Candidate(ix22.B,ix22.Phi,ix22.Uses),"indexed positive");
+var neg22=new Action<(Block B,Node Phi,Node Load,Node Shift,Dictionary<Node,List<Node>> Uses)>[]{
+ f=>f.Phi.In[0]=new Node{Op=Op.Param,Type=VT.I64},
+ f=>f.Shift.In[1].Imm=2,
+ f=>f.Uses[f.Phi].Add(new Node{Op=Op.Load,Type=VT.I64}),
+ f=>f.Load.Type=VT.I32,
+ f=>f.B.Scope=1,
+ f=>f.B.Nodes.Insert(0,new Node{Op=Op.Store,Type=VT.I64}),
+ f=>f.B.Preds.Add(new Block()),
+ f=>f.Load.In[0].In[1].Imm=24
+};
+foreach(var mutation in neg22){var fixture22=IndexedFixture22();mutation(fixture22);Check(!Rewind.Analysis.Passes.IndexedBaseMerges.Candidate(fixture22.B,fixture22.Phi,fixture22.Uses),"unsafe indexed merge accepted");}
+Console.WriteLine("INDEXED_BASE_SMOKE_PASS positive=1 negative="+neg22.Length);
+
 sealed class VectorImage:NativeImage{
  public override ImageFormat Format=>ImageFormat.Elf;
  public VectorImage(params uint[] words){
