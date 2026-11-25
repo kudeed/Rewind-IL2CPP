@@ -34,6 +34,12 @@ public sealed class DecompileOptions
     /// code has exactly the shape the C# compiler gives such a class; the class itself is always what ran.
     /// </summary>
     public bool StateMachines;
+    /// <summary>Keep compiler-generated local methods and closures as members.</summary>
+    public bool RawClosures;
+    /// <summary>Preserve explicit single-precision rounding in C# output.</summary>
+    public bool PreserveFloatBoundaries = true;
+    /// <summary>Optional exact top-level type filter for source-only export.</summary>
+    public HashSet<string>? SourceTypes;
     /// <summary>
     /// How many threads recover method bodies; zero for the default (REWIND_THREADS, else one per processor).
     /// What comes out is the same for any number.
@@ -273,10 +279,23 @@ public static partial class Decompiler
         return new CSharpDecompiler(module, resolver, settings);
     }
 
+    /// <summary>Export an already recovered assembly without rerunning native analysis.</summary>
+    public static DecompileResult ExportSource(string assemblyPath, string targetDirectory, DecompileOptions options)
+    {
+        var result = new DecompileResult();
+        string fullPath = Path.GetFullPath(assemblyPath);
+        WriteSource(fullPath, Path.GetDirectoryName(fullPath)!, targetDirectory, result, options);
+        return result;
+    }
+
     /// <summary>Decompiles one rebuilt assembly into one C# file per top-level type.</summary>
     private static void WriteSource(string assemblyPath, string assemblyDirectory, string targetDirectory, DecompileResult result, DecompileOptions options)
     {
         Action<string> log = options.Log;
+        using var sourceImage = new SourceFloatBoundaries(assemblyPath, options.PreserveFloatBoundaries);
+        assemblyPath = sourceImage.AssemblyPath;
+        if (sourceImage.Calls != 0)
+            log($"source precision: {sourceImage.Calls} explicit rounding boundaries in temporary {Path.GetFileName(assemblyPath)}");
         List<(string File, FullTypeName Name)> types = [];
         try
         {
@@ -288,7 +307,8 @@ public static partial class Decompiler
                 TypeDefinition definition = reader.GetTypeDefinition(handle);
                 if (!definition.GetDeclaringType().IsNil) continue; // nested types come with their parent
                 string name = reader.GetString(definition.Name), ns = reader.GetString(definition.Namespace);
-                if (name is "<Module>" or "__Rewind") continue;
+                if (name is "<Module>" or "__Rewind" || name == SourceFloatBoundaries.HelperName && ns.Length == 0) continue;
+                if (options.SourceTypes != null && !options.SourceTypes.Contains(ns.Length == 0 ? name : ns + "." + name)) continue;
                 string relative = Path.Combine(ns.Length == 0 ? "" : Path.Combine(ns.Split('.').Select(SafeName).ToArray()), SafeName(name));
                 string unique = relative;
                 for (int n = 2; !used.Add(unique); n++) unique = relative + "_" + n;
@@ -301,7 +321,10 @@ public static partial class Decompiler
             return;
         }
 
-        int errors = 0, iteratorsKept = 0, closuresKept = 0, markersUsed = 0;
+        if (options.SourceTypes != null && types.Count != options.SourceTypes.Count)
+            throw new InvalidDataException("one or more requested top-level source types were not found");
+        Directory.CreateDirectory(targetDirectory);
+        int errors = 0, iteratorsKept = 0, closuresKept = 0, markersUsed = 0, precisionUsed = 0;
         var work = new ConcurrentQueue<(string File, FullTypeName Name)>(types);
         int workers = Math.Max(1, Math.Min(Environment.ProcessorCount, 1 + types.Count / 64));
         var threads = new List<Thread>();
@@ -316,7 +339,7 @@ public static partial class Decompiler
                 CSharpFormattingOptions format = new DecompilerSettings(options.Language).CSharpFormattingOptions;
                 try
                 {
-                    decompiler = NewDecompiler(assemblyPath, assemblyDirectory, options.Language, options.StateMachines);
+                    decompiler = NewDecompiler(assemblyPath, assemblyDirectory, options.Language, options.StateMachines, closures: options.RawClosures);
                 }
                 catch (Exception e)
                 {
@@ -334,7 +357,7 @@ public static partial class Decompiler
                         // state machines as classes instead (see IteratorCheck).
                         if (!options.StateMachines && !NoIteratorCheck && IteratorCheck.HasStuckIterator(tree))
                         {
-                            machines ??= NewDecompiler(assemblyPath, assemblyDirectory, options.Language, stateMachines: true, iteratorsOnly: true);
+                            machines ??= NewDecompiler(assemblyPath, assemblyDirectory, options.Language, stateMachines: true, iteratorsOnly: true, closures: options.RawClosures);
                             tree = machines.DecompileType(item.Name);
                             machinesUsed = true;
                             Interlocked.Increment(ref iteratorsKept);
@@ -362,6 +385,8 @@ public static partial class Decompiler
                     SanitizeIdentifiers(ref text);
                     SourceCleanup(ref text);
                     if (text.Contains("__Rewind.", StringComparison.Ordinal)) Interlocked.Exchange(ref markersUsed, 1);
+                    if (sourceImage.Calls != 0 && text.Contains(SourceFloatBoundaries.HelperName, StringComparison.Ordinal))
+                        Interlocked.Exchange(ref precisionUsed, 1);
                     if (failed) Interlocked.Increment(ref errors);
                     string file = Path.Combine(targetDirectory, item.File);
                     Directory.CreateDirectory(Path.GetDirectoryName(file)!);
@@ -375,6 +400,7 @@ public static partial class Decompiler
         // The marker calls the written bodies make (__Rewind.Note, .Opaque, .Effect) name a type the body writer
         // adds to the rebuilt assembly; it is not written from the metadata, so the file that declares it is.
         if (markersUsed != 0) File.WriteAllText(Path.Combine(targetDirectory, "__Rewind.cs"), MarkerHelper);
+        if (precisionUsed != 0) File.WriteAllText(Path.Combine(targetDirectory, SourceFloatBoundaries.HelperName + ".cs"), SourceFloatBoundaries.HelperSource);
         if (iteratorsKept != 0)
             log($"note:     {iteratorsKept} types written with their iterators as state machine classes: the C# decompiler's \"yield return\" for them could not advance");
         if (closuresKept != 0)
