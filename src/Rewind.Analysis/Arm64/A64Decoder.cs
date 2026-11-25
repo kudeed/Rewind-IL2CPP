@@ -582,6 +582,21 @@ public static partial class A64Decoder
     private static bool ScalarFp(uint w, ref A64Instruction i)
     {
         uint ptype = Bits(w, 23, 22);
+        // Fixed-point integer to float: convert, then scale by 2^-fbits.
+        // The permitted power-of-two scaling stays in the normal FP32/64
+        // range for every nonzero integer, so it introduces no extra rounding.
+        if (!Bit(w, 21) && Bits(w, 30, 29) == 0 && Bits(w, 20, 19) == 0 &&
+            Bits(w, 18, 16) is 2 or 3 && ptype is 0 or 1)
+        {
+            i.Is64 = Bit(w, 31);
+            int fbits = 64 - (int)Bits(w, 15, 10);
+            if (fbits > (i.Is64 ? 64 : 32)) return false;
+            i.FpSize = FpSizeOf(ptype);
+            i.Op = Bits(w, 18, 16) == 2 ? A64Op.Scvtf : A64Op.Ucvtf;
+            i.Signed = i.Op == A64Op.Scvtf;
+            i.Amount = (byte)fbits;
+            return true;
+        }
         if (Bit(w, 21) && Bits(w, 15, 10) == 0 && Bits(w, 30, 29) == 0)
         {
             // conversion between floating point and integer
@@ -768,7 +783,13 @@ public static partial class A64Decoder
             int op = (int)Bits(w, 29, 29), cmode = (int)Bits(w, 15, 12);
             ulong imm8 = Bits(w, 18, 16) << 5 | Bits(w, 9, 5);
             bool isOrrBic = cmode < 12 && (cmode & 1) == 1;
-            if (isOrrBic) { i.Op = A64Op.Vector; return; }
+            if (isOrrBic)
+            {
+                if (ExpandSimdImmediate(op, cmode, imm8) is not ulong mask) return;
+                i.Op = op == 0 ? A64Op.VOrImm : A64Op.VBicImm;
+                i.Target = mask;
+                return;
+            }
             if (cmode == 15 && op == 1 && !q) return;
             ulong? value = ExpandSimdImmediate(op, cmode, imm8);
             if (value == null) return;

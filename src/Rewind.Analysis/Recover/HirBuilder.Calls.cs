@@ -1740,6 +1740,12 @@ public sealed partial class HirBuilder
                         // An instance method handed zero for its object: the code it shares never reads the
                         // object, and the C++ compiler, seeing that, did not keep which one it was. "null" here
                         // would throw where the program does not; what it was called on is not known.
+                        else if (CanRestoreUnusedReceiver(call, method, classArgs, methodArgs, isVirtual, alternatives, receiverOverride, shift))
+                        {
+                            thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                            _h.Notes.Add($"receiver-independent direct call at 0x{call.Addr:X} to 0x{method.Address:X}");
+                            break;
+                        }
                         else Problem(UnkeptReceiver);
                         thisExpr = new HConst(null, p.Type);
                     }
@@ -2209,6 +2215,33 @@ public sealed partial class HirBuilder
         if (!NoPInvokeChoices) ChosenCalls[call] = (method, _p.Abi.For(method, [], []), 0);
         FinishCall(call, new HCall { Method = method, Arguments = arguments, Type = returnType }, kind, returnType, tail);
         return true;
+    }
+
+    // The native receiver was optimized away. Substitute the current instance
+    // only for an unambiguous direct, nonvirtual, non-generic same-type call
+    // whose exact callee is proven to kill x0 on every entry path.
+    private readonly Dictionary<ulong, bool> _receiverProofs = [];
+    private bool CanRestoreUnusedReceiver(Node call, MethodDef method, TypeSig[] classArgs, TypeSig[] methodArgs,
+        bool isVirtual, List<MethodDef>? alternatives, Node? receiverOverride, int shift)
+    {
+        if (Environment.GetEnvironmentVariable("REWIND_NO_RECEIVER_PROOF") != null ||
+            _p.Model.Image.Arch != Rewind.Binary.CpuArch.Arm64 ||
+            _method.IsStatic || _method.IsConstructor || method.IsStatic || method.IsConstructor ||
+            method.IsVirtual || isVirtual || method.IsAbstract ||
+            !ReferenceEquals(method.DeclaringType, _method.DeclaringType) ||
+            method.DeclaringType.IsValueType || method.DeclaringType.IsGenericDefinition ||
+            method.IsGenericDefinition || _method.IsGenericDefinition ||
+            classArgs.Length != 0 || methodArgs.Length != 0 ||
+            alternatives is { Count: > 0 } || receiverOverride != null || shift != 0 ||
+            method.Address == 0 || call.Aux is not CallInfo { Indirect: false, Intrinsic: null } ci ||
+            ci.Target != method.Address ||
+            _p.RangeOf(method.Address) is not { } range) return false;
+        if (!_receiverProofs.TryGetValue(method.Address, out bool proved))
+        {
+            proved = Rewind.Analysis.Arm64.Arm64ReceiverProof.IsUnused(_p.Model.Image, range.Start, range.End);
+            _receiverProofs[method.Address] = proved;
+        }
+        return proved;
     }
 
     private static readonly bool NoPInvokeChoices = Environment.GetEnvironmentVariable("REWIND_NO_PINVOKE_CHOICES") != null;

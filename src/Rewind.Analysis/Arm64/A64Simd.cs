@@ -17,7 +17,8 @@ public enum VecKind : byte
     // by element: the second operand is element Amount of Rm
     MulElem, MlaElem, MlsElem, FMulElem, FMlaElem, FMlsElem,
     // shifts by an immediate (Amount)
-    Shl, Ushr, Sshr,
+    Shl, Ushr, Sshr, Ushl,
+    Rev64, FCmLtZero,
     /// <summary>Widening (Amount: shift): the low (or, with Q, high) half's elements to twice their size.</summary>
     Ushll, Sshll,
     /// <summary>Narrowing: elements of twice ElemSize cut to ElemSize, into the low (or, with Q, high) half.</summary>
@@ -92,6 +93,7 @@ public static partial class A64Decoder
                     (false, 0b01101) => VecKind.SMin,
                     (true, 0b01100) => VecKind.UMax,
                     (true, 0b01101) => VecKind.UMin,
+                    (true, 0b01000) => VecKind.Ushl,
                     (true, 0b00011) when size == 1 => VecKind.Bsl,
                     (true, 0b00011) when size == 2 => VecKind.Bit,
                     (true, 0b00011) when size == 3 => VecKind.Bif,
@@ -99,7 +101,7 @@ public static partial class A64Decoder
                 };
                 i.ElemSize = kind is VecKind.Bsl or VecKind.Bit or VecKind.Bif ? (byte)8 : ElemBytes(size);
                 if (scalar && size != 3) kind = VecKind.None;
-                if (!scalar && size == 3 && !q) kind = VecKind.None;
+                if (!scalar && size == 3 && !q && kind != VecKind.Bif) kind = VecKind.None;
             }
         }
         else if ((w & 0x9F3E0C00) == 0x0E200800 || (w & 0xDF3E0C00) == 0x5E200800)
@@ -110,6 +112,8 @@ public static partial class A64Decoder
             i.ElemSize = ElemBytes(size);
             switch (opcode)
             {
+                case 0b00000 when !u && !scalar && size < 3: kind = VecKind.Rev64; break;
+                case 0b01110 when !u && a: kind = VecKind.FCmLtZero; i.ElemSize = (byte)(sz ? 8 : 4); break;
                 case 0b01011: kind = u ? VecKind.Neg : VecKind.Abs; break;
                 case 0b00101 when u && size == 0 && !scalar: kind = VecKind.Not; break;
                 case 0b01001: kind = u ? VecKind.CmLeZero : VecKind.CmEqZero; break;

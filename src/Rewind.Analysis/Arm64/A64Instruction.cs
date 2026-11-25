@@ -68,6 +68,8 @@ public enum A64Op : byte
     /// <summary>General register Rd = element Imm of Vn, zero- or sign-extended.</summary>
     Umov, Smov,
     VAnd, VOrr, VEor, VBic,
+    /// <summary>Bitwise modified immediate, Target contains the expanded mask.</summary>
+    VOrImm, VBicImm,
     /// <summary>Element-wise float arithmetic on vectors (ElemSize 4 or 8).</summary>
     VFAdd, VFSub, VFMul, VFDiv,
     /// <summary>An element-wise or rearranging SIMD operation: Imm is its <see cref="VecKind"/>.</summary>

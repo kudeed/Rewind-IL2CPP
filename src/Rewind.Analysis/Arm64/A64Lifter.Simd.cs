@@ -235,6 +235,31 @@ public sealed partial class A64Lifter
                 SetElems(i.Rd, wide, widened);
                 return;
             }
+            case VecKind.Rev64:
+                // Reverse element order separately within each 64-bit half.
+                // Compute all elements before writing even when Rd == Rn.
+                int perHalf = 8 / bytes;
+                for (int k = 0; k < count; k++)
+                    result[k] = A((k / perHalf) * perHalf + perHalf - 1 - k % perHalf);
+                break;
+            case VecKind.FCmLtZero:
+                for (int k = 0; k < count; k++)
+                    result[k] = AllOnes(_b.Raw(Op.FCmpLt, VT.I1, F(A(k)), C(ft, 0)), t);
+                break;
+            case VecKind.Ushl:
+                for (int k = 0; k < count; k++)
+                {
+                    // USHL takes the signed LOW BYTE of each count. A shift
+                    // beyond the element width is zero, not a masked count.
+                    Node value = A(k), shift = _b.SExt(_b.Trunc(B(k), VT.I8), VT.I32);
+                    Node negative = _b.Cmp(Op.CmpLtS, shift, C(VT.I32, 0));
+                    Node magnitude = _b.Select(negative, _b.Neg(shift), shift);
+                    Node outside = _b.Cmp(Op.CmpLeU, C(VT.I32, bytes * 8), magnitude);
+                    Node safe = _b.Trunc(_b.And(magnitude, C(VT.I32, bytes * 8 - 1)), VT.I8);
+                    Node shifted = _b.Select(negative, _b.Shift(Op.ShrU, value, safe), _b.Shift(Op.Shl, value, safe));
+                    result[k] = _b.Select(outside, C(t, 0), shifted);
+                }
+                break;
             case VecKind.Xtn:
             {
                 int n = 8 / bytes;

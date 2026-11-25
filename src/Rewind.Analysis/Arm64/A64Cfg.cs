@@ -343,6 +343,6 @@ public sealed class A64Cfg
         or A64Op.FAbs or A64Op.FNeg or A64Op.FSqrt or A64Op.FCvt or A64Op.FRint or A64Op.FAdd or A64Op.FSub or A64Op.FMul or A64Op.FDiv
         or A64Op.FMax or A64Op.FMin or A64Op.FMaxNm or A64Op.FMinNm or A64Op.FNMul or A64Op.FMAdd or A64Op.FMSub or A64Op.FNMAdd or A64Op.FNMSub
         or A64Op.FCsel or A64Op.Scvtf or A64Op.Ucvtf or A64Op.Movi or A64Op.VMov or A64Op.Dup or A64Op.DupScalar or A64Op.DupGp or A64Op.Ins
-        or A64Op.InsGp or A64Op.VAnd or A64Op.VOrr or A64Op.VEor or A64Op.VBic or A64Op.VFAdd or A64Op.VFSub or A64Op.VFMul or A64Op.VFDiv or A64Op.Vector
+        or A64Op.InsGp or A64Op.VAnd or A64Op.VOrr or A64Op.VEor or A64Op.VBic or A64Op.VOrImm or A64Op.VBicImm or A64Op.VFAdd or A64Op.VFSub or A64Op.VFMul or A64Op.VFDiv or A64Op.Vector
         or A64Op.VecOp or A64Op.Ld1Lane or A64Op.Ld1R;
 }

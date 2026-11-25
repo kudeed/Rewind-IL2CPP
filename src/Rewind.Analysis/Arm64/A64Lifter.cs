@@ -1050,6 +1050,22 @@ public sealed partial class A64Lifter : IMachineLifter
                 SetR(i.Rd, i.Is64, _b.Shift(op, R(i.Rn, i.Is64), count));
                 return;
             }
+            case A64Op.Rev16 or A64Op.Rev32:
+            {
+                Node a = R(i.Rn, i.Is64);
+                long mask = unchecked((long)0x00FF00FF00FF00FFUL);
+                Node v = _b.Or(
+                    _b.Shift(Op.Shl, _b.And(a, C(t, mask)), C(VT.I8, 8)),
+                    _b.And(_b.Shift(Op.ShrU, a, C(VT.I8, 8)), C(t, mask)));
+                if (i.Op == A64Op.Rev32)
+                {
+                    long halves = unchecked((long)0x0000FFFF0000FFFFUL);
+                    v = _b.Or(_b.Shift(Op.Shl, _b.And(v, C(t, halves)), C(VT.I8, 16)),
+                        _b.And(_b.Shift(Op.ShrU, v, C(VT.I8, 16)), C(t, halves)));
+                }
+                SetR(i.Rd, i.Is64, v);
+                return;
+            }
             case A64Op.Rev:
                 SetR(i.Rd, i.Is64, _b.Raw(Op.Bswap, t, R(i.Rn, i.Is64)));
                 return;
@@ -1263,7 +1279,15 @@ public sealed partial class A64Lifter : IMachineLifter
             {
                 if (i.FpSize == 2) Unknown(i, i.Op + " (half)");
                 Node a = R(i.Rn, i.Is64);
-                SetFp(i.Rd, _b.Raw(i.Op == A64Op.Scvtf ? Op.SIntToF : Op.UIntToF, FpType(i.FpSize), a));
+                VT ft = FpType(i.FpSize);
+                Node converted = _b.Raw(i.Op == A64Op.Scvtf ? Op.SIntToF : Op.UIntToF, ft, a);
+                if (i.Amount != 0)
+                {
+                    double factor = Math.ScaleB(1.0, -i.Amount);
+                    long raw = ft == VT.F64 ? BitConverter.DoubleToInt64Bits(factor) : BitConverter.SingleToInt32Bits((float)factor);
+                    converted = _b.Raw(Op.FMul, ft, converted, C(ft, raw));
+                }
+                SetFp(i.Rd, converted);
                 return;
             }
             case A64Op.FCvtToInt:
@@ -1304,6 +1328,17 @@ public sealed partial class A64Lifter : IMachineLifter
                 bool q = (i.Imm2 & 1) != 0;
                 SetQword(i.Rd, 0, C(VT.I64, (long)pattern));
                 SetQword(i.Rd, 1, C(VT.I64, q ? (long)pattern : 0));
+                return;
+            }
+            case A64Op.VOrImm or A64Op.VBicImm:
+            {
+                bool q = (i.Imm2 & 1) != 0;
+                Node mask = C(VT.I64, unchecked((long)i.Target));
+                Node lo = Qword(i.Rd, 0), hi = q ? Qword(i.Rd, 1) : C(VT.I64, 0);
+                bool or = i.Op == A64Op.VOrImm;
+                Node Apply(Node value) => or ? _b.Or(value, mask) : _b.And(value, _b.Not(mask));
+                SetQword(i.Rd, 0, Apply(lo));
+                SetQword(i.Rd, 1, q ? Apply(hi) : hi);
                 return;
             }
             case A64Op.VMov:
