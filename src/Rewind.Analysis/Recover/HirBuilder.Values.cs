@@ -368,6 +368,14 @@ public sealed partial class HirBuilder
             return new SVal(field);
         }
 
+        // AArch64 passes small Nullable<float> values in integer registers.
+        // For a complete low-byte test, recover the public HasValue accessor
+        // only when its closed native body proves that exact field read.
+        if (n.Op == Op.And && n.Type == VT.I64 && n.In[1].IsConstValue(255) &&
+            Eval(n.In[0]) is SVal { Expr: { } optional } &&
+            NullableFlagValue(optional) is { } flag)
+            return new SVal(new HConv(HConvKind.U8, flag) { Type = _ulong });
+
         bool isShift = n.Op is Op.Shl or Op.ShrU or Op.ShrS;
         HExpr left = IntValue(n.In[0]), right = isShift ? ShiftCount(n.In[1], n.Type.Bits()) : IntValue(n.In[1]);
         // A shift takes its width from the value shifted: a 64-bit shift of what the program holds as a 32-bit
@@ -426,6 +434,39 @@ public sealed partial class HirBuilder
             if (left is HConst { Value: int or long } nothing && Convert.ToInt64(nothing.Value) == 0 && op is HBinaryOp.Or or HBinaryOp.Xor or HBinaryOp.Add && right is not HConst) return new SVal(right);
         }
         return new SVal(new HBinary(op, left, right) { Type = type });
+    }
+
+    private HCall? NullableFlagValue(HExpr value)
+    {
+        if (Environment.GetEnvironmentVariable("REWIND_NO_NULLABLE_FLAG_VALUE")!=null ||
+            _m.Image.Arch!=Rewind.Binary.CpuArch.Arm64 ||
+            value.Type is not GenericInstSig g ||
+            g.Definition.Assembly.Name!="mscorlib" ||
+            g.Definition.ReflectionName!="System.Nullable`1" ||
+            g.Arguments is not [PrimitiveSig {Element:Il2CppTypeEnum.R4}] ||
+            _p.Layouts.Of(g) is not {Known:true,Size:8} layout ||
+            layout.Fields.Length!=2 ||
+            !layout.Fields.Any(f=>f.Offset==0&&f.Size==1&&f.Field.Name=="hasValue"&&
+                f.Type is PrimitiveSig {Element:Il2CppTypeEnum.Boolean}) ||
+            !layout.Fields.Any(f=>f.Offset==4&&f.Size==4&&f.Field.Name=="value"&&
+                f.Type is PrimitiveSig {Element:Il2CppTypeEnum.R4})) return null;
+        var getters=g.Definition.Properties.Where(p=>p.Name=="HasValue"&&p.Getter!=null).Select(p=>p.Getter!).ToArray();
+        if(getters.Length!=1)return null;
+        var getter=getters[0];
+        if(getter.IsStatic||getter.IsVirtual||getter.Parameters.Length!=0||getter.GenericParameters.Length!=0||
+            (getter.Flags&MethodDef.AccessMask)!=6||getter.ReturnType is not PrimitiveSig{Element:Il2CppTypeEnum.Boolean})return null;
+        var insts=_p.InstsOf(getter).Where(i=>i.Address!=0&&i.MethodArguments.Length==0&&
+            i.ClassArguments.Length==1&&i.ClassArguments[0].Key==g.Arguments[0].Key).ToArray();
+        if(insts.Length==0||insts.Any(i=>!NullableFlagGetterCode(_m.Image,i.Address)))return null;
+        return new HCall{Method=getter,DeclaringType=g,This=value,Arguments=[],Type=_bool};
+    }
+
+    internal static bool NullableFlagGetterCode(Rewind.Binary.NativeImage image,ulong address)
+    {
+        // ldrb w0, [x0]; ret (no extra effects).
+        return address!=0&&image.Arch==Rewind.Binary.CpuArch.Arm64&&
+            image.SectionAt(address) is {IsExecutable:true} s&&address+8<=s.End&&
+            image.IsMapped(address,8)&&image.U32(address)==0x39400000&&image.U32(address+4)==0xd65f03c0;
     }
 
     private static readonly bool NoWholeStructTruncation = Environment.GetEnvironmentVariable("REWIND_NO_WHOLE_STRUCT_TRUNCATION") != null;

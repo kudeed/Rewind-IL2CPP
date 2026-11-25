@@ -27,6 +27,61 @@ internal static class VectorListValue
         }
         return n;
     }
+    internal static bool ValueOnlyLocal(HMethod method,SigFactory sigs,HVar variable)
+    {
+        if(!variable.Type.IsValueType||method.Problems.Count!=0||method.TryRegions.Count!=0)return false;
+        // All explicit address constructions, pointer/opaque uses and
+        // receiver calls are excluded. Substitution is required for a
+        // value argument of a generic method.
+        bool Mentions(HExpr? e)=>ConstructorFolding.Mentions(e,variable);
+        bool Argument(HExpr e,TypeSig type)
+        {
+            if(!Mentions(e))return true;
+            if(type is ByRefSig or PointerSig||type.ContainsGenericParameter)return false;
+            return Safe(e)&&(e.Type??(e as HLocal)?.Variable.Type)?.Key==type.Key;
+        }
+        bool Safe(HExpr? e)
+        {
+            if(!Mentions(e))return true;
+            switch(e)
+            {
+                case HLocal l:return l.Variable==variable&&(l.Type==null||l.Type.Key==variable.Type.Key);
+                case HField f:return f.Object is HLocal l2&&l2.Variable==variable&&!f.Field.IsStatic&&
+                    ReferenceEquals(f.Field.DeclaringType,variable.Type.Definition)&&f.Field.Type is PrimitiveSig{Element:Il2CppTypeEnum.R4};
+                case HCall c:
+                    if(Mentions(c.This)||c.Arguments.Length!=c.Method.Parameters.Length)return false;
+                    var cls=(c.DeclaringType as GenericInstSig)?.Arguments??[];
+                    return c.Arguments.Select((arg,i)=>Argument(arg,sigs.Substitute(c.Method.Parameters[i].Type,cls,c.MethodArguments))).All(x=>x);
+                case HNewObject n:
+                    if(n.Arguments.Length!=n.Constructor.Parameters.Length)return false;
+                    var cl=(n.DeclaringType as GenericInstSig)?.Arguments??[];
+                    return n.Arguments.Select((arg,i)=>Argument(arg,sigs.Substitute(n.Constructor.Parameters[i].Type,cl,[]))).All(x=>x);
+                // Pure scalar arithmetic on known components only.
+                case HBinary b:return b.Type is PrimitiveSig&&Safe(b.Left)&&Safe(b.Right);
+                case HUnary u:return u.Type is PrimitiveSig&&Safe(u.Operand);
+                case HCompare c:return Safe(c.Left)&&Safe(c.Right);
+                default:return false;
+            }
+        }
+        foreach(var b in method.Blocks)
+        foreach(var s in b.Statements)
+        {
+            if(!ConstructorFolding.Mentions(s,variable))continue;
+            bool ok=s switch
+            {
+                HAssign a=>Safe(a.Target)&&Safe(a.Value),
+                HEval e=>Safe(e.Expression),
+                HReturn r=>Safe(r.Value),
+                HBranch br=>Safe(br.Condition),
+                _=>false
+            };
+            // Array destinations containing the value local are never
+            // accepted; the item itself is on the assignment's RHS.
+            if(!ok)return false;
+        }
+        return true;
+    }
+
     internal static bool ConstructorShape(NativeImage image,MethodDef ctor,TypeSig? type)
     {
         if(image.Arch!=CpuArch.Arm64||Dimension(type,2*image.PointerSize) is not (2 or 3)||

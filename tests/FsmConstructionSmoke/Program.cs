@@ -182,6 +182,27 @@ var nan=Fixture(custom:vec.Sig);
 Check(!ListAppendFolding.TryFold(nan.h,sf,nan.block,native),"different NaN payload accepted");
 Console.WriteLine("VECTOR_LIST_SMOKE_PASS positive=3 negative=7");
 
+// A value local may carry a stale address-taken marker, but not any
+// remaining actual pointer or byref use. Validate the whole HIR use proof.
+static void SetCopy24((HMethod h,HBlock block,HBlock fast,HBlock slow,HVar arr,HVar n) f,HVar v)
+{
+ var item=new HLocal(v){Type=v.Type};
+ ((HAssign)f.fast.Statements[1]).Value=item;
+ ((HCall)((HEval)f.slow.Statements[0]).Expression).Arguments[0]=item;
+}
+var cp24=Fixture(custom:vec.Sig);var vv24=cp24.h.NewLocal(vec.Sig);vv24.AddressTaken=true;SetCopy24(cp24,vv24);
+cp24.block.Statements.Insert(0,new HAssign(L(vv24),new HArg(0){Type=vec.Sig}));
+Check(VectorListValue.ValueOnlyLocal(cp24.h,sf,vv24)&&ListAppendFolding.TryFold(cp24.h,sf,cp24.block,native),"value-only vector copy");
+var copyNeg24=new Action<(HMethod h,HBlock block,HBlock fast,HBlock slow,HVar arr,HVar n),HVar>[]{
+ (f,x)=>f.block.Statements.Insert(0,new HEval(new HAddressOf(L(x)))),
+ (f,x)=>f.block.Statements.Insert(0,new HEval(new HConv(HConvKind.I8,L(x)))),
+ (f,x)=>f.h.Problems.Add("opaque native operation"),
+ (f,x)=>f.block.Statements.Insert(0,new HEval(new HCall{Method=vc,This=L(x),Arguments=[new HConst(1f,ft),new HConst(2f,ft)]})),
+ (f,x)=>f.block.Statements.Insert(0,new HEval(new HCall{Method=new MethodDef{Name="Escape",DeclaringType=owner,ReturnType=v,Parameters=[new ParamDef{Type=sf.ByRef(vec.Sig)}]},Arguments=[L(x)]}))
+};
+foreach(var mut24 in copyNeg24){var f24=Fixture(custom:vec.Sig);var x24=f24.h.NewLocal(vec.Sig);x24.AddressTaken=true;SetCopy24(f24,x24);mut24(f24,x24);Check(!ListAppendFolding.TryFold(f24.h,sf,f24.block,native),"unsafe vector copy accepted");}
+Console.WriteLine("VECTOR_VALUE_COPY_SMOKE_PASS positive=1 negative="+copyNeg24.Length);
+
 // Independent branch/edge shape checks used before a native null guard is
 // discarded. These tests do not substitute for the full metadata/callee proof.
 var pointer=new Node{Op=Op.Load,Type=VT.I64};
@@ -320,6 +341,13 @@ var neg23=new Action<(Function Fn,Block Gate,Block Body,Node Call,Node Park,List
 };
 foreach(var mutate23 in neg23){var fixture23=TryPrefix23();mutate23(fixture23);var before23=fixture23.Body.Nodes.ToArray();Check(Rewind.Analysis.Passes.NativeTryPrefix.Run(fixture23.Fn,fixture23.Sites)==0&&fixture23.Body.Nodes.SequenceEqual(before23),"unsafe prefix accepted");}
 Console.WriteLine("NATIVE_TRY_PREFIX_SMOKE_PASS positive=1 negative="+neg23.Length);
+
+Check(HirBuilder.NullableFlagGetterCode(new VectorImage(0x39400000,0xd65f03c0),0x1000),"nullable getter");
+Check(!HirBuilder.NullableFlagGetterCode(new VectorImage(0x39400400,0xd65f03c0),0x1000),"wrong flag offset");
+Check(!HirBuilder.NullableFlagGetterCode(new VectorImage(0xb9400000,0xd65f03c0),0x1000),"wrong flag width");
+Check(!HirBuilder.NullableFlagGetterCode(new VectorImage(0x39400000,0xd61f0020),0x1000),"wrong getter exit");
+Check(!HirBuilder.NullableFlagGetterCode(new VectorImage(0x39400000),0x1000),"truncated getter");
+Console.WriteLine("NULLABLE_FLAG_GETTER_SMOKE_PASS positive=1 negative=4");
 
 sealed class VectorImage:NativeImage{
  public override ImageFormat Format=>ImageFormat.Elf;

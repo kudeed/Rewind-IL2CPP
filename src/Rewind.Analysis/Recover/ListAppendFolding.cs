@@ -61,6 +61,23 @@ internal static class ListAppendFolding
         bool Float(TypeSig? t)=>t is PrimitiveSig{Element:Il2CppTypeEnum.R4};
         bool Independent(HVar v)=>!v.AddressTaken&&!ReferenceEquals(v,array.Variable)&&
             !ReferenceEquals(v,count.Variable)&&!ReferenceEquals(v,list.Variable);
+        // A vector kept in a typed local may retain the old stack object's
+        // AddressTaken bit after the ABI reads were recovered as value
+        // operations. Only relax that bit for a direct vector copy, if all
+        // remaining uses are proven value uses (not a byref/address escape).
+        var copyProofs=new Dictionary<HVar,bool>();
+        bool CopyLocal(HVar v)
+        {
+            if(Independent(v))return true;
+            if(!vectorElement||!Vector(v.Type)||v==array.Variable||v==count.Variable||v==list.Variable||
+                Environment.GetEnvironmentVariable("REWIND_NO_VECTOR_VALUE_COPY")!=null)return false;
+            if(!copyProofs.TryGetValue(v,out bool safe))
+            {
+                safe=VectorListValue.ValueOnlyLocal(method,sigs,v);
+                copyProofs[v]=safe;
+            }
+            return safe;
+        }
         bool PlainVector(HExpr e,int depth=0)
         {
             if(!vectorElement||depth>16)return false;
@@ -69,7 +86,7 @@ internal static class ListAppendFolding
             return e switch
             {
                 HArg {Index:>=0}=>true,
-                HLocal l=>Independent(l.Variable),
+                HLocal l=>CopyLocal(l.Variable),
                 HConst {Value:float}=>Float(t),
                 HField {Object:HLocal l} f=>Float(t)&&Independent(l.Variable)&&Vector(l.Variable.Type)&&
                     ReferenceEquals(f.Field.DeclaringType,l.Variable.Type.Definition)&&!f.Field.IsStatic&&
