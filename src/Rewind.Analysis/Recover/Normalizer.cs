@@ -49,6 +49,7 @@ public sealed partial class Normalizer(ProgramAnalysis program)
         _slotValues.Clear();
         _lazyTargets.Clear();
         if (ExpandLookupTables()) ApplyReplacements();
+        FoldLateMetadataFlags();
         CanonicalizeSlotLoads();
         RemoveNoOpHelpers();
         RemoveInitFlagStores();

@@ -1470,8 +1470,36 @@ public sealed partial class HirBuilder
     /// of it: "a[i * 6 + k]" of an int array, the 6 folded into the scale (24). A smaller scale: the index was
     /// multiplied already ("i * 12", or "i &lt;&lt; 4"), by enough to make whole elements. Null otherwise.
     /// </summary>
+    // ARM64 combines signed 32-bit index arithmetic with element scaling:
+    // asr((uint64(x) << 32) + (c << 32), 32-log2(size)).
+    // Recover the exact modulo-2^32 addition before the sign extension,
+    // rather than dividing a raw address or treating it as a reference.
+    internal static bool TryPackedSignedIndex(Node n,long scale,long size,out Node value,out int delta)
+    {
+        value=null!;delta=0;
+        if(scale!=1||size is not(2 or 4 or 8 or 16)||
+           n is not{Op:Op.ShrS,Type:VT.I64,In.Length:2}||!n.In[1].IsConstValue(32-System.Numerics.BitOperations.Log2((uint)size))||
+           n.In[0] is not{Op:Op.Add,Type:VT.I64,In.Length:2} add)return false;
+        var a=add.In[0];var b=add.In[1];if(b.IsConst)(a,b)=(b,a);
+        if(!a.IsConst||(a.UImm&0xfffffffful)!=0||
+           b is not{Op:Op.Shl,Type:VT.I64,In.Length:2}||!b.In[1].IsConstValue(32))return false;
+        var x=StripExtension(b.In[0]);if(x.Type!=VT.I32)return false;
+        value=x;delta=unchecked((int)(a.UImm>>32));return true;
+    }
+
     private HExpr? ScaledIndex(Node index, long scale, long elementSize)
     {
+        if(Environment.GetEnvironmentVariable("REWIND_NO_PACKED_SIGNED_INDEX")==null&&
+           _m.Image.Arch==Rewind.Binary.CpuArch.Arm64&&TryPackedSignedIndex(index,scale,elementSize,out var packed,out int delta))
+        {
+            var v=IntValue(packed);
+            if(v.Type is PrimitiveSig{Element:Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4})
+            {
+                var signed=new HConv(HConvKind.I4,v){Type=_int};
+                return delta==0?signed:new HBinary(HBinaryOp.Add,signed,new HConst(delta,_int)){Type=_int};
+            }
+        }
+
         HExpr Times(HExpr e, long k) => k == 1 ? e : new HBinary(HBinaryOp.Mul, e, new HConst((int)k, _int)) { Type = _int };
         if (scale > elementSize && scale % elementSize == 0)
             return Times(IntValue(StripExtension(index)), scale / elementSize);

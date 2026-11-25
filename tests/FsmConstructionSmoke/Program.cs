@@ -349,6 +349,41 @@ Check(!HirBuilder.NullableFlagGetterCode(new VectorImage(0x39400000,0xd61f0020),
 Check(!HirBuilder.NullableFlagGetterCode(new VectorImage(0x39400000),0x1000),"truncated getter");
 Console.WriteLine("NULLABLE_FLAG_GETTER_SMOKE_PASS positive=1 negative=4");
 
+// Delayed constant folding may leave page+offset and trunc(1) in SSA.
+var flag25=N22(Op.Load,N22(Op.Add,C22(0x5502000),C22(0xa6d)));flag25.Type=VT.I8;
+var z25=N22(Op.ZExt,flag25);z25.Type=VT.I32;
+var cond25=N22(Op.CmpNe,z25,C22(0));cond25.Type=VT.I1;
+var one25=N22(Op.Trunc,C22(1));one25.Type=VT.I8;
+var store25=N22(Op.Store,N22(Op.Add,C22(0x5502000),C22(0xa6d)),one25);
+Check(Normalizer.FlagCondition(cond25,out var load25,out var truth25)&&load25==flag25&&truth25,"exact metadata branch");
+Check(Normalizer.FlagStore(store25,0x5502a6d),"late constant byte store");
+cond25.Op=Op.CmpEq;
+Check(Normalizer.FlagCondition(cond25,out load25,out truth25)&&load25==flag25&&!truth25,"inverted metadata branch");
+cond25.Op=Op.CmpLtU;Check(!Normalizer.FlagCondition(cond25,out _,out _),"nonzero test only");
+cond25.Op=Op.CmpNe;cond25.In[1]=C22(1);Check(!Normalizer.FlagCondition(cond25,out _,out _),"wrong comparison constant");
+cond25.In[1]=C22(0);flag25.Type=VT.I32;Check(!Normalizer.FlagCondition(cond25,out _,out _),"not byte");
+flag25.Type=VT.I8;Check(!Normalizer.FlagStore(store25,0x5502a6c),"different flag");
+one25.In[0]=C22(2);Check(!Normalizer.FlagStore(store25,0x5502a6d),"wrong store value");
+one25.In[0]=C22(1);one25.Type=VT.I32;Check(!Normalizer.FlagStore(store25,0x5502a6d),"wrong store width");
+one25.Type=VT.I8;store25.In[0]=N22(Op.Add,mi22,C22(0xa6d));Check(!Normalizer.FlagStore(store25,0x5502a6d),"unknown base");
+store25.In[0]=N22(Op.Mul,C22(2),C22(0x5502a6d));Check(!Normalizer.FlagStore(store25,0x5502a6d),"unsupported arithmetic");
+Console.WriteLine("LATE_METADATA_FLAG_SMOKE_PASS positive=3 negative=8");
+
+// Packed signed indexing must match an exact full-word shift/add/ASR
+// pattern, preserve 32-bit wrap, and not accept a differently scaled access.
+var x25=N22(Op.Param);x25.Type=VT.I32;
+var ext25=N22(Op.ZExt,x25);var sh25=N22(Op.Shl,ext25,C22(32));
+var add25=N22(Op.Add,C22(-4294967296),sh25);
+var asr25=N22(Op.ShrS,add25,C22(29));
+Check(HirBuilder.TryPackedSignedIndex(asr25,1,8,out var val25,out var delta25)&&val25==x25&&delta25==-1,"packed index");
+Check(!HirBuilder.TryPackedSignedIndex(asr25,2,8,out _,out _),"wrong scale");
+Check(!HirBuilder.TryPackedSignedIndex(asr25,1,4,out _,out _),"wrong size");
+asr25.Op=Op.ShrU;Check(!HirBuilder.TryPackedSignedIndex(asr25,1,8,out _,out _),"unsigned shift");
+asr25.Op=Op.ShrS;add25.In[0]=C22(-4294967295);Check(!HirBuilder.TryPackedSignedIndex(asr25,1,8,out _,out _),"low bits nonzero");
+add25.In[0]=C22(-4294967296);sh25.In[1]=C22(31);Check(!HirBuilder.TryPackedSignedIndex(asr25,1,8,out _,out _),"wrong upper shift");
+sh25.In[1]=C22(32);x25.Type=VT.I64;Check(!HirBuilder.TryPackedSignedIndex(asr25,1,8,out _,out _),"unproven width");
+Console.WriteLine("PACKED_INDEX_SMOKE_PASS positive=1 negative=6");
+
 sealed class VectorImage:NativeImage{
  public override ImageFormat Format=>ImageFormat.Elf;
  public VectorImage(params uint[] words){
