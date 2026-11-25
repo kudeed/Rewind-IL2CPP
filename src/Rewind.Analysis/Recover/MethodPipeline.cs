@@ -991,6 +991,7 @@ public sealed class MethodPipeline
         EnumeratorLoops.Run(result, _program);
         if (LateMoves.Run(result)) StructConstruction.Run(result);
         SwitchRanges.Run(result);
+        DelegateChoiceFolding.Run(result);
         return result;
     }
 

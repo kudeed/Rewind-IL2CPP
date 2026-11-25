@@ -19,12 +19,16 @@ internal sealed class SourceFloatBoundaries : IDisposable
         {
             [global::System.Runtime.CompilerServices.MethodImpl(global::System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
             internal static float Round(float value) { return (float)value; }
+            // Unary negation is not subtraction from +0: signed zero differs.
+            [global::System.Runtime.CompilerServices.MethodImpl(global::System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+            internal static float Negate(float value) { return -value; }
         }
         """ + "\n";
 
     private string? _tempDirectory;
     public string AssemblyPath { get; private set; }
     public int Calls { get; private set; }
+    public int Negations { get; private set; }
 
     public SourceFloatBoundaries(string path, bool enabled)
     {
@@ -63,6 +67,16 @@ internal sealed class SourceFloatBoundaries : IDisposable
         il.Emit(OpCodes.Ldarg_0);
         il.Emit(OpCodes.Conv_R4);
         il.Emit(OpCodes.Ret);
+        var negate = new MethodDefinition("Negate",
+            MethodAttributes.Assembly | MethodAttributes.Static | MethodAttributes.HideBySig,
+            module.TypeSystem.Single);
+        negate.ImplAttributes |= MethodImplAttributes.NoInlining;
+        negate.Parameters.Add(new ParameterDefinition("value", ParameterAttributes.None, module.TypeSystem.Single));
+        holder.Methods.Add(negate);
+        var nil = negate.Body.GetILProcessor();
+        nil.Emit(OpCodes.Ldarg_0);
+        nil.Emit(OpCodes.Neg);
+        nil.Emit(OpCodes.Ret);
         foreach (var (m, instructions) in sites)
         {
             // Widen short branches before increasing instruction lengths.
@@ -71,8 +85,29 @@ internal sealed class SourceFloatBoundaries : IDisposable
             // conversion's fallthrough edge, with identical stack height.
             m.Body.SimplifyMacros();
             var p = m.Body.GetILProcessor();
+            // Only a neg immediately after conv.r4, with no alternate entry,
+            // has the necessary proven stack type. Leave all other negs alone.
+            var targets = m.Body.Instructions.SelectMany(i => i.Operand switch
+            {
+                Instruction target => new[] { target },
+                Instruction[] many => many,
+                _ => Array.Empty<Instruction>()
+            }).ToHashSet();
+            foreach (var handler in m.Body.ExceptionHandlers)
+            {
+                targets.Add(handler.TryStart);
+                targets.Add(handler.HandlerStart);
+                if (handler.FilterStart != null) targets.Add(handler.FilterStart);
+            }
             foreach (Instruction i in instructions)
             {
+                if (Environment.GetEnvironmentVariable("REWIND_NO_SOURCE_NEGATION") == null &&
+                    i.Next is { OpCode.Code: Code.Neg } n && !targets.Contains(n))
+                {
+                    n.OpCode = OpCodes.Call;
+                    n.Operand = negate;
+                    Negations++;
+                }
                 p.InsertAfter(i, Instruction.Create(OpCodes.Call, round));
                 Calls++;
             }

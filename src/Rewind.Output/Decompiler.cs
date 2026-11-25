@@ -263,6 +263,9 @@ public static partial class Decompiler
             ThrowOnAssemblyResolveErrors = false,
             // Compiler-generated members are part of what was compiled; keep the names as they are.
             ShowXmlDocumentation = false,
+            // Keep explicit delegate constructions; a method-group cast can
+            // be ill-typed on C# 9 and may introduce caching on newer compilers.
+            UseImplicitMethodGroupConversion = false,
         };
         if (stateMachines)
         {
@@ -295,7 +298,7 @@ public static partial class Decompiler
         using var sourceImage = new SourceFloatBoundaries(assemblyPath, options.PreserveFloatBoundaries);
         assemblyPath = sourceImage.AssemblyPath;
         if (sourceImage.Calls != 0)
-            log($"source precision: {sourceImage.Calls} explicit rounding boundaries in temporary {Path.GetFileName(assemblyPath)}");
+            log($"source precision: {sourceImage.Calls} explicit rounding boundaries, {sourceImage.Negations} typed negations in temporary {Path.GetFileName(assemblyPath)}");
         List<(string File, FullTypeName Name)> types = [];
         try
         {

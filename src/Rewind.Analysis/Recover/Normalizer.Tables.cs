@@ -45,6 +45,20 @@ public sealed partial class Normalizer
                     changed = true;
                     continue;
                 }
+                if (size == 8 && Environment.GetEnvironmentVariable("REWIND_NO_METHOD_SLOT_TABLES") == null &&
+                    compared.Type.Bits() is >= 8 and <= 32 &&
+                    LiteralLookupTable.TryRead(program.Model.Image, table, (int)last + 1,
+                        slot => program.Model.ResolveUsageSlot(slot) is { Kind: Rewind.Model.UsageKind.MethodDef, Method: { IsStatic: true, IsAbstract: false } m } &&
+                            m.Address != 0 && m.GenericParameters.Length == 0 && m.DeclaringType.GenericParameters.Length == 0,
+                        out ulong[] methodEntries))
+                {
+                    int position = i;
+                    _replace[load] = LiteralLookupTable.BuildChoice(_fn, b, ref position, compared, methodEntries, load.Addr);
+                    load.Dead = true;
+                    i = position;
+                    changed = true;
+                    continue;
+                }
                 var entries = new long[last + 1];
                 if (!ReadTable(table, size, entries)) continue;
 
