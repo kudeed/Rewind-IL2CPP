@@ -804,6 +804,14 @@ public sealed partial class HirBuilder
             if (s is SPair or SParts) s = new SVal(Value(inner));
             if (s is not SVal v) return s;
             HExpr e = v.Expr;
+            // A merge local's storage can be 64-bit even when the
+            // expression view has no annotation. The native Trunc node is
+            // explicit proof that the low 32 bits, not the full local, are used.
+            if (Environment.GetEnvironmentVariable("REWIND_NO_TYPED_TRUNC_LOCAL")==null &&
+                to==32 && inner.Type==VT.I64 && e is HLocal l &&
+                l.Variable.Type is PrimitiveSig {Element:Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8} &&
+                (e.Type==null || e.Type is PrimitiveSig {Element:Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4 or Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8}))
+                return new SVal(new HConv(HConvKind.I4,e){Type=_int});
             int known = BitsOf(e.Type);
             // Already no wider than the target: the truncation only drops undefined upper register bits.
             if (known != 0 && known <= to) return v;
