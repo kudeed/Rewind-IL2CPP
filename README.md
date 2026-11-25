@@ -437,3 +437,14 @@ restrictions. Do not apply this to arbitrary values or calls. Disable this
 extension with REWIND_NO_I32_UNUSED_RECEIVER=1. Arm64ReceiverProofSmoke includes
 one accepted and three rejected cold/warm metadata-prologue cases in addition
 to the original receiver and metadata argument tests.
+
+### Repeated direct boolean call with an unused receiver
+
+Accept the stale boolean result as an unused instance receiver only for the
+exact native sequence BL target / TBZ or TBNZ bit 0 of w0 / BL same target,
+where the test skips the second call on its taken edge. Require a parameterless
+boolean-returning exact same-owner direct call and the existing receiver proof.
+A recognized argumentless ThrowNullReference helper may terminate a proof
+path; no arbitrary call or inferred throw is accepted. Disable this extension
+with REWIND_NO_BOOL_UNUSED_RECEIVER=1. Synthetic tests cover one accepted and
+five rejected repeat shapes, and one accepted and three rejected throw paths.

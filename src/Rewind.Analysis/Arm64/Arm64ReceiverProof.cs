@@ -10,7 +10,22 @@ namespace Rewind.Analysis.Arm64;
 /// </summary>
 public static class Arm64ReceiverProof
 {
-    public static bool IsUnused(NativeImage image, ulong start, ulong end, byte register = 0, Func<ulong,bool>? unaryMetadataCall = null)
+    // Exact repeated direct call with a bit-zero test on its boolean return.
+    // The second call's incoming x0 is the first call's result, not this.
+    public static bool RepeatedBooleanCall(NativeImage image, ulong pc, ulong target)
+    {
+        if(image.Arch!=CpuArch.Arm64||pc<8||!image.IsMapped(pc-8,12)||
+           image.SectionAt(pc-8) is not {IsExecutable:true} section||pc+4>section.End)return false;
+        uint word=image.U32(pc-4);
+        if((word&0xfff8001fu) is not (0x36000000u or 0x37000000u))return false;
+        var first=A64Decoder.Decode(image.U32(pc-8),pc-8);
+        var test=A64Decoder.Decode(word,pc-4);
+        var second=A64Decoder.Decode(image.U32(pc),pc);
+        return first.Op==A64Op.Bl&&first.Target==target&&second.Op==A64Op.Bl&&second.Target==target&&
+            test.Op is A64Op.Tbz or A64Op.Tbnz&&test.Target>=pc+4&&test.Target<section.End;
+    }
+
+    public static bool IsUnused(NativeImage image, ulong start, ulong end, byte register = 0, Func<ulong,bool>? unaryMetadataCall = null, Func<ulong,bool>? arglessThrow = null)
     {
         if (register > 7 || image.Arch != CpuArch.Arm64 || start >= end || (start & 3) != 0 || (end & 3) != 0 ||
             image.SectionAt(start) is not { IsExecutable: true } section || end > section.End) return false;
@@ -55,6 +70,9 @@ public static class Arm64ReceiverProof
                 case A64Op.LdrLit:
                     kill = !i.Vector && i.Rd == register; break;
                 case A64Op.Bl:
+                    // An exactly identified argumentless nonreturning throw
+                    // consumes no incoming register and ends this path.
+                    if(arglessThrow!=null&&arglessThrow(i.Target))continue;
                     // For a separately proven unary metadata service only, continue
                     // until the incoming argument register is explicitly overwritten.
                     // Do not rely on caller-saved registers being clobbered.

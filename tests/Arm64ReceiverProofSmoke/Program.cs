@@ -43,6 +43,27 @@ foreach(var c in warmCold){
  if(actual!=c.Expected){Console.Error.WriteLine(c.Name+": "+actual+" expected "+c.Expected);failed++;}
 }
 Console.WriteLine($"INT32_RECEIVER_ENTRY_SMOKE positive={warmCold.Count(c=>c.Expected)} negative={warmCold.Count(c=>!c.Expected)} failed={failed}");
+var throwCases=new (string Name,bool Expected,uint[] Words,bool KnownThrow)[]{
+ ("argless throw or explicit overwrite",true,new[]{0xB4000061u,Kill,Ret,0x94000002u},true),
+ ("unknown call or explicit overwrite",false,new[]{0xB4000061u,Kill,Ret,0x94000002u},false),
+ ("observed receiver before throw",false,new[]{0xAA0003E1u,0x94000004u},true),
+ ("normal return without overwrite",false,new[]{0xB4000061u,Kill,Ret,Ret},true),
+};
+foreach(var c in throwCases){
+ var im=new CodeImage(c.Words);bool actual=Arm64ReceiverProof.IsUnused(im,0x1000,0x1000+(ulong)c.Words.Length*4,arglessThrow:a=>c.KnownThrow&&a==0x1014);
+ if(actual!=c.Expected){Console.Error.WriteLine(c.Name+": "+actual+" expected "+c.Expected);failed++;}
+}
+Console.WriteLine($"BOOL_RECEIVER_THROW_SMOKE positive={throwCases.Count(c=>c.Expected)} negative={throwCases.Count(c=>!c.Expected)} failed={failed}");
+uint[] repeatBool=[0x94000006u,0x36000040u,0x94000004u,Ret,Ret,Ret,Kill,Ret];
+var repeated=new CodeImage(repeatBool);
+if(!Arm64ReceiverProof.RepeatedBooleanCall(repeated,0x1008,0x1018))failed++;
+foreach(int index in new[]{0,1,2}){
+ var wrong=repeatBool.ToArray();wrong[index]^=1;
+ if(Arm64ReceiverProof.RepeatedBooleanCall(new CodeImage(wrong),0x1008,0x1018))failed++;
+}
+if(Arm64ReceiverProof.RepeatedBooleanCall(repeated,0x1008,0x101c)||
+   Arm64ReceiverProof.RepeatedBooleanCall(repeated,0x1004,0x1018))failed++;
+Console.WriteLine($"BOOL_REPEAT_CALL_SMOKE positive=1 negative=5 failed={failed}");
 var argCases=new (string Name,bool Expected,uint[] Words,bool KnownCall)[]{
  ("x2 direct kill",true,new[]{0xAA1F03E2u,Ret},false),
  ("x2 kill after proven unary metadata helper",true,new[]{0x94000004u,0xAA1F03E2u,Ret},true),

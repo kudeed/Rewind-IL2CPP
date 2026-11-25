@@ -1771,6 +1771,16 @@ public sealed partial class HirBuilder
                         thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
                         _h.Notes.Add($"receiver-independent int32 scalar at 0x{call.Addr:X} to 0x{method.Address:X}");
                     }
+                    else if (Environment.GetEnvironmentVariable("REWIND_NO_BOOL_UNUSED_RECEIVER") == null &&
+                             Eval(node) is SVal { Expr: { } staleBool } &&
+                             (staleBool.Type ?? (staleBool as HLocal)?.Variable.Type) is PrimitiveSig { Element: Il2CppTypeEnum.Boolean } &&
+                             method.Parameters.Length==0 && method.ReturnType is PrimitiveSig { Element: Il2CppTypeEnum.Boolean } &&
+                             Rewind.Analysis.Arm64.Arm64ReceiverProof.RepeatedBooleanCall(_p.Model.Image,call.Addr,method.Address) &&
+                             CanRestoreUnusedReceiver(call, method, classArgs, methodArgs, isVirtual, alternatives, receiverOverride, shift, allowArglessThrow:true))
+                    {
+                        thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                        _h.Notes.Add($"receiver-independent bool scalar at 0x{call.Addr:X} to 0x{method.Address:X}");
+                    }
                     else
                     {
                         thisExpr = Value(node);
@@ -2248,9 +2258,9 @@ public sealed partial class HirBuilder
     // The native receiver was optimized away. Substitute the current instance
     // only for an unambiguous direct, nonvirtual, non-generic same-type call
     // whose exact callee is proven to kill x0 on every entry path.
-    private readonly Dictionary<ulong, bool> _receiverProofs = [];
+    private readonly Dictionary<(ulong,bool), bool> _receiverProofs = [];
     private bool CanRestoreUnusedReceiver(Node call, MethodDef method, TypeSig[] classArgs, TypeSig[] methodArgs,
-        bool isVirtual, List<MethodDef>? alternatives, Node? receiverOverride, int shift)
+        bool isVirtual, List<MethodDef>? alternatives, Node? receiverOverride, int shift, bool allowArglessThrow=false)
     {
         if (Environment.GetEnvironmentVariable("REWIND_NO_RECEIVER_PROOF") != null ||
             _p.Model.Image.Arch != Rewind.Binary.CpuArch.Arm64 ||
@@ -2264,10 +2274,11 @@ public sealed partial class HirBuilder
             method.Address == 0 || call.Aux is not CallInfo { Indirect: false, Intrinsic: null } ci ||
             ci.Target != method.Address ||
             _p.RangeOf(method.Address) is not { } range) return false;
-        if (!_receiverProofs.TryGetValue(method.Address, out bool proved))
+        if (!_receiverProofs.TryGetValue((method.Address,allowArglessThrow), out bool proved))
         {
-            proved = Rewind.Analysis.Arm64.Arm64ReceiverProof.IsUnused(_p.Model.Image, range.Start, range.End);
-            _receiverProofs[method.Address] = proved;
+            proved = Rewind.Analysis.Arm64.Arm64ReceiverProof.IsUnused(_p.Model.Image, range.Start, range.End,
+                arglessThrow:allowArglessThrow ? target => _p.Helpers.KindAt(target)==HelperKind.ThrowNullReference : null);
+            _receiverProofs[(method.Address,allowArglessThrow)] = proved;
         }
         return proved;
     }
