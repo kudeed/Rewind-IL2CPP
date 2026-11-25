@@ -28,6 +28,9 @@ public static partial class Decompiler
         text = Regex.Replace(text, @"(\w+)\.<(\w+)>k__BackingField\.(\w+)\s*=\s*([^;]+);",
             m => "{ var __b = " + m.Groups[1].Value + "." + m.Groups[2].Value + "; __b." + m.Groups[3].Value + " = " + m.Groups[4].Value + "; " + m.Groups[1].Value + "." + m.Groups[2].Value + " = __b; }");
         text = Regex.Replace(text, @"\.<(\w+)>k__BackingField", m => "." + m.Groups[1].Value);
+        // The same field named without a receiver: its declaration ("double? <P>k__BackingField;") and the
+        // reads and writes inside the property itself. A bare "<...>" is not a C# identifier.
+        text = Regex.Replace(text, @"<(\w+)>k__BackingField", m => m.Groups[1].Value + "BackingField");
         // Collection and object initializers written with the "in" argument modifier ("{ in item }") are not C#.
         text = Regex.Replace(text, @"\{(\s*)in[ \t]+", m => "{" + m.Groups[1].Value);
         text = Regex.Replace(text, @"(?m)^([ \t]*)in[ \t]+", m => m.Groups[1].Value);

@@ -322,6 +322,19 @@ public static partial class Decompiler
         // Opaque placeholders for __frame/__rgctx used as LHS of assignment collapsed to 0; drop those lines.
         text = Regex.Replace(text, @"(?m)^\s*0\s*=\s*\(nint\)__Rewind\.Opaque[^\n]*;\s*\r?\n?", "", RegexOptions.Multiline);
 
+        // UnityEngine's static members are named with the "Vector" suffix in metadata and without it in C#.
+        text = text.Replace("Quaternion.identityQuaternion", "Quaternion.identity");
+        text = Regex.Replace(text, @"\b(Vector[234])\.(down|up|left|right|forward|back|zero|one)Vector\b", "$1.$2");
+
+        // Internal_* math calls take their public call's arguments by reference; the helper forwards them.
+        text = Regex.Replace(text, @"\bVector3\.Internal_Slerp\(", "__Rewind.Slerp(");
+        text = Regex.Replace(text, @"\bVector3\.Internal_RotateTowards\(", "__Rewind.RotateTowards(");
+        text = Regex.Replace(text, @"\bGeometryUtility\.Internal_TestPlanesAABB\(", "__Rewind.TestPlanesAABB(");
+        text = Regex.Replace(text, @"\bMatrix4x4\.Internal_TRS\(", "__Rewind.TRS(");
+        text = Regex.Replace(text, @"\bMatrix4x4\.Internal_Inverse\(", "__Rewind.Inverse(");
+        text = Regex.Replace(text, @"\bQuaternion\.Internal_(Slerp|Lerp|AngleAxis|FromToRotation|Inverse|LookRotation)\(", "__Rewind.$1(");
+        text = Regex.Replace(text, @"\bVector3\.Internal_(Normalize|Cross|Project|ProjectOnPlane|RotateTowards|Slerp)\(", "__Rewind.$1(");
+
     }
 
     /// <summary>
