@@ -69,6 +69,7 @@ public sealed partial class Normalizer(ProgramAnalysis program)
             changed |= CollapseDelegateGuards();
             changed |= CollapsePInvokeTargets();
         }
+        RestoreArrayArgumentReceivers();
         return _result;
     }
 

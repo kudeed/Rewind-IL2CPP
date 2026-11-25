@@ -19,7 +19,7 @@ public sealed partial class Normalizer
         return value?.Type==VT.I64?value:null;
     }
 
-    internal static Node? FirstDirectCall(Block guard,Block continuation)
+    internal static Node? FirstDirectCall(Block guard,Block continuation,Node? stackPointer=null)
     {
         if(guard.Scope!=-1||continuation.Scope!=-1||continuation==guard||
             continuation.Preds.Count!=1||continuation.Preds[0]!=guard)return null;
@@ -30,9 +30,25 @@ public sealed partial class Normalizer
                 return n.Aux is CallInfo {Indirect:false,Intrinsic:null,NoReturn:false}?n:null;
             // No intervening effects: don't move the original null check
             // past another call, load, write or control transfer.
-            if(n.IsEffect)return null;
+            if(n.IsEffect)
+            {
+                // The native tail-call epilogue may restore saved registers.
+                // Only fixed 8-byte loads inside the existing stack frame are
+                // allowed; never move the guard past a heap access or a call.
+                if(continuation.Terminator?.Op!=Op.TailCall || !IsFixedStackRestore(n,stackPointer))return null;
+            }
         }
         return null;
+    }
+
+    internal static bool IsFixedStackRestore(Node n,Node? sp)
+    {
+        if(sp==null||n.Op!=Op.Load||n.Type!=VT.I64||n.In.Length!=1||n.In[0] is not {Op:Op.Add} a||
+            a.In.Length!=2)return false;
+        Node? offset=ReferenceEquals(a.In[0],sp)?a.In[1]:ReferenceEquals(a.In[1],sp)?a.In[0]:null;
+        if(offset?.IsConst!=true)return false;
+        long v=IrBuilder.SImm(offset);
+        return v is >= -4096 and <= -8 && v%8==0;
     }
 
     private void RestoreGuardedReceiver(Block guard,Block continuation,Node condition,int side)
@@ -41,7 +57,7 @@ public sealed partial class Normalizer
             program.Model.Image.Arch!=CpuArch.Arm64||_fn.TryRegions.Count!=0||
             NullGuardValue(condition,side) is not { Op:Op.Load,Type:VT.I64 } checkedObject||
             checkedObject.Block!=guard||
-            FirstDirectCall(guard,continuation) is not {Aux:CallInfo ci} call)
+            FirstDirectCall(guard,continuation,_fn.Params.GetValueOrDefault(_fn.Regs.StackPointer)) is not {Aux:CallInfo ci} call)
             return;
 
         // A static reference field is Load(Load(Klass+static_fields)+offset).

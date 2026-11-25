@@ -201,6 +201,42 @@ next.Nodes.Insert(0,new Node{Op=Op.Store});Check(Normalizer.FirstDirectCall(guar
 next.Scope=0;Check(Normalizer.FirstDirectCall(guard,next)==null,"exception scope");
 Console.WriteLine("GUARDED_RECEIVER_SHAPE_PASS positive=3 negative=7");
 
+// Receiver proof checks: no arbitrary heap reads, writes or unaligned stack locations.
+var sp=new Node{Op=Op.Param,Type=VT.I64};
+Node Const19(long n)=>new(){Op=Op.Const,Type=VT.I64,Imm=n};
+Node Add19(Node a,Node b)=>new(){Op=Op.Add,Type=VT.I64,In=[a,b]};
+Node Load19(Node a,VT t=VT.I64)=>new(){Op=Op.Load,Type=t,In=[a]};
+var restore=Load19(Add19(sp,Const19(-16)));
+var guard19=new Block();var tail19=new Block{Preds=[guard19]};
+var tailCall19=new Node{Op=Op.TailCall,Aux=new CallInfo{Target=0x1000}};
+tail19.Nodes=[restore,tailCall19];
+Check(Normalizer.FirstDirectCall(guard19,tail19,sp)==tailCall19,"tail restore");
+tail19.Nodes[0]=Load19(Add19(sp,Const19(-9)));
+Check(Normalizer.FirstDirectCall(guard19,tail19,sp)==null,"unaligned stack read");
+tail19.Nodes[0]=Load19(Add19(pointer,Const19(-16)));
+Check(Normalizer.FirstDirectCall(guard19,tail19,sp)==null,"heap load");
+tail19.Nodes[0]=restore;tail19.Nodes[1]=direct;
+Check(Normalizer.FirstDirectCall(guard19,tail19,sp)==null,"non-tail restore");
+var own19=Load19(Add19(pointer,Const19(32)));
+var arr19=Load19(Add19(own19,Const19(120)));
+var index19=new Node{Op=Op.Shl,Type=VT.I64,In=[zero,Const19(2)]};
+var element19=Load19(Add19(Add19(arr19,index19),Const19(32)),VT.I32);
+Check(Normalizer.ArrayArgumentOwner(element19,32,out var ar19,out var off19)==own19&&ar19==arr19&&off19==120,"array origin");
+Check(Normalizer.IsThisFieldValue(own19,pointer,32),"owner field");
+Check(!Normalizer.IsThisFieldValue(own19,pointer,40),"wrong owner offset");
+Check(Normalizer.ArrayArgumentOwner(element19,24,out _,out _)==null,"wrong array header");
+index19.In[1]=Const19(3);
+Check(Normalizer.ArrayArgumentOwner(element19,32,out _,out _)==null,"wrong element scale");
+Console.WriteLine("V19_RECEIVER_SHAPE_PASS positive=3 negative=6");
+uint[] getter19=[0xf9401808,0xb4000068,0xb9402100,0xd65f03c0,0xf81f0ffe,0x94000002];
+Check(Arm64ChainedGetter.Matches(getter19,48,32,0x1000,a=>a==0x101c),"chain getter");
+Check(!Arm64ChainedGetter.Matches(getter19,40,32,0x1000,_=>true),"wrong first offset");
+Check(!Arm64ChainedGetter.Matches(getter19,48,36,0x1000,_=>true),"wrong second offset");
+Check(!Arm64ChainedGetter.Matches(getter19,48,32,0x1000,_=>false),"wrong helper");
+getter19[1]^=1;
+Check(!Arm64ChainedGetter.Matches(getter19,48,32,0x1000,_=>true),"wrong guard register");
+Console.WriteLine("V19_CHAIN_GETTER_SHAPE_PASS positive=1 negative=4");
+
 sealed class VectorImage:NativeImage{
  public override ImageFormat Format=>ImageFormat.Elf;
  public VectorImage(params uint[] words){
