@@ -934,6 +934,29 @@ public sealed class MethodPipeline
     private HMethod BuildCoreOf(LiftedMethod lifted)
     {
         (HirBuilder builder, HMethod result) = BuildRounds(lifted);
+        // Use the already typed call choices to prove array cursor recovery.
+        // Rebuild from SSA only after a complete bounded shape was recognized.
+        if(Environment.GetEnvironmentVariable("REWIND_NO_ARRAY_CURSOR_RECOVERY")==null&&
+           _program.Model.Image.Arch==Rewind.Binary.CpuArch.Arm64)
+        {
+            int? ProvenSize(Node array,Node receiverCall)
+            {
+                if(array is not {Op:Op.Proj,Imm:CallResult.IntReturn,In.Length:1}||
+                   !builder.ChosenCalls.TryGetValue(array.In[0],out var producer)||
+                   producer.Shift!=0||producer.Method.IsGenericDefinition||producer.Method.DeclaringType.IsGenericDefinition||
+                   producer.Method.ReturnType is not SzArraySig {ElementType:TypeDefSig element}||
+                   !element.Definition.IsValueType||element.Definition.IsEnum||
+                   !builder.ChosenCalls.TryGetValue(receiverCall,out var consumer)||consumer.Shift!=0||
+                   consumer.Method.IsStatic||consumer.Method.IsVirtual||consumer.Method.IsGenericDefinition||
+                   consumer.Method.Parameters.Length!=0||consumer.Method.DeclaringType!=element.Definition||
+                   receiverCall.Aux is not CallInfo ci||ci.Target!=consumer.Method.Address)return null;
+                var layout=_program.Layouts.SizeOf(element);
+                return layout.Known&&layout.Size>0?layout.Size:null;
+            }
+            if(ArrayCursorRecovery.Run(lifted.Function,4*_program.Model.Image.PointerSize,ProvenSize,
+              (at,size)=>lifted.Normalization.ReceiverNotes.Add($"array cursor at 0x{at:X}, exact element stride {size}"))!=0)
+                (builder,result)=BuildRounds(lifted);
+        }
         // Code for two classes merged because their fields sit at the same offsets: un-merge and build again.
         for (int round = 0; round < 2 && builder.MergedObjects.Count != 0; round++)
         {

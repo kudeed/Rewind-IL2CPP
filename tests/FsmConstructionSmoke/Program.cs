@@ -421,6 +421,59 @@ foreach(int ix in new[]{0,2,3,4,5,7,8,9}){var bad27=target27.ToArray();bad27[ix]
 Check(!Target27(target27[..^1]),"truncated target");
 Console.WriteLine("COMPOUND_TARGET_SETTER_SMOKE_PASS positive=1 negative=13");
 
+
+// Exact bounded two-phi cursor loop. The type proof is a separate callback;
+// this tests the machine shape, use restrictions and rewritten SSA.
+(Function fn,Block head,Block body,Node index,Node cursor,Node inc,Node call,Node len,Node array) Cursor30()
+{
+ var fn=new Function();
+ var entry=new Block{Id=0};var pre=new Block{Id=1};var head=new Block{Id=2};var body=new Block{Id=3};var fail=new Block{Id=4};var exit=new Block{Id=5};
+ fn.Blocks=[entry,pre,head,body,fail,exit];
+ entry.Succs=[pre];pre.Preds=[entry];pre.Succs=[head];head.Preds=[pre,body];head.Succs=[fail,body];body.Preds=[head];body.Succs=[head,exit];fail.Preds=[head];exit.Preds=[body];
+ Node C(long v){var n=fn.NewNode(Op.Const,VT.I64,null);n.Imm=v;return n;}
+ Node N(Block b,Op op,VT t,params Node[] x){var n=fn.NewNode(op,t,b,x);b.Nodes.Add(n);return n;}
+ var array=N(entry,Op.Proj,VT.I64);var n0=N(entry,Op.Load,VT.I64,N(entry,Op.Add,VT.I64,array,C(24)));
+ N(entry,Op.Jump,VT.None);
+ var p0=N(pre,Op.Add,VT.I64,array,C(32));var l0=N(pre,Op.Trunc,VT.I32,n0);N(pre,Op.Jump,VT.None);
+ var index=fn.NewNode(Op.Phi,VT.I64,head);var cursor=fn.NewNode(Op.Phi,VT.I64,head);var len=fn.NewNode(Op.Phi,VT.I32,head);head.Phis=[index,cursor,len];
+ var cmp=N(head,Op.CmpLeU,VT.I1,N(head,Op.ZExt,VT.I64,len),index);N(head,Op.Branch,VT.None,cmp);
+ var call=N(body,Op.Call,VT.None,cursor);call.Aux=new CallInfo{Target=0x1000,Slots=[new ArgSlot(ArgSlotKind.IntReg,0)]};
+ var l1=N(body,Op.Load,VT.I32,N(body,Op.Add,VT.I64,array,C(24)));
+ var i1=N(body,Op.Add,VT.I64,index,C(1));var inc=N(body,Op.Add,VT.I64,cursor,C(44));
+ N(body,Op.Branch,VT.None,N(body,Op.CmpLtS,VT.I1,i1,N(body,Op.SExt,VT.I64,l1)));
+ index.In=[C(0),i1];cursor.In=[p0,inc];len.In=[l0,l1];
+ N(fail,Op.Unreachable,VT.None);N(exit,Op.Return,VT.None);
+ return(fn,head,body,index,cursor,inc,call,len,array);
+}
+var pos30=Cursor30();
+Check(ArrayCursorRecovery.Run(pos30.fn,32,(a,c)=>a==pos30.array&&c==pos30.call?44:null)==1,"bounded cursor positive");
+Check(pos30.cursor.Dead&&pos30.inc.Dead&&pos30.call.In[0] is {Op:Op.Add} newAddress&&
+ newAddress.In[1].IsConstValue(32)&&newAddress.In[0].In[0]==pos30.array&&
+ newAddress.In[0].In[1].In[0]==pos30.index&&newAddress.In[0].In[1].In[1].IsConstValue(44),"cursor rewrites to captured array/index");
+var neg30=new Action<(Function fn,Block head,Block body,Node index,Node cursor,Node inc,Node call,Node len,Node array)>[]{
+ x=>x.inc.In[1].Imm=40,
+ x=>x.index.In[0].Imm=1,
+ x=>x.index.In[1].In[1].Imm=2,
+ x=>x.body.Terminator!.In[0].Op=Op.CmpLtU,
+ x=>x.head.Terminator!.In[0].Op=Op.CmpLtU,
+ x=>x.head.Succs.Reverse(),
+ x=>x.body.Succs.Reverse(),
+ x=>x.len.In[1].In[0].In[1].Imm=16,
+ x=>x.len.In[1].In[0].In[0]=new Node{Op=Op.Param,Type=VT.I64},
+ x=>x.body.Nodes.Insert(0,x.fn.NewNode(Op.Store,VT.None,x.body,x.cursor,x.array)),
+ x=>x.body.Nodes.Insert(0,x.fn.NewNode(Op.Store,VT.None,x.body,x.inc,x.array)),
+ x=>((CallInfo)x.call.Aux!).Indirect=true,
+ x=>((CallInfo)x.call.Aux!).Slots[0]=new ArgSlot(ArgSlotKind.IntReg,1),
+ x=>x.fn.TryRegions.Add(new TryRegionInfo{Index=0}),
+ x=>x.head.Preds.Add(new Block()),
+};
+foreach(var mutate30 in neg30){var x=Cursor30();mutate30(x);Check(ArrayCursorRecovery.Run(x.fn,32,(_,_)=>44)==0&&!x.cursor.Dead,"unsafe cursor accepted");}
+var noProof30=Cursor30();
+Check(ArrayCursorRecovery.Run(noProof30.fn,32,(_,_)=>null)==0,"unknown array type accepted");
+var wrongHeader30=Cursor30();
+Check(ArrayCursorRecovery.Run(wrongHeader30.fn,16,(_,_)=>44)==0,"wrong header accepted");
+Console.WriteLine("ARRAY_CURSOR_SMOKE_PASS positive=1 negative="+(neg30.Length+2));
+
 sealed class VectorImage:NativeImage{
  public override ImageFormat Format=>ImageFormat.Elf;
  public VectorImage(params uint[] words){

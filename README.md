@@ -385,3 +385,20 @@ The exact BCL append diamond can also end in a common successor (including loop 
 The IL writer can recover a read of the inaccessible Color32.rgba word through its four public byte channels. This ARM64 rule requires the exact UnityEngine.CoreModule Color32 identity, non-generic explicit value-type layout, original four-byte instance size and matching recorded field offsets and types. Evaluate the color expression once into a local, then assemble the little-endian word with shifts/OR. Only reads are transformed; no access to unknown/private overlays, inferred layouts or unrelated fields is introduced. Disable with REWIND_NO_PUBLIC_COLOR32_OVERLAY=1. PublicOverlayReadSmoke exercises one accepted and sixteen rejected layouts, actual emitted IL over 2048 synthetic inputs, and provider evaluation counts. Original Color32 machine-code layout and actual target Unity types should be verified separately.
 
 ListAppendFolding may use a merge local's declared HVar type when its expression annotation is absent. If an annotation exists it must agree with the declaration. This is not inference from a name or from the destination; the previous capacity-diamond and pure-computation requirements still apply. FsmConstructionSmoke adds accepted unannotated integer-local and rejected conflicting-type cases.
+
+### Bounded SZARRAY interior-cursor recovery (ARM64)
+
+When an exact paired induction loop maintains both an integer index and an
+interior pointer into the same captured single-dimensional array, recover the
+typed element receiver instead of an untyped byte offset. The rule requires
+zero index initialization, the native array data offset, matching captured
+length reads, unsigned entry and signed backedge bounds, unit index increment,
+and the exact stride from the proven non-enum value-type element layout.
+Only the single direct, nonvirtual, nongeneric, parameterless value-type
+instance call and the cursor recurrence may use the pointer. Other escapes,
+exception regions, additional CFG entries, ambiguous targets and unknown
+layouts are rejected. Rebuild typed HIR after the SSA rewrite; keep the
+original index loop and calls. This relies on valid managed SZARRAY invariants
+and does not infer arbitrary interior pointers. Disable using
+`REWIND_NO_ARRAY_CURSOR_RECOVERY=1`. FsmConstructionSmoke covers one positive
+and seventeen negative synthetic shapes.
