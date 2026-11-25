@@ -2,6 +2,9 @@ using Rewind.Analysis.Hir;
 using Rewind.Analysis.Recover;
 using Rewind.Model;
 using Rewind.Runtime;
+using Rewind.Analysis.Ir;
+using Rewind.Binary;
+using System.Buffers.Binary;
 static void Check(bool pass,string why){if(!pass)throw new Exception(why);}
 var sf=new SigFactory();
 var asm=new AssemblyModel{Name="Synthetic"};
@@ -53,8 +56,8 @@ var sz=new FieldDef{Name="_size",DeclaringType=listDef,Type=i};
 MethodDef Method(string name,TypeSig ret,params TypeSig[] args)=>new(){Name=name,DeclaringType=listDef,ReturnType=ret,Parameters=args.Select(x=>new ParamDef{Type=x}).ToArray()};
 var add=Method("Add",v,tp);var resize=Method("AddWithResize",v,tp);var count=Method("get_Count",i);
 listDef.Methods=[add,resize,count];
-(HMethod h,HBlock block,HBlock fast,HBlock slow,HVar arr,HVar n) Fixture(bool ints=false){
- var element=ints?i:o;
+(HMethod h,HBlock block,HBlock fast,HBlock slow,HVar arr,HVar n) Fixture(bool ints=false,TypeSig? custom=null){
+ var element=custom??(ints?i:o);
  var listType=sf.GenericInst(listDef,[element]);
  var arrayType=sf.SzArray(element);
  var h=new HMethod{Method=new MethodDef{Name="Caller",DeclaringType=owner,ReturnType=v}};
@@ -134,3 +137,75 @@ var conflict=Fixture(true);var local=conflict.h.NewLocal(i);var output=conflict.
 conflict.block.Statements.Insert(4,new HAssign(L(output),new HBinary(HBinaryOp.Add,new HLocal(local){Type=o},new HConst(-1,i)){Type=i}));
 Check(!ListAppendFolding.TryFold(conflict.h,sf,conflict.block),"conflicting annotation accepted");
 Console.WriteLine("LIST_APPEND_MERGE_TYPE_SMOKE_PASS positive=1 negative=1");
+
+// The declared Unity value layout and actual ARM64 constructor are both
+// required before allowing struct computations inside a list diamond.
+var unity=new AssemblyModel{Name="UnityEngine.CoreModule"};
+var ft=sf.Primitive(Il2CppTypeEnum.R4);
+var vec=new TypeDef{Index=100,Name="Vector2",Namespace="UnityEngine",Assembly=unity,IsValueType=true,
+ Flags=TypeDef.SequentialLayout,Sizes=new RawTypeSizes(24,8,0,0)};
+vec.Sig=sf.TypeDef(vec);
+vec.Fields=[new FieldDef{Name="x",DeclaringType=vec,Type=ft,Offset=16,Attrs=6},new FieldDef{Name="y",DeclaringType=vec,Type=ft,Offset=20,Attrs=6}];
+var vc=new MethodDef{Name=".ctor",DeclaringType=vec,ReturnType=v,Address=0x1000,Flags=6,Parameters=[new ParamDef{Type=ft},new ParamDef{Type=ft}]};
+var native=new VectorImage(0x2D000400u,0xD65F03C0u);
+Check(VectorListValue.Dimension(vec.Sig,16)==2&&VectorListValue.ConstructorShape(native,vc,vec.Sig),"vector layout/constructor proof");
+var vectorCopy=Fixture(custom:vec.Sig);
+Check(ListAppendFolding.TryFold(vectorCopy.h,sf,vectorCopy.block,native),"vector argument append");
+HNewObject NewVector(float x,float y)=>new(){Constructor=vc,Type=vec.Sig,Arguments=[new HConst(x,ft),new HConst(y,ft)]};
+var vectorCtor=Fixture(custom:vec.Sig);
+((HAssign)vectorCtor.fast.Statements[1]).Value=NewVector(1.25f,-2.5f);
+((HCall)((HEval)vectorCtor.slow.Statements[0]).Expression).Arguments[0]=NewVector(1.25f,-2.5f);
+Check(ListAppendFolding.TryFold(vectorCtor.h,sf,vectorCtor.block,native),"same proven vector constructor");
+var vectorMismatch=Fixture(custom:vec.Sig);
+((HAssign)vectorMismatch.fast.Statements[1]).Value=NewVector(1,2);
+((HCall)((HEval)vectorMismatch.slow.Statements[0]).Expression).Arguments[0]=NewVector(1,3);
+Check(!ListAppendFolding.TryFold(vectorMismatch.h,sf,vectorMismatch.block,native),"different constructor arguments");
+var vectorBadCtor=Fixture(custom:vec.Sig);
+((HAssign)vectorBadCtor.fast.Statements[1]).Value=NewVector(1,2);
+((HCall)((HEval)vectorBadCtor.slow.Statements[0]).Expression).Arguments[0]=NewVector(1,2);
+Check(!ListAppendFolding.TryFold(vectorBadCtor.h,sf,vectorBadCtor.block,new VectorImage(0x2D000401u,0xD65F03C0u)),"wrong native constructor");
+vec.Fields[1].Offset=24;
+var badLayout=Fixture(custom:vec.Sig);
+Check(!ListAppendFolding.TryFold(badLayout.h,sf,badLayout.block,native),"wrong field offset");
+vec.Fields[1].Offset=20;
+vec.Fields[0].Attrs=1;
+Check(VectorListValue.Dimension(vec.Sig,16)==0,"private channel");
+vec.Fields[0].Attrs=6;
+Check(VectorListValue.Dimension(vec.Sig,8)==0,"wrong ABI header");
+var signZero=Fixture(custom:vec.Sig);
+((HAssign)signZero.fast.Statements[1]).Value=NewVector(0f,1);
+((HCall)((HEval)signZero.slow.Statements[0]).Expression).Arguments[0]=NewVector(BitConverter.UInt32BitsToSingle(0x80000000),1);
+Check(!ListAppendFolding.TryFold(signZero.h,sf,signZero.block,native),"different signed zero accepted");
+var nan=Fixture(custom:vec.Sig);
+((HAssign)nan.fast.Statements[1]).Value=NewVector(BitConverter.UInt32BitsToSingle(0x7fc00001),1);
+((HCall)((HEval)nan.slow.Statements[0]).Expression).Arguments[0]=NewVector(BitConverter.UInt32BitsToSingle(0x7fc00002),1);
+Check(!ListAppendFolding.TryFold(nan.h,sf,nan.block,native),"different NaN payload accepted");
+Console.WriteLine("VECTOR_LIST_SMOKE_PASS positive=3 negative=7");
+
+// Independent branch/edge shape checks used before a native null guard is
+// discarded. These tests do not substitute for the full metadata/callee proof.
+var pointer=new Node{Op=Op.Load,Type=VT.I64};
+var zero=new Node{Op=Op.Const,Type=VT.I64,Imm=0};
+var equal=new Node{Op=Op.CmpEq,Type=VT.I1,In=[pointer,zero]};
+var notEqual=new Node{Op=Op.CmpNe,Type=VT.I1,In=[zero,pointer]};
+Check(Normalizer.NullGuardValue(equal,0)==pointer&&Normalizer.NullGuardValue(notEqual,1)==pointer,"null guard polarity");
+Check(Normalizer.NullGuardValue(equal,1)==null&&Normalizer.NullGuardValue(notEqual,0)==null,"inverted guard rejected");
+var narrow=new Node{Op=Op.Load,Type=VT.I32};
+Check(Normalizer.NullGuardValue(new Node{Op=Op.CmpEq,In=[narrow,zero]},0)==null,"narrow guard");
+var guard=new Block();var next=new Block();var direct=new Node{Op=Op.Call,Aux=new CallInfo{Target=0x1000}};
+next.Preds=[guard];next.Nodes=[new Node{Op=Op.Add},direct];
+Check(Normalizer.FirstDirectCall(guard,next)==direct,"unique continuation");
+next.Preds.Add(new Block());Check(Normalizer.FirstDirectCall(guard,next)==null,"alternate entry");next.Preds.RemoveAt(1);
+next.Nodes.Insert(0,new Node{Op=Op.Store});Check(Normalizer.FirstDirectCall(guard,next)==null,"effect before call");next.Nodes.RemoveAt(0);
+((CallInfo)direct.Aux!).Indirect=true;Check(Normalizer.FirstDirectCall(guard,next)==null,"indirect call");((CallInfo)direct.Aux!).Indirect=false;
+next.Scope=0;Check(Normalizer.FirstDirectCall(guard,next)==null,"exception scope");
+Console.WriteLine("GUARDED_RECEIVER_SHAPE_PASS positive=3 negative=7");
+
+sealed class VectorImage:NativeImage{
+ public override ImageFormat Format=>ImageFormat.Elf;
+ public VectorImage(params uint[] words){
+  Arch=CpuArch.Arm64;PointerSize=8;MemoryBase=0x1000;Memory=new byte[4*words.Length];
+  for(int i=0;i<words.Length;i++)BinaryPrimitives.WriteUInt32LittleEndian(Memory.AsSpan(4*i),words[i]);
+  Sections.Add(new ImageSection(".text",MemoryBase,(ulong)Memory.Length,SectionFlags.Read|SectionFlags.Execute));
+ }
+}

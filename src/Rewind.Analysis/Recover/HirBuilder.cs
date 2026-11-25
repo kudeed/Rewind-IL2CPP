@@ -881,6 +881,7 @@ public sealed partial class HirBuilder
     public HMethod Build()
     {
         foreach (string p in _fn.Problems) Problem("lift: " + p);
+        _h.Notes.AddRange(_l.Normalization.ReceiverNotes);
         // Code that only runs when an exception is caught is not part of the function's ordinary flow; unless the
         // lifter rebuilt the try regions (or said why not), what was recovered is the no-exception path only.
         if (_p.ExceptionInfo(_fn.Address) is { TryBlocks.Count: > 0 } regions && _fn.TryRegions.Count == 0 &&

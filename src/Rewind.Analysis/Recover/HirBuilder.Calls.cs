@@ -2227,7 +2227,7 @@ public sealed partial class HirBuilder
         if (Environment.GetEnvironmentVariable("REWIND_NO_RECEIVER_PROOF") != null ||
             _p.Model.Image.Arch != Rewind.Binary.CpuArch.Arm64 ||
             _method.IsStatic || _method.IsConstructor || method.IsStatic || method.IsConstructor ||
-            method.IsVirtual || isVirtual || method.IsAbstract ||
+            (method.IsVirtual && (method.Flags & MethodDef.Final)==0) || isVirtual || method.IsAbstract ||
             !ReferenceEquals(method.DeclaringType, _method.DeclaringType) ||
             method.DeclaringType.IsValueType || method.DeclaringType.IsGenericDefinition ||
             method.IsGenericDefinition || _method.IsGenericDefinition ||

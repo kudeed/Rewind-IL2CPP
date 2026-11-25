@@ -21,6 +21,7 @@ public sealed record CastFact(Block At, Node Object, Node Klass, Node? From = nu
 public sealed class NormalizeResult
 {
     public List<CastFact> Casts = [];
+    public List<string> ReceiverNotes = [];
     /// <summary>(operation, left, right) triples whose overflow is checked.</summary>
     public HashSet<(Op, Node, Node)> CheckedArithmetic = [];
     public int GuardsRemoved, HelpersRemoved, RegionsRemoved;
@@ -1493,6 +1494,7 @@ public sealed partial class Normalizer(ProgramAnalysis program)
                 if (kind == ThrowKind.InvalidCast && a != null && b != null)
                     _result.Casts.Add(new CastFact(p, PhiInputFor(a, target, p), PhiInputFor(b, target, p)));
                 if (kind == ThrowKind.Overflow) NoteOverflow(term.In[0]);
+                if (kind == ThrowKind.NullReference) RestoreGuardedReceiver(p, other, term.In[0], side);
 
                 RemoveEdge(p, target);
                 term.Op = Op.Jump;

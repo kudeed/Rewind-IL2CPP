@@ -1,4 +1,5 @@
 using Rewind.Analysis.Hir;
+using Rewind.Binary;
 using Rewind.Model;
 using Rewind.Runtime;
 
@@ -9,7 +10,7 @@ namespace Rewind.Analysis.Recover;
 /// Never leave an inaccessible BCL private field in this matched pattern.</summary>
 internal static class ListAppendFolding
 {
-    internal static bool TryFold(HMethod method, SigFactory sigs, HBlock block)
+    internal static bool TryFold(HMethod method, SigFactory sigs, HBlock block, NativeImage? image=null)
     {
         if (method.TryRegions.Count != 0 ||
             method.Blocks.Any(b => b.Scope != -1) || block.Statements.Count < 4) return false;
@@ -27,7 +28,9 @@ internal static class ListAppendFolding
             list.Variable.Type is not GenericInstSig g || g.Definition.FullName != "System.Collections.Generic.List" ||
             g.Definition.Assembly.Name is not ("mscorlib" or "System.Private.CoreLib") ||
             g.Arguments.Length != 1 || g.Arguments[0].ContainsGenericParameter ||
-            (g.Arguments[0].IsValueType && g.Arguments[0] is not PrimitiveSig {Element:Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4}) ||
+            (g.Arguments[0].IsValueType && g.Arguments[0] is not PrimitiveSig {Element:Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4} &&
+                (image==null||image.Arch!=CpuArch.Arm64||Environment.GetEnvironmentVariable("REWIND_NO_VECTOR_LIST_APPEND")!=null||
+                 VectorListValue.Dimension(g.Arguments[0],2*image.PointerSize)==0)) ||
             array.Variable.AddressTaken || list.Variable.AddressTaken ||
             array.Variable.Type is not SzArraySig arr || arr.ElementType.Key != g.Arguments[0].Key ||
             ss[start+1] is not HAssign {Target:HField version,Value:HBinary {Op:HBinaryOp.Add,Left:HField previous,Right:HConst one}} ||
@@ -52,6 +55,48 @@ internal static class ListAppendFolding
             ? (e.Type == null || e.Type.Key==l.Variable.Type.Key ? l.Variable.Type : null)
             : e.Type;
         bool Integer(TypeSig? t)=>t is PrimitiveSig {Element:Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4};
+        bool Vector(TypeSig? t)=>image!=null&&image.Arch==CpuArch.Arm64&&
+            VectorListValue.Dimension(t,2*image.PointerSize)!=0;
+        bool vectorElement=Vector(g.Arguments[0]);
+        bool Float(TypeSig? t)=>t is PrimitiveSig{Element:Il2CppTypeEnum.R4};
+        bool Independent(HVar v)=>!v.AddressTaken&&!ReferenceEquals(v,array.Variable)&&
+            !ReferenceEquals(v,count.Variable)&&!ReferenceEquals(v,list.Variable);
+        bool PlainVector(HExpr e,int depth=0)
+        {
+            if(!vectorElement||depth>16)return false;
+            TypeSig? t=EffectiveType(e);
+            if(!Vector(t)&&!Float(t))return false;
+            return e switch
+            {
+                HArg {Index:>=0}=>true,
+                HLocal l=>Independent(l.Variable),
+                HConst {Value:float}=>Float(t),
+                HField {Object:HLocal l} f=>Float(t)&&Independent(l.Variable)&&Vector(l.Variable.Type)&&
+                    ReferenceEquals(f.Field.DeclaringType,l.Variable.Type.Definition)&&!f.Field.IsStatic&&
+                    (f.Field.Attrs&FieldDef.AccessMask)==6&&f.Field.Type.Key==t!.Key,
+                HBinary {Op:HBinaryOp.Add or HBinaryOp.Sub or HBinaryOp.Mul or HBinaryOp.Div} b=>
+                    Float(t)&&Float(EffectiveType(b.Left))&&Float(EffectiveType(b.Right))&&
+                    PlainVector(b.Left,depth+1)&&PlainVector(b.Right,depth+1),
+                HNewObject n=>Vector(t)&&VectorListValue.ConstructorShape(image!,n.Constructor,t)&&
+                    n.Arguments.Length==n.Constructor.Parameters.Length&&
+                    n.Arguments.All(a=>Float(EffectiveType(a))&&PlainVector(a,depth+1)),
+                _=>false
+            };
+        }
+        bool SameVector(HExpr a,HExpr b,int depth=0)
+        {
+            if(depth>16||EffectiveType(a)?.Key!=EffectiveType(b)?.Key||a.GetType()!=b.GetType())return false;
+            return (a,b) switch
+            {
+                (HConst {Value:float x},HConst {Value:float y})=>BitConverter.SingleToUInt32Bits(x)==BitConverter.SingleToUInt32Bits(y),
+                (HBinary x,HBinary y)=>x.Op==y.Op&&SameVector(x.Left,y.Left,depth+1)&&SameVector(x.Right,y.Right,depth+1),
+                (HNewObject x,HNewObject y)=>ReferenceEquals(x.Constructor,y.Constructor)&&x.Arguments.Length==y.Arguments.Length&&
+                    PlainVector(x)&&PlainVector(y)&&x.Arguments.Zip(y.Arguments).All(z=>SameVector(z.First,z.Second,depth+1)),
+                _=>HirCleanup.Same(a,b)
+            };
+        }
+        bool SameItem(HExpr a,HExpr b)=>vectorElement?SameVector(a,b):HirCleanup.Same(a,b);
+
         bool Plain(HExpr e)=>Integer(EffectiveType(e)) && (e switch
         {
             HConst {Value:int or long}=>true,
@@ -63,8 +108,10 @@ internal static class ListAppendFolding
         });
         var computations=ss.Skip(start+3).Take(ss.Count-start-4).ToArray();
         if(computations.Length>4||computations.Any(s=>s is not HAssign {Target:HLocal dest,Value:var value} ||
-            !Integer(dest.Variable.Type)||dest.Variable.AddressTaken||ReferenceEquals(dest.Variable,array.Variable)||
-            ReferenceEquals(dest.Variable,count.Variable)||ReferenceEquals(dest.Variable,list.Variable)||!Plain(value)))return false;
+            !Independent(dest.Variable)||
+            !((Integer(dest.Variable.Type)&&Plain(value))||
+                ((Vector(dest.Variable.Type)||Float(dest.Variable.Type))&&
+                 EffectiveType(value)?.Key==dest.Variable.Type.Key&&PlainVector(value)))))return false;
         HBlock slow=branch.WhenTrue,fast=branch.WhenFalse;
         if(slow==fast||slow==block||fast==block||slow==method.Blocks[0]||fast==method.Blocks[0]||
             !method.Blocks.Contains(slow)||!method.Blocks.Contains(fast))return false;
@@ -75,8 +122,10 @@ internal static class ListAppendFolding
             slow.Statements is not [HEval {Expression:HCall resize},var slowEnd] ||
             resize.Method.Name!="AddWithResize"||!ReferenceEquals(resize.Method.DeclaringType,g.Definition)||
             resize.Method.IsStatic||!Local(resize.This,list.Variable)||resize.Arguments.Length!=1||
-            !HirCleanup.Same(item,resize.Arguments[0])||
-            item is not (HArg or HLocal or HConst)||EffectiveType(item)?.Key!=g.Arguments[0].Key||
+            !SameItem(item,resize.Arguments[0])||
+            (!(item is HArg or HLocal or HConst)&&!PlainVector(item))||
+            (vectorElement&&(!PlainVector(item)||!PlainVector(resize.Arguments[0])))||EffectiveType(item)?.Key!=g.Arguments[0].Key||
+            (vectorElement&&EffectiveType(resize.Arguments[0])?.Key!=g.Arguments[0].Key)||
             ConstructorFolding.Mentions(item,array.Variable)||ConstructorFolding.Mentions(item,count.Variable))
             return false;
         HStmt continuation;
@@ -110,10 +159,10 @@ internal static class ListAppendFolding
         method.Notes.Add($"public List.Add restored from complete inlined capacity diamond at 0x{branch.Address:X}");
         return true;
     }
-    public static void Run(HMethod method,SigFactory sigs)
+    public static void Run(HMethod method,SigFactory sigs,NativeImage image)
     {
         if(Environment.GetEnvironmentVariable("REWIND_NO_LIST_APPEND_FOLDING")!=null)return;
         foreach(var b in method.Blocks.ToArray())
-            if(method.Blocks.Contains(b))TryFold(method,sigs,b);
+            if(method.Blocks.Contains(b))TryFold(method,sigs,b,image);
     }
 }
