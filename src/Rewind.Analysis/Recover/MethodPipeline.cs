@@ -386,6 +386,13 @@ public sealed class MethodPipeline
             _normalizer.CanonicalizeSlots(fn);
             _normalizer.Cleanup(fn);
         }
+        if (_program.Model.Image.Arch == Rewind.Binary.CpuArch.Arm64 &&
+            _program.Model.Image.Format == Rewind.Binary.ImageFormat.Elf &&
+            Environment.GetEnvironmentVariable("REWIND_NO_LATE_METADATA_GOT") == null)
+        {
+            _normalizer.CanonicalizeSlots(fn);
+            _normalizer.Cleanup(fn);
+        }
         CheckShape(fn, "class merges");
         if (Environment.GetEnvironmentVariable("REWIND_NO_WIDENED_CONSTANTS") == null) FoldWidenedConstants(fn);
         return new LiftedMethod

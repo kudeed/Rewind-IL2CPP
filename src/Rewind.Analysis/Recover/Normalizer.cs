@@ -363,6 +363,8 @@ public sealed partial class Normalizer(ProgramAnalysis program)
     /// </summary>
     private void CanonicalizeSlotLoads()
     {
+        if (Environment.GetEnvironmentVariable("REWIND_NO_LATE_METADATA_GOT") == null)
+            FoldMetadataGotLoads();
         // A read through a choice of slots (a select or phi of their addresses) reads the chosen slot's value.
         var chosen = new List<Node>();
         foreach (Block b in _fn.Blocks)
@@ -390,6 +392,36 @@ public sealed partial class Normalizer(ProgramAnalysis program)
             n.Dead = true;
         }
         foreach (Block b in _fn.Blocks) b.Nodes.RemoveAll(n => n.Dead);
+    }
+
+    // Late SSA simplification can expose ADRP + constant after the lifter has
+    // already missed the read-only GOT load. Only fold a full-width aligned
+    // RELRO pointer when its relocated value is an actual metadata slot.
+    // Never read arbitrary writable globals as constants.
+    private void FoldMetadataGotLoads()
+    {
+        NativeImage image = program.Model.Image;
+        if (image.Arch != CpuArch.Arm64 || image.Format != ImageFormat.Elf || image.PointerSize != 8) return;
+        foreach (Block b in _fn.Blocks)
+        {
+            foreach (Node n in b.Nodes)
+            {
+                if (n.Dead || n.Op != Op.Load || n.Type != VT.I64) continue;
+                Node a = Resolve(n.In[0]);
+                ulong va;
+                if (a.IsConst) va = a.UImm;
+                else if (a.Op == Op.Add && a.Type == VT.I64 &&
+                         Resolve(a.In[0]) is { IsConst: true } left &&
+                         Resolve(a.In[1]) is { IsConst: true } right)
+                    va = unchecked(left.UImm + right.UImm);
+                else continue;
+                if (!MetadataGotLoad.TryResolve(image, va, IsMetadataSlot, out ulong slot)) continue;
+                _replace[n] = _b.Const(VT.I64, unchecked((long)slot));
+                n.Dead = true;
+            }
+            b.Nodes.RemoveAll(n => n.Dead);
+        }
+        ApplyReplacements();
     }
 
     // ---- helpers with no managed meaning -------------------------------------------------------------------

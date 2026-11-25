@@ -333,3 +333,7 @@ mark the files you changed.
 
 The libraries and fonts Rewind is built with keep their own licenses; they're listed in
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
+### Late ARM64 metadata GOT loads
+
+On ELF ARM64, a GOT read may become constant only after SSA simplification, too late for the machine lifter's read-only folding. The recovery normalizer now recognizes such loads when a full aligned pointer lies in a non-executable read-only-after-load range and points to a known metadata slot. It reuses normal metadata-slot canonicalization instead of treating writable runtime metadata as a raw constant. The late pass is restricted to ARM64 ELF; arbitrary writable memory, unknown targets, imports and partial read-only ranges are rejected. `REWIND_NO_LATE_METADATA_GOT=1` disables the change for A/B testing. The synthetic safety-policy smoke test is `dotnet run --project tests/MetadataGotLoadSmoke -c Release`.
