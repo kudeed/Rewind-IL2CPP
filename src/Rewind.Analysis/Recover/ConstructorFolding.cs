@@ -36,6 +36,7 @@ internal static partial class ConstructorFolding
                 string problem = $"the constructor of {allocation.Target.ShortName} was inlined and could not be folded back";
                 string note = $"the constructor of {allocation.Target.ShortName} was inlined here; the object is allocated raw and its statements follow";
                 if (TryFold(block, i, target, allocation.Target, program, pipeline) || TryFoldChain(method, block, i, target, allocation.Target, program, pipeline) ||
+                    TryFoldScheduledReads(method, block, i, target, allocation.Target, program, pipeline) ||
                     TryFoldAround(block, i, target, allocation.Target, program, pipeline))
                 {
                     if (again)
@@ -265,6 +266,50 @@ internal static partial class ConstructorFolding
             a = b;
         }
         return unifier;
+    }
+
+    /// <summary>Recover a constructor with a caller-this field read scheduled
+    /// between its base call and its final plain stores to the fresh object.
+    /// The read is moved only across those stores, not across a call.
+    /// </summary>
+    private static bool TryFoldScheduledReads(HMethod method, HBlock block, int at, HLocal target, TypeSig type, ProgramAnalysis program, MethodPipeline pipeline)
+    {
+        if (Environment.GetEnvironmentVariable("REWIND_NO_SCHEDULED_CTOR_READS") != null ||
+            method.Method.Name != ".ctor" || method.Method.IsStatic || method.Method.DeclaringType.IsValueType ||
+            type is not TypeDefSig { Definition: { IsValueType: false } definition } ||
+            definition.GenericParameters.Length != 0) return false;
+        var site = block.Statements;
+        var created = target.Variable;
+        foreach (MethodDef ctor in definition.Methods)
+        {
+            if (ctor.Name != ".ctor" || ctor.IsStatic || pipeline.ConstructorBody(ctor, []) is not { } body)
+                continue;
+            var template = body.Blocks[0].Statements;
+            if (!ScheduledConstructorReads.TryGather(method.Method, site, at, created, template.Count - 1,
+                    out List<int> picked)) continue;
+            var gathered = picked.Select(i => site[i]).ToList();
+            var unifier = new Unifier(created, ctor.Parameters.Length) { Constructor = ctor, Quiet = c => QuietConstructor(c, pipeline) };
+            bool match = true;
+            for (int k = 0; k < picked.Count && match; k++)
+                match = unifier.Statement(template[k], gathered[k], k);
+            if (!match || !unifier.ArgumentsAreValid(gathered, 0, picked.Count)) continue;
+            // A matched argument must not be supplied by any moved read.
+            var delayed = Enumerable.Range(picked[0], picked[^1] - picked[0] + 1)
+                .Where(i => !picked.Contains(i)).Select(i => ((HLocal)((HAssign)site[i]).Target).Variable).ToArray();
+            if (unifier.Arguments.Any(arg => arg != null && delayed.Any(v => Mentions(arg, v)))) continue;
+            if (unifier.Arguments.Any(arg => arg == null)) continue; // require all arguments
+            var creation = new HAssign(target, new HNewObject
+            {
+                Constructor = ctor, Type = type, Arguments = unifier.Arguments.Select(a => a!).ToArray()
+            }) { Address = site[at].Address };
+            int first = picked[0];
+            for (int k = picked.Count - 1; k >= 0; k--) site.RemoveAt(picked[k]);
+            site.Insert(first, creation);
+            site.RemoveAt(at);
+            method.Notes.Add($"constructor scheduled reads: {ctor.FullName}, {delayed.Length} independent caller field read(s)");
+            return true;
+        }
+        return false;
     }
 
     private static readonly bool NoAround = Environment.GetEnvironmentVariable("REWIND_NO_CONSTRUCTOR_INTERLEAVING") != null;

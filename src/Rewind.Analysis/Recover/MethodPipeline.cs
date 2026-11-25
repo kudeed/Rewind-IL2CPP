@@ -992,6 +992,7 @@ public sealed class MethodPipeline
         if (LateMoves.Run(result)) StructConstruction.Run(result);
         SwitchRanges.Run(result);
         DelegateChoiceFolding.Run(result);
+        ListAppendFolding.Run(result, _program.Model.Sigs);
         return result;
     }
 
