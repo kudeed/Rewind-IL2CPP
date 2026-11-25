@@ -32,6 +32,23 @@ foreach(var c in cases){
 }
 var x=new CodeImage(new[]{Kill,Ret});
 if(Arm64ReceiverProof.IsUnused(x,0x1001,0x1008)||Arm64ReceiverProof.IsUnused(x,0x1000,0x1010)||Arm64ReceiverProof.IsUnused(x,0x1000,0x1000))failed++;
+var argCases=new (string Name,bool Expected,uint[] Words,bool KnownCall)[]{
+ ("x2 direct kill",true,new[]{0xAA1F03E2u,Ret},false),
+ ("x2 kill after proven unary metadata helper",true,new[]{0x94000004u,0xAA1F03E2u,Ret},true),
+ ("unknown helper",false,new[]{0x94000004u,0xAA1F03E2u,Ret},false),
+ ("incoming x2 read",false,new[]{0xAA0203E1u,0xAA1F03E2u,Ret},false),
+ ("incoming x2 stored",false,new[]{0xF9000022u,0xAA1F03E2u,Ret},false),
+ ("incoming x2 dereferenced",false,new[]{0xF9400043u,0xAA1F03E2u,Ret},false),
+ ("known call without subsequent kill",false,new[]{0x94000004u,Ret},true),
+ ("known call then stale read",false,new[]{0x94000004u,0xAA0203E1u,0xAA1F03E2u,Ret},true),
+ ("wrong register kill",false,new[]{Kill,Ret},false),
+};
+foreach(var c in argCases){
+ var im=new CodeImage(c.Words);
+ bool actual=Arm64ReceiverProof.IsUnused(im,0x1000,0x1000+(ulong)c.Words.Length*4,2,a=>c.KnownCall&&a==0x1010);
+ if(actual!=c.Expected){Console.Error.WriteLine(c.Name+": "+actual+" expected "+c.Expected);failed++;}
+}
+Console.WriteLine($"UNUSED_METADATA_ARG_SMOKE positive={argCases.Count(c=>c.Expected)} negative={argCases.Count(c=>!c.Expected)} failed={failed}");
 Console.WriteLine($"RECEIVER_PROOF_SMOKE positive={cases.Count(c=>c.Expected)} negative={cases.Count(c=>!c.Expected)+3} failed={failed}");
 return failed==0?0:1;
 sealed class CodeImage:NativeImage{

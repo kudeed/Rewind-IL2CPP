@@ -1749,6 +1749,18 @@ public sealed partial class HirBuilder
                         else Problem(UnkeptReceiver);
                         thisExpr = new HConst(null, p.Type);
                     }
+                    else if (Environment.GetEnvironmentVariable("REWIND_NO_SCALAR_UNUSED_RECEIVER") == null &&
+                             node.Op == Op.Phi &&
+                             Eval(node) is SVal { Expr: { } scalar } &&
+                             (scalar.Type ?? (scalar as HLocal)?.Variable.Type) is PrimitiveSig { Element: Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8 } &&
+                             CanRestoreUnusedReceiver(call, method, classArgs, methodArgs, isVirtual, alternatives, receiverOverride, shift))
+                    {
+                        // A merged stale scalar return register is not a
+                        // managed receiver. The same-class direct callee
+                        // demonstrably overwrites x0 on every entry path.
+                        thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                        _h.Notes.Add($"receiver-independent merged scalar at 0x{call.Addr:X} to 0x{method.Address:X}");
+                    }
                     else
                     {
                         thisExpr = Value(node);
@@ -1795,6 +1807,12 @@ public sealed partial class HirBuilder
                         else
                         {
                             arg = ValueFor(node, type);
+                            if (IsReference(type) && arg is HMethodPointer mp && ReferenceEquals(mp.Method, _method)
+                                && CanRestoreUnusedMetadataArgument(call, method, classArgs, methodArgs, isVirtual, alternatives, shift, position))
+                            {
+                                arg = new HConst(null, type);
+                                _h.Notes.Add($"unused native argument x{position} at 0x{call.Addr:X} to 0x{method.Address:X}, metadata pointer discarded");
+                            }
                             if (IsReference(type) && CheckedClassHere(node) is { } checkedAs &&
                                 !IsAssignable(arg.Type, type) && IsAssignable(checkedAs, type))
                                 arg = new HTypeExpr(HTypeOp.CastClass, checkedAs, arg) { Type = checkedAs };
@@ -2242,6 +2260,44 @@ public sealed partial class HirBuilder
             _receiverProofs[method.Address] = proved;
         }
         return proved;
+    }
+
+    // The metadata initializer has one logical argument. Accept an inline
+    // branch alias only if it shares the exact target of an identified
+    // metadata initializer wrapper (save LR; BL; DMB ISH; restore LR; RET).
+    // The wrapper identity is already established by the runtime helper table.
+    private bool IsUnaryMetadataService(ulong target)
+    {
+        var im = _p.Model.Image;
+        if (_p.Helpers.KindAt(target) is HelperKind.MetadataInit or HelperKind.MetadataInitInline) return true;
+        if (!im.IsMapped(target, 4) || im.SectionAt(target) is not { IsExecutable: true }) return false;
+        var alias = Rewind.Analysis.Arm64.A64Decoder.Decode(im.U32(target), target);
+        if (alias.Op != Rewind.Analysis.Arm64.A64Op.B) return false;
+        foreach (var known in _p.Helpers.AddressesOf(HelperKind.MetadataInit))
+        {
+            if (!im.IsMapped(known,20) || im.SectionAt(known) is not { IsExecutable: true }) continue;
+            if (im.U32(known)!=0xF81F0FFE || im.U32(known+8)!=0xD5033BBF ||
+                im.U32(known+12)!=0xF84107FE || im.U32(known+16)!=0xD65F03C0) continue;
+            var branch = Rewind.Analysis.Arm64.A64Decoder.Decode(im.U32(known+4), known+4);
+            if (branch.Op==Rewind.Analysis.Arm64.A64Op.Bl && branch.Target==alias.Target) return true;
+        }
+        return false;
+    }
+
+    private bool CanRestoreUnusedMetadataArgument(Node call, MethodDef method, TypeSig[] classArgs,
+        TypeSig[] methodArgs, bool isVirtual, List<MethodDef>? alternatives, int shift, int position)
+    {
+        if (Environment.GetEnvironmentVariable("REWIND_NO_UNUSED_METADATA_ARGUMENT")!=null ||
+            _p.Model.Image.Arch!=Rewind.Binary.CpuArch.Arm64 || position!=2 || shift!=0 ||
+            _method.IsStatic || method.IsStatic || method.IsConstructor || method.IsVirtual || isVirtual ||
+            method.IsAbstract || !ReferenceEquals(method.DeclaringType,_method.DeclaringType) ||
+            method.DeclaringType.IsValueType || method.DeclaringType.IsGenericDefinition ||
+            method.IsGenericDefinition || _method.IsGenericDefinition ||
+            classArgs.Length!=0 || methodArgs.Length!=0 || alternatives is {Count:>0} ||
+            method.Address==0 || call.Aux is not CallInfo {Indirect:false, Intrinsic:null} ci ||
+            ci.Target!=method.Address || _p.RangeOf(method.Address) is not {} range) return false;
+        return Rewind.Analysis.Arm64.Arm64ReceiverProof.IsUnused(_p.Model.Image,range.Start,range.End,
+            (byte)position,IsUnaryMetadataService);
     }
 
     private static readonly bool NoPInvokeChoices = Environment.GetEnvironmentVariable("REWIND_NO_PINVOKE_CHOICES") != null;

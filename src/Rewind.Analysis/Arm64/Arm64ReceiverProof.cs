@@ -10,9 +10,9 @@ namespace Rewind.Analysis.Arm64;
 /// </summary>
 public static class Arm64ReceiverProof
 {
-    public static bool IsUnused(NativeImage image, ulong start, ulong end)
+    public static bool IsUnused(NativeImage image, ulong start, ulong end, byte register = 0, Func<ulong,bool>? unaryMetadataCall = null)
     {
-        if (image.Arch != CpuArch.Arm64 || start >= end || (start & 3) != 0 || (end & 3) != 0 ||
+        if (register > 7 || image.Arch != CpuArch.Arm64 || start >= end || (start & 3) != 0 || (end & 3) != 0 ||
             image.SectionAt(start) is not { IsExecutable: true } section || end > section.End) return false;
         // Do not try to reason about exceptional entries for this narrow proof.
         if (image is ElfImage elf && elf.ExceptionTableOf(start) is { } table &&
@@ -32,34 +32,40 @@ public static class Arm64ReceiverProof
             {
                 case A64Op.Nop or A64Op.Barrier: break;
                 case A64Op.Adr or A64Op.Adrp or A64Op.MovZ or A64Op.MovN:
-                    kill = i.Rd == 0; break;
+                    kill = i.Rd == register; break;
                 case A64Op.MovK:
-                    if (i.Rd == 0) return false;
+                    if (i.Rd == register) return false;
                     break;
                 case A64Op.AddImm or A64Op.SubImm or A64Op.AndImm or A64Op.OrrImm or A64Op.EorImm:
-                    if (i.Rn == 0) return false;
-                    kill = i.Rd == 0; break;
+                    if (i.Rn == register) return false;
+                    kill = i.Rd == register; break;
                 case A64Op.AddReg or A64Op.SubReg or A64Op.AddExt or A64Op.SubExt or
                     A64Op.And or A64Op.Bic or A64Op.Orr or A64Op.Orn or A64Op.Eor or A64Op.Eon:
-                    if (i.Rn == 0 || i.Rm == 0) return false;
-                    kill = i.Rd == 0; break;
+                    if (i.Rn == register || i.Rm == register) return false;
+                    kill = i.Rd == register; break;
                 case A64Op.Ldr or A64Op.Ldp or A64Op.Str or A64Op.Stp:
-                    if (i.Rn == 0 || i.Mode == A64Mode.RegOffset && i.Rm == 0) return false;
+                    if (i.Rn == register || i.Mode == A64Mode.RegOffset && i.Rm == register) return false;
                     if (!i.Vector)
                     {
-                        bool touches = i.Rd == 0 || i.Op is A64Op.Ldp or A64Op.Stp && i.Ra == 0;
+                        bool touches = i.Rd == register || i.Op is A64Op.Ldp or A64Op.Stp && i.Ra == register;
                         if (i.Op is A64Op.Str or A64Op.Stp && touches) return false;
                         kill = i.Op is A64Op.Ldr or A64Op.Ldp && touches;
                     }
                     break;
                 case A64Op.LdrLit:
-                    kill = !i.Vector && i.Rd == 0; break;
+                    kill = !i.Vector && i.Rd == register; break;
+                case A64Op.Bl:
+                    // For a separately proven unary metadata service only, continue
+                    // until the incoming argument register is explicitly overwritten.
+                    // Do not rely on caller-saved registers being clobbered.
+                    if (register < 2 || unaryMetadataCall == null || !unaryMetadataCall(i.Target)) return false;
+                    break;
                 case A64Op.B:
                     if (i.Target <= pc || i.Target >= end) return false;
                     pending.Push(i.Target);
                     continue;
                 case A64Op.Cbz or A64Op.Cbnz or A64Op.Tbz or A64Op.Tbnz:
-                    if (i.Rd == 0) return false;
+                    if (i.Rd == register) return false;
                     goto case A64Op.BCond;
                 case A64Op.BCond:
                     if (i.Target <= pc || i.Target >= end) return false;

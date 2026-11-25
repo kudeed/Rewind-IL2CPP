@@ -297,6 +297,32 @@ var neg22=new Action<(Block B,Node Phi,Node Load,Node Shift,Dictionary<Node,List
 foreach(var mutation in neg22){var fixture22=IndexedFixture22();mutation(fixture22);Check(!Rewind.Analysis.Passes.IndexedBaseMerges.Candidate(fixture22.B,fixture22.Phi,fixture22.Uses),"unsafe indexed merge accepted");}
 Console.WriteLine("INDEXED_BASE_SMOKE_PASS positive=1 negative="+neg22.Length);
 
+// Different loaded arrays merge with indexed elements from other arrays.
+static (Block B,Node Phi,Node Load,Node Shift,Dictionary<Node,List<Node>> Uses) MixedIndexedFixture28(){
+ var f=IndexedFixture22();
+ Node C(long n)=>new(){Op=Op.Const,Type=VT.I64,Imm=n};
+ Node N(Op op,params Node[] xs)=>new(){Op=op,Type=VT.I64,In=xs};
+ Node Loaded()=>N(Op.Load,N(Op.Param));
+ var ix=N(Op.SExt,new Node{Op=Op.Param,Type=VT.I32});
+ var joined=N(Op.Phi,Enumerable.Range(0,7).Select(_=>Loaded()).ToArray());
+ var a=N(Op.Add,joined,N(Op.Shl,ix,C(3)));
+ var c=N(Op.Add,Loaded(),N(Op.Shl,ix,C(3)));
+ f.B.Preds.Add(new Block());f.Phi.In=[a,Loaded(),c];
+ return f;
+}
+var mix28=MixedIndexedFixture28();Check(Rewind.Analysis.Passes.IndexedBaseMerges.Candidate(mix28.B,mix28.Phi,mix28.Uses),"mixed indexed positive");
+var neg28=new Action<(Block B,Node Phi,Node Load,Node Shift,Dictionary<Node,List<Node>> Uses)>[]{
+ f=>f.Phi.In[0].In[0].In[0]=new Node{Op=Op.Param,Type=VT.I64},
+ f=>f.Phi.In[0].In[1].In[1].Imm=2,
+ f=>f.Phi.In[2].In[1].In[0].In[0].Type=VT.I64,
+ f=>f.Phi.In[1]=f.Phi.In[0],
+ f=>f.Uses[f.Phi].Add(new Node{Op=Op.Load,Type=VT.I64}),
+ f=>f.Load.In[0].In[1].Imm=24,
+ f=>f.B.Nodes.Insert(0,new Node{Op=Op.Store,Type=VT.I64}),
+};
+foreach(var mutation in neg28){var mix=MixedIndexedFixture28();mutation(mix);Check(!Rewind.Analysis.Passes.IndexedBaseMerges.Candidate(mix.B,mix.Phi,mix.Uses),"unsafe mixed indexed merge accepted");}
+Console.WriteLine("MIXED_INDEXED_BASE_SMOKE_PASS positive=1 negative="+neg28.Length);
+
 // Explicit LSDA no-pad evidence is required, not merely a missing entry.
 static (Function Fn,Block Gate,Block Body,Node Call,Node Park,List<CallSite> Sites) TryPrefix23()
 {
