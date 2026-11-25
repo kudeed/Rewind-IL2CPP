@@ -384,6 +384,17 @@ add25.In[0]=C22(-4294967296);sh25.In[1]=C22(31);Check(!HirBuilder.TryPackedSigne
 sh25.In[1]=C22(32);x25.Type=VT.I64;Check(!HirBuilder.TryPackedSignedIndex(asr25,1,8,out _,out _),"unproven width");
 Console.WriteLine("PACKED_INDEX_SMOKE_PASS positive=1 negative=6");
 
+uint[] target27=[0xa9bf4ffe,0xf9002801,0xb4000101,0xaa0003f3,0xaa0103e0,0xaa1f03e1,0x9400000a,0xbd005a62,0xa8c14ffe,0xd65f03c0,0x9400000a];
+bool Target27(uint[] a,int first=80,int second=88,ulong get=0x1040,bool helper=true)=>Arm64TargetPositionSetter.Matches(a,first,second,0x1000,get,x=>helper&&x==0x1050);
+Check(Target27(target27),"compound target");
+Check(!Target27(target27,72),"wrong reference offset");
+Check(!Target27(target27,80,92),"wrong scalar offset");
+Check(!Target27(target27,get:0x1044),"wrong position call");
+Check(!Target27(target27,helper:false),"wrong exception call");
+foreach(int ix in new[]{0,2,3,4,5,7,8,9}){var bad27=target27.ToArray();bad27[ix]^=1;Check(!Target27(bad27),"unsafe target shape "+ix);}
+Check(!Target27(target27[..^1]),"truncated target");
+Console.WriteLine("COMPOUND_TARGET_SETTER_SMOKE_PASS positive=1 negative=13");
+
 sealed class VectorImage:NativeImage{
  public override ImageFormat Format=>ImageFormat.Elf;
  public VectorImage(params uint[] words){

@@ -609,6 +609,7 @@ public sealed class MethodPipeline
         StructFromParts.Run(result, this);
         WriteBacks.Run(result, _program);
         AccessorFolding.Run(result, _program);
+        Arm64TargetPositionSetter.Run(result, _program);
         LibraryInternals.Run(result, _program);
         HiddenImplementations.Run(result, _program);
         BaseConstructorCalls.Run(result, this, _program);
