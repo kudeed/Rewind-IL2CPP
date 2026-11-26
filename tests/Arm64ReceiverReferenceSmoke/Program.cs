@@ -23,12 +23,13 @@ Actual("GetTimeAddGold",0x245a290,[0xd100c3ffu,0xa90157feu,0xa9024ff4u,0x9001855
 Actual("SetTimeAddGold",0x245aa18,[0xf81e0ffeu,0xa9014ff4u,0x90018554u,0xd0016a33u,0x39657288u,0xf941fe73u,0xf90007e1u,0x37000128u,0xd0016a20u,0xf941fc00u,0x97fbea6fu,0xd0016a20u,0xf9420800u,0x97fbea6cu,0x52800028u,0x39257288u,0xf9400260u,0xd0016a33u,0xb940e408u,0xf9420a73u,0x35000048u,0x97fbeab2u,0x910023e0u,0xaa1f03e1u,0x946de729u,0xf9400268u,0xaa0003e1u,0xaa1f03e2u,0xaa0803e0u,0x949a0866u,0xa9414ff4u,0xf84207feu,0xd65f03c0u],"6d60c7156ebe11714245425fa44ff8f976ca20a7249e965e74d9888969a2fff5",6);
 Actual("EnableHoleCollider",0x2468150,[0xf81e0ffeu,0xa9014ff4u,0xd00184d4u,0xaa0103f3u,0x3967ea88u,0x370000c8u,0x900169c0u,0xf9461400u,0x97fbb4a3u,0x52800028u,0x3927ea88u,0xb4000193u,0x900169c8u,0xaa1303e0u,0xf9461508u,0xf9400101u,0x94163d9eu,0xb40000c0u,0xa9414ff4u,0x52800021u,0xaa1f03e2u,0xf84207feu,0x149c5cceu,0x97fbb52du],"caca041f52de6ca136371c0660a641d69e7e979c82ecbbc4257846159a7bfb29",3);
 Actual("DisableHoleCollider",0x24681b0,[0xf81e0ffeu,0xa9014ff4u,0xd00184d4u,0xaa0103f3u,0x3967e688u,0x370000c8u,0x900169c0u,0xf9461400u,0x97fbb48bu,0x52800028u,0x3927e688u,0xb4000193u,0x900169c8u,0xaa1303e0u,0xf9461508u,0xf9400101u,0x94163d86u,0xb40000c0u,0xa9414ff4u,0x52800021u,0xaa1f03e2u,0xf84207feu,0x149c5cb6u,0x97fbb515u],"fc050cb13341d59a38472d9d0364bb23c7f242e8b2ec07567b59452fd4c4665f",3);
+Actual("RectTransformDistance",0x24f6aa8,[0xfc1c0fecu,0x6d012bebu,0x6d0223e9u,0xa9034ffeu,0xb4000481u,0xaa0103f3u,0xaa0103e0u,0xaa1f03e1u,0x9497fd87u,0xaa1303e0u,0xaa1f03e1u,0x1e204008u,0x9497fde4u,0xaa1303e0u,0xaa1f03e1u,0x1e204009u,0x9497fe41u,0xaa1303e0u,0xaa1f03e1u,0x1e20400au,0x9497fd7bu,0xaa1303e0u,0xaa1f03e1u,0x1e20402bu,0x9497fdd8u,0xaa1303e0u,0xaa1f03e1u,0x1e20402cu,0x9497fe35u,0x1e2e1000u,0xa9434ffeu,0x1e213800u,0x1e2a0921u,0x1e200982u,0x1e213900u,0x6d4223e9u,0x1e222961u,0x6d412bebu,0xfc4407ecu,0xd65f03c0u,0x97f97ac6u],"8fc3d5491c68803759b1f0a8f269d4d4cebadc2e521c79e5f5970ce431ac655d",6);
 void Actual(string name,ulong start,uint[] words,string hash,int mutate){
  var image=new CodeImage(words,start);
  if(image.Sha!=hash)throw new Exception(name+" fixture hash");
  bool Check(uint[] w,bool known)=>Arm64ReceiverProof.IsUnused(new CodeImage(w,start),start,start+(ulong)w.Length*4,arglessThrow:t=>known&&t==Throw);
  checks.Add((name+" native receiver independent",true,Check(words,true)));
- if(name.EndsWith("HoleCollider"))checks.Add((name+" unknown null throw",false,Check(words,false)));
+ if(name.EndsWith("HoleCollider")||name=="RectTransformDistance")checks.Add((name+" unknown null throw",false,Check(words,false)));
  var m=words.ToArray();m[mutate]=0xaa0003f3u;
  checks.Add((name+" injected incoming receiver read",false,Check(m,true)));
 }
