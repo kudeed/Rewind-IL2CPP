@@ -25,6 +25,18 @@ public static class Arm64ReceiverProof
             test.Op is A64Op.Tbz or A64Op.Tbnz&&test.Target>=pc+4&&test.Target<section.End;
     }
 
+    // Exact epilogue with restored x20/x19, one x1 load from x8,
+    // restored LR/x21 and a direct B. No write/read of stale x0.
+    public static bool DirectRestoredTail(NativeImage image,ulong pc,ulong target)
+    {
+        if(image.Arch!=CpuArch.Arm64||pc<12||!image.IsMapped(pc-12,16)||
+           image.SectionAt(pc-12) is not {IsExecutable:true} section||pc+4>section.End)return false;
+        return image.U32(pc-12)==0xa9414ff4u&&
+               image.U32(pc-8)==0xf9400101u&&
+               image.U32(pc-4)==0xa8c257feu&&
+               A64Decoder.Decode(image.U32(pc),pc) is {Op:A64Op.B,Target:var dest}&&dest==target;
+    }
+
     // An entry null-checks the first managed reference argument before
     // copying it into x0. The only path that skips the overwrite must
     // reach an identified argumentless null-reference throw directly.

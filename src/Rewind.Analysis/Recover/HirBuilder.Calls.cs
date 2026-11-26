@@ -1778,6 +1778,21 @@ public sealed partial class HirBuilder
                         thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
                         _h.Notes.Add($"receiver-independent merged scalar at 0x{call.Addr:X} to 0x{method.Address:X}");
                     }
+                    else if (Environment.GetEnvironmentVariable("REWIND_NO_TAIL_UNUSED_RECEIVER") == null &&
+                             tail && call.Op == Op.TailCall && method.ReturnType.IsVoid &&
+                             method.Parameters.Length == 1 &&
+                             method.Parameters[0].Type is TypeDefSig { Definition: { IsValueType: false } } &&
+                             Eval(node) is SVal { Expr: { } tailScalar } &&
+                             (tailScalar.Type ?? (tailScalar as HLocal)?.Variable.Type) is PrimitiveSig { Element: Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8 } &&
+                             Rewind.Analysis.Arm64.Arm64ReceiverProof.DirectRestoredTail(_p.Model.Image,call.Addr,method.Address) &&
+                             CanRestoreUnusedReceiver(call,method,classArgs,methodArgs,isVirtual,alternatives,receiverOverride,shift))
+                    {
+                        // A direct tail branch after restoring the caller's
+                        // callee-saved frame can reuse a dead integer x0. The
+                        // actual reference argument must remain untouched.
+                        thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                        _h.Notes.Add($"receiver-independent restored scalar tail at 0x{call.Addr:X} to 0x{method.Address:X}");
+                    }
                     else if (Environment.GetEnvironmentVariable("REWIND_NO_I32_UNUSED_RECEIVER") == null &&
                              Eval(node) is SVal { Expr: { } stale } &&
                              (stale.Type ?? (stale as HLocal)?.Variable.Type) is PrimitiveSig { Element: Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4 } &&

@@ -73,6 +73,15 @@ foreach(int ix in new[]{0,1,2,3,5}){
 }
 if(ArgGuard(guardedArg,false))failed++;
 Console.WriteLine($"GUARDED_ARGUMENT_RECEIVER_SMOKE positive=1 negative=6 failed={failed}");
+uint[] restoredTail=[0xa9414ff4u,0xf9400101u,0xa8c257feu,0x14000001u,Kill,Ret];
+bool Tail(uint[] words,ulong target=0x1010)=>Arm64ReceiverProof.DirectRestoredTail(new CodeImage(words),0x100c,target);
+if(!Tail(restoredTail))failed++;
+foreach(int ix in new[]{0,1,2,3}){
+ var wrong=restoredTail.ToArray();wrong[ix]^=1;
+ if(Tail(wrong))failed++;
+}
+if(Tail(restoredTail,0x1014)||Arm64ReceiverProof.DirectRestoredTail(new CodeImage(restoredTail),0x1008,0x1010))failed++;
+Console.WriteLine($"RESTORED_TAIL_RECEIVER_SMOKE positive=1 negative=6 failed={failed}");
 var argCases=new (string Name,bool Expected,uint[] Words,bool KnownCall)[]{
  ("x2 direct kill",true,new[]{0xAA1F03E2u,Ret},false),
  ("x2 kill after proven unary metadata helper",true,new[]{0x94000004u,0xAA1F03E2u,Ret},true),
