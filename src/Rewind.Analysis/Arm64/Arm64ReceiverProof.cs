@@ -25,6 +25,24 @@ public static class Arm64ReceiverProof
             test.Op is A64Op.Tbz or A64Op.Tbnz&&test.Target>=pc+4&&test.Target<section.End;
     }
 
+    // An entry null-checks the first managed reference argument before
+    // copying it into x0. The only path that skips the overwrite must
+    // reach an identified argumentless null-reference throw directly.
+    public static bool GuardedFirstArgument(NativeImage image, ulong start, ulong end, Func<ulong,bool> arglessThrow)
+    {
+        if(image.Arch!=CpuArch.Arm64||start>=end||end-start<20||
+           !image.IsMapped(start,16)||image.SectionAt(start) is not {IsExecutable:true} section||end>section.End)return false;
+        if(image.U32(start)!=0xf81e0ffeu||image.U32(start+4)!=0xa9014ff4u||
+           image.U32(start+12)!=0xaa0103e0u)return false;
+        uint word=image.U32(start+8);
+        if((word&0xff00001fu)!=0xb4000001u)return false;
+        var guard=A64Decoder.Decode(word,start+8);
+        if(guard.Op!=A64Op.Cbz||guard.Target<start+16||guard.Target+4>end||!image.IsMapped(guard.Target,4))return false;
+        var fail=A64Decoder.Decode(image.U32(guard.Target),guard.Target);
+        return fail.Op==A64Op.Bl&&arglessThrow(fail.Target)&&
+            IsUnused(image,start,end,arglessThrow:arglessThrow);
+    }
+
     public static bool IsUnused(NativeImage image, ulong start, ulong end, byte register = 0, Func<ulong,bool>? unaryMetadataCall = null, Func<ulong,bool>? arglessThrow = null)
     {
         if (register > 7 || image.Arch != CpuArch.Arm64 || start >= end || (start & 3) != 0 || (end & 3) != 0 ||

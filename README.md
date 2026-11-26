@@ -448,3 +448,16 @@ A recognized argumentless ThrowNullReference helper may terminate a proof
 path; no arbitrary call or inferred throw is accepted. Disable this extension
 with REWIND_NO_BOOL_UNUSED_RECEIVER=1. Synthetic tests cover one accepted and
 five rejected repeat shapes, and one accepted and three rejected throw paths.
+
+### Exact first-reference-argument guard with unused instance receiver
+
+Recognize the bounded ARM64 entry shape saving LR/x20/x19, CBZ x1 to a
+direct identified argumentless ThrowNullReference helper, and MOV x0,x1
+on the nonnull edge. Require a void-returning same-owner direct method with
+a reference first parameter and the existing receiver-independence proof.
+Only a stale recovered Int32/UInt32 or zero receiver is replaced with the
+current managed instance; the actual argument and its null behavior remain
+unchanged. Disable with REWIND_NO_GUARDED_ARGUMENT_RECEIVER=1. The synthetic
+guard test has one accepted and six rejected shapes. The external workflow
+executes original complete ToggleInteractable bodies with explicit engine
+service boundaries and checks all changed callers.

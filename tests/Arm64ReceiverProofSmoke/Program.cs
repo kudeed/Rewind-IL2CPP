@@ -64,6 +64,15 @@ foreach(int index in new[]{0,1,2}){
 if(Arm64ReceiverProof.RepeatedBooleanCall(repeated,0x1008,0x101c)||
    Arm64ReceiverProof.RepeatedBooleanCall(repeated,0x1004,0x1018))failed++;
 Console.WriteLine($"BOOL_REPEAT_CALL_SMOKE positive=1 negative=5 failed={failed}");
+uint[] guardedArg=[0xf81e0ffeu,0xa9014ff4u,0xb4000061u,0xaa0103e0u,Ret,0x94000002u,Ret,Ret];
+bool ArgGuard(uint[] words,bool known=true)=>Arm64ReceiverProof.GuardedFirstArgument(new CodeImage(words),0x1000,0x1020,a=>known&&a==0x101c);
+if(!ArgGuard(guardedArg))failed++;
+foreach(int ix in new[]{0,1,2,3,5}){
+ var wrong=guardedArg.ToArray();wrong[ix]^=1;
+ if(ArgGuard(wrong))failed++;
+}
+if(ArgGuard(guardedArg,false))failed++;
+Console.WriteLine($"GUARDED_ARGUMENT_RECEIVER_SMOKE positive=1 negative=6 failed={failed}");
 var argCases=new (string Name,bool Expected,uint[] Words,bool KnownCall)[]{
  ("x2 direct kill",true,new[]{0xAA1F03E2u,Ret},false),
  ("x2 kill after proven unary metadata helper",true,new[]{0x94000004u,0xAA1F03E2u,Ret},true),

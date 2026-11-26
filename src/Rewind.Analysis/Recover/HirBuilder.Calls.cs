@@ -1732,6 +1732,23 @@ public sealed partial class HirBuilder
                             thisExpr = Value(node);
                         }
                     }
+                    else if (Environment.GetEnvironmentVariable("REWIND_NO_GUARDED_ARGUMENT_RECEIVER") == null &&
+                             (node.IsConstValue(0) ||
+                              Eval(node) is SVal { Expr: { } staleArg } &&
+                              (staleArg.Type ?? (staleArg as HLocal)?.Variable.Type) is PrimitiveSig { Element: Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4 }) &&
+                             method.ReturnType.IsVoid && method.Parameters.Length>0 &&
+                             method.Parameters[0].Type is TypeDefSig { Definition: { IsValueType: false } } &&
+                             _p.RangeOf(method.Address) is {} argRange &&
+                             Rewind.Analysis.Arm64.Arm64ReceiverProof.GuardedFirstArgument(_p.Model.Image,argRange.Start,argRange.End,
+                                 target=>_p.Helpers.KindAt(target)==HelperKind.ThrowNullReference) &&
+                             CanRestoreUnusedReceiver(call,method,classArgs,methodArgs,isVirtual,alternatives,receiverOverride,shift,allowArglessThrow:true))
+                    {
+                        // The native first argument is the actual receiver of
+                        // the callee's first operation. Its independent null
+                        // check must still throw; never substitute that argument.
+                        thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                        _h.Notes.Add($"receiver-independent guarded first argument at 0x{call.Addr:X} to 0x{method.Address:X}");
+                    }
                     else if (!NoNullReceivers && node.IsConstValue(0))
                     {
                         // A string constructor: IL2CPP makes each one a method "CreateString" with the same
