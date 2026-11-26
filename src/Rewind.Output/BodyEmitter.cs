@@ -780,6 +780,7 @@ public sealed class BodyEmitter
                     _il.Emit(OpCodes.Ldobj, Ref(d.Type));
                     return;
                 case HUnary u:
+                    CheckAggregateNumeric(u.Op.ToString(), u.Operand);
                     Value(u.Operand);
                     switch (u.Op)
                     {
@@ -798,6 +799,7 @@ public sealed class BodyEmitter
                     Compare(c);
                     return;
                 case HConv c:
+                    CheckAggregateNumeric(c.Kind.ToString(), c.Operand);
                     Value(c.Operand);
                     _il.Emit(c.Kind switch
                     {
@@ -883,8 +885,19 @@ public sealed class BodyEmitter
             }
         }
 
+        private void CheckAggregateNumeric(string operation, HExpr operand)
+        {
+            TypeSig? declared = operand is HArg a
+                ? (a.Index < 0 ? _method.DeclaringType.Sig : ParameterType(a.Index))
+                : null;
+            if (AggregateNumericOperands.Error(operation, operand, declared) is { } error)
+                throw new CannotEmit(error);
+        }
+
         private void Binary(HBinary b)
         {
+            CheckAggregateNumeric(b.Op.ToString(), b.Left);
+            CheckAggregateNumeric(b.Op.ToString(), b.Right);
             bool shift = b.Op is HBinaryOp.Shl or HBinaryOp.Shr or HBinaryOp.ShrUn;
             bool wide = StackBits(b.Left) == 64 || (!shift && StackBits(b.Right) == 64);
             Value(b.Left);
@@ -925,6 +938,8 @@ public sealed class BodyEmitter
 
         private void Compare(HCompare c)
         {
+            CheckAggregateNumeric(c.Op.ToString(), c.Left);
+            CheckAggregateNumeric(c.Op.ToString(), c.Right);
             bool isFloat = IsFloat(c.Left.Type) || IsFloat(c.Right.Type);
             // ("x as long" is an object or null, not a number of 64 bits: nothing to widen the other side to.)
             bool tested = c.Left is HTypeExpr { Op: HTypeOp.IsInst } || c.Right is HTypeExpr { Op: HTypeOp.IsInst };
