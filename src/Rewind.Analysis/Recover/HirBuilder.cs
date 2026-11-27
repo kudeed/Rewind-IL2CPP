@@ -1,4 +1,3 @@
-// Modified by xob0t (2026): virtual calls through merged class pointers, gaps always marked, small structs as numbers, floating-point negation, bits read as float/double, merged struct returns, long stack slots that held a reference and a number, struct addresses typed as their target, merged statics pointers, objects copied into a merge before their constructor runs. See FORK.md.
 using Rewind.Analysis.Abi;
 using Rewind.Analysis.Hir;
 using Rewind.Analysis.Ir;

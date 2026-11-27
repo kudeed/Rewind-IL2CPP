@@ -1,4 +1,3 @@
-// Modified by xob0t (2026): stack arguments of calls to targets not yet known, switches through byte-indexed jump tables, jump-table registers dead after the jump, volatile registers a direct callee leaves alone kept across the call. See FORK.md.
 using Iced.Intel;
 using Rewind.Analysis.Ir;
 using Rewind.Binary;

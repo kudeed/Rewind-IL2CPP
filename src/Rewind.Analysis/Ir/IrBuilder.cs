@@ -1,4 +1,3 @@
-// Modified by xob0t (2026): floating-point negation. See FORK.md.
 namespace Rewind.Analysis.Ir;
 
 /// <summary>

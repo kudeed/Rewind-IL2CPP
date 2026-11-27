@@ -1,4 +1,3 @@
-// Modified by xob0t (2026): objects copied into a merge before their constructor runs. See FORK.md.
 using Rewind.Analysis.Hir;
 using Rewind.Analysis.Ir;
 using Rewind.Model;

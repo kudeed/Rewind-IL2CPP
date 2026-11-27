@@ -1,4 +1,3 @@
-// Modified by xob0t (2026): floating-point negation, engine-method lookups merged from several paths. See FORK.md.
 using Rewind.Model;
 using Rewind.Analysis.Ir;
 using Rewind.Analysis.Passes;

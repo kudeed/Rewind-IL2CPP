@@ -1,4 +1,3 @@
-// Modified by xob0t (2026): gaps always marked, floating-point negation. See FORK.md.
 using Rewind.Analysis.Abi;
 using Rewind.Analysis.Hir;
 using Rewind.Analysis.Ir;

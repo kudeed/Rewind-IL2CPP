@@ -1,4 +1,3 @@
-// Modified by xob0t (2026): float arguments of native calls, slot-specialized invokers, offset-0 field addresses, gaps always marked, small structs as numbers, floating-point negation, inlined compare-exchange on references, one virtual method through nested merges, objects copied into a merge before their constructor runs. See FORK.md.
 using Rewind.Analysis.Abi;
 using Rewind.Analysis.Hir;
 using Rewind.Analysis.Ir;

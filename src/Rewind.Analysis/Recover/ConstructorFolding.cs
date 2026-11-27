@@ -1,4 +1,3 @@
-// Modified by xob0t (2026): inlined constructor folding. See FORK.md.
 using Rewind.Analysis.Hir;
 using Rewind.Model;
 using Rewind.Runtime;

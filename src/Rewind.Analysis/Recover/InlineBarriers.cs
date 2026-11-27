@@ -1,4 +1,3 @@
-// Modified by xob0t (2026): static-field write barriers; card tables indexed from the image base, re-read flags, copied endings. See FORK.md.
 using Rewind.Analysis.Ir;
 using Rewind.Analysis.Passes;
 

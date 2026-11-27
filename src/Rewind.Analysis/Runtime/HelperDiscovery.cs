@@ -1,4 +1,3 @@
-// Modified by xob0t (2026): helpers behind widening wrappers. See FORK.md.
 using Rewind.Binary;
 using Rewind.Metadata;
 using Rewind.Model;

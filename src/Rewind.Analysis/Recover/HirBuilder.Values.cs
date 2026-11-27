@@ -1,4 +1,3 @@
-// Modified by xob0t (2026): virtual calls through merged class pointers, string indexer, gaps always marked, inlined object hash, small structs as numbers, floating-point negation, merged struct returns, low halves of 64-bit fields, casts of stored objects, unboxed reads after a type test, a class entry's address merged from several paths. See FORK.md.
 using Rewind.Analysis.Hir;
 using Rewind.Analysis.Ir;
 using Rewind.Analysis.X64;

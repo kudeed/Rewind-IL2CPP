@@ -1,4 +1,3 @@
-// Added by xob0t (2026): the volatile registers a direct callee can change, read from its code. See FORK.md.
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using Iced.Intel;

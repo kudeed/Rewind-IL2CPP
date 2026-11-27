@@ -1,4 +1,3 @@
-// Modified by xob0t (2026): byte-indexed two-level jump tables. See FORK.md.
 using Iced.Intel;
 using Rewind.Binary;
 
