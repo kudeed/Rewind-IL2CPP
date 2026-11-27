@@ -56,6 +56,11 @@ public sealed class BodyEmitter
         {
             var body = new MethodBody(target) { InitLocals = true };
             new Writer(this, method, h, target, body).Run();
+            // HIR already folds many List.Add diamonds. A final exact
+            // IL-shape pass handles only the remaining proven patterns.
+            if (Environment.GetEnvironmentVariable("REWIND_NO_LIST_APPEND_IL_FOLDING") == null &&
+                ListAppendIlFolding.Run(body) is int folded && folded > 0)
+                h.Notes.Add($"public List.Add restored from {folded} complete emitted capacity diamond(s)");
             body.OptimizeMacros();
             target.Body = body;
             return null;
