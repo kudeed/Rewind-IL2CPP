@@ -309,6 +309,38 @@ public sealed class ProgramAnalysis
     /// <summary>What a P/Invoke declaration imports (library, entry point, ...), when its wrapper could be read.</summary>
     public PInvokeImport? PInvokeOf(MethodDef method) => PInvoke.ByMethod.GetValueOrDefault(method);
 
+    private Dictionary<ulong, List<MethodDef>>? _pinvokeStubs;
+
+    /// <summary>
+    /// AArch64: the P/Invoke declarations a function the image imports (a PLT stub, by its symbol) is called for.
+    /// A declaration whose code calls one imported function and no other is that function's wrapper; IL2CPP links
+    /// such imports directly instead of resolving them at run time, so a call of the stub is a call of the
+    /// declaration (made through it, the way its wrapper marshals the arguments).
+    /// </summary>
+    public IReadOnlyDictionary<ulong, List<MethodDef>> PInvokeStubs => _pinvokeStubs ??= FindPInvokeStubs();
+
+    private Dictionary<ulong, List<MethodDef>> FindPInvokeStubs()
+    {
+        var result = new Dictionary<ulong, List<MethodDef>>();
+        if (Model.Image is not Rewind.Binary.ElfImage { Arch: Rewind.Binary.CpuArch.Arm64 } elf || elf.ImportStubs.Count == 0 ||
+            Environment.GetEnvironmentVariable("REWIND_NO_PINVOKE_STUBS") != null) return result;
+        foreach (MethodDef method in Model.Methods)
+        {
+            if ((method.Flags & MethodDef.PInvokeImpl) == 0 || method.Address == 0 || !method.IsStatic) continue;
+            Arm64.A64Cfg cfg = Arm64.A64Cfg.Build(Context, method.Address);
+            var stubs = new HashSet<ulong>();
+            foreach (Arm64.A64Block block in cfg.Blocks)
+                foreach (Arm64.A64Instruction ins in block.Instructions)
+                    if (ins.Op is Arm64.A64Op.Bl or Arm64.A64Op.B && elf.ImportStubs.ContainsKey(ins.Target) && Helpers.At(ins.Target) == null)
+                        stubs.Add(ins.Target);
+            if (stubs.Count != 1) continue;
+            ulong stub = stubs.First();
+            if (!result.TryGetValue(stub, out List<MethodDef>? list)) result[stub] = list = [];
+            list.Add(method);
+        }
+        return result;
+    }
+
     /// <summary>All P/Invoke declarations whose wrapper could be read.</summary>
     public IEnumerable<PInvokeImport> PInvokeDeclarations => PInvoke.ByMethod.Values;
 
