@@ -1299,7 +1299,10 @@ public sealed partial class HirBuilder
         HConv c => c.Kind < HConvKind.OvfI1 && IsPure(c.Operand),
         HSelect s => IsPure(s.Condition) && IsPure(s.WhenTrue) && IsPure(s.WhenFalse),
         HTypeExpr t => t.Op is HTypeOp.IsInst or HTypeOp.Default or HTypeOp.SizeOf or HTypeOp.TypeToken && (t.Operand == null || IsPure(t.Operand)),
-        HOpaque o => o.Text is "undefined" or "frame" && o.Operands.All(IsPure),
+        // A marker that stands for a value it could not express (a reference or a struct computed with as a number,
+        // a struct made from one) does nothing itself: where that value is never used, the marker and its problem
+        // (a site problem) go, as the arithmetic itself would have.
+        HOpaque o => o.Text is "undefined" or "frame" or "reference_arithmetic" or "struct_bits" or "struct_from_value" && o.Operands.All(IsPure),
         // The same bits read as another type (BitsOfValue, ValueFromBits): a way of writing a value, not an action.
         HCall { This: null, Method: { Name: "SingleToInt32Bits" or "Int32BitsToSingle" or "DoubleToInt64Bits" or "Int64BitsToDouble", DeclaringType: { Name: "BitConverter", Namespace: "System" } } } c =>
             c.Arguments.All(IsPure),
