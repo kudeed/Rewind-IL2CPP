@@ -54,6 +54,66 @@ foreach(var c in throwCases){
  if(actual!=c.Expected){Console.Error.WriteLine(c.Name+": "+actual+" expected "+c.Expected);failed++;}
 }
 Console.WriteLine($"BOOL_RECEIVER_THROW_SMOKE positive={throwCases.Count(c=>c.Expected)} negative={throwCases.Count(c=>!c.Expected)} failed={failed}");
+// Void return leaves x0 unconstrained; a scalar-return method cannot use
+// this proof. Preserve rejection of arbitrary RET-register and read paths.
+var voidCases=new (string Name,bool Expected,bool Void,uint[] Words)[]{
+ ("void receiver-independent return",true,true,new[]{Ret}),
+ ("nonvoid stale return",false,false,new[]{Ret}),
+ ("void read then return",false,true,new[]{0xAA0003E1u,Ret}),
+ ("void branch to return or kill",true,true,new[]{0xB4000041u,Kill,Ret}),
+ ("void indirect return register x0",false,true,new[]{0xD65F0000u}),
+ ("void forwards stale receiver",false,true,new[]{0x94000002u,Ret}),
+};
+foreach(var c in voidCases){
+ var im=new CodeImage(c.Words);
+ bool actual=Arm64ReceiverProof.IsUnused(im,0x1000,0x1000+(ulong)c.Words.Length*4,allowVoidReturn:c.Void);
+ if(actual!=c.Expected){Console.Error.WriteLine(c.Name+": "+actual+" expected "+c.Expected);failed++;}
+}
+Console.WriteLine($"VOID_RECEIVER_EXIT_SMOKE positive={voidCases.Count(c=>c.Expected)} negative={voidCases.Count(c=>!c.Expected)} failed={failed}");
+var indirectCases=new (string Name,bool Expected,uint[] Words)[]{
+ ("AAPCS64 indirect UIVertex result leaves x0 unused",true,new[]{Ret}),
+ ("indirect result still rejects x0 read",false,new[]{0xAA0003E1u,Ret}),
+ ("indirect result still rejects unknown call",false,new[]{0x94000002u,Ret}),
+ ("indirect result accepts x0 overwritten before return",true,new[]{Kill,Ret}),
+ ("ordinary scalar return still rejects stale x0",false,new[]{Ret}),
+};
+foreach(var c in indirectCases){
+ var im=new CodeImage(c.Words);
+ bool actual=Arm64ReceiverProof.IsUnused(im,0x1000,0x1000+(ulong)c.Words.Length*4,
+     allowIndirectStructReturn:c.Name.StartsWith("AAPCS64")||c.Name.StartsWith("indirect result"));
+ if(actual!=c.Expected){Console.Error.WriteLine(c.Name+": "+actual+" expected "+c.Expected);failed++;}
+}
+Console.WriteLine($"INDIRECT_STRUCT_RECEIVER_EXIT_SMOKE positive={indirectCases.Count(c=>c.Expected)} negative={indirectCases.Count(c=>!c.Expected)} failed={failed}");
+var sretCases=new (string Name,bool Expected,uint[] Words)[]{
+ ("x8 copied to callee-saved sret pointer",true,new[]{0xAA0803F3u,Ret}), // mov x19,x8
+ ("ordinary x7 copied to callee-saved register",false,new[]{0xAA0703F3u,Ret}),
+ ("x8 scratch after first call is not an sret proof",false,new[]{0x94000001u,0xAA0803F3u,Ret}),
+};
+foreach(var c in sretCases){
+ var im=new CodeImage(c.Words);
+ bool actual=Arm64ReceiverProof.HasIndirectReturnBuffer(im,0x1000,0x1000+(ulong)c.Words.Length*4);
+ if(actual!=c.Expected){Console.Error.WriteLine(c.Name+": "+actual+" expected "+c.Expected);failed++;}
+}
+Console.WriteLine($"AAPCS64_SRET_BUFFER_SMOKE positive={sretCases.Count(c=>c.Expected)} negative={sretCases.Count(c=>!c.Expected)} failed={failed}");
+
+// Original CUIGraphic.uiVertexLerp entry (RVA 0x24e56b8), through mov x0,xzr.
+// SIMD/GP register numbers are not interchangeable: the receiver survives
+// until the explicit GP kill, while the native interpolation loads vertex data.
+uint[] vertexEntry=[0xD10143FFu, 0xFD0013EAu, 0x6D0323E9u, 0xA9044FFEu, 0xB9402829u, 0xD0FF462Au, 0xBD402025u, 0xFD412142u, 0xAD404047u, 0x0E040D21u, 0x1E270123u, 0x53087D2Bu, 0xB9402849u, 0xFC42C031u, 0xFC42C052u, 0xFC43C033u, 0xFC43C054u, 0xAA1F03E0u,Ret];
+if(!Arm64ReceiverProof.IsUnused(new CodeImage(vertexEntry),0x1000,0x1000+(ulong)vertexEntry.Length*4,allowIndirectStructReturn:true))failed++;
+var gpRead=vertexEntry.ToArray();
+// DUP V1.2S,W9 -> DUP V1.2S,W0. The explicit overwrite later is not enough.
+gpRead[9]&=~(31u<<5);
+if(Arm64ReceiverProof.IsUnused(new CodeImage(gpRead),0x1000,0x1000+(ulong)gpRead.Length*4,allowIndirectStructReturn:true))failed++;
+var fpRead=vertexEntry.ToArray();
+// FMOV S3,W9 -> FMOV S3,W0.
+fpRead[10]&=~(31u<<5);
+if(Arm64ReceiverProof.IsUnused(new CodeImage(fpRead),0x1000,0x1000+(ulong)fpRead.Length*4,allowIndirectStructReturn:true))failed++;
+// GP register 0 is not killed by a SIMD-register-0 destination.
+uint[] vectorZero=[(vertexEntry[9]&~31u),0xAA0003E1u,Ret];
+if(Arm64ReceiverProof.IsUnused(new CodeImage(vectorZero),0x1000,0x100c,allowIndirectStructReturn:true))failed++;
+Console.WriteLine($"NATIVE_UIVERTEX_RECEIVER_PROOF positive=1 negative=3 failed={failed}");
+
 uint[] repeatBool=[0x94000006u,0x36000040u,0x94000004u,Ret,Ret,Ret,Kill,Ret];
 var repeated=new CodeImage(repeatBool);
 if(!Arm64ReceiverProof.RepeatedBooleanCall(repeated,0x1008,0x1018))failed++;
