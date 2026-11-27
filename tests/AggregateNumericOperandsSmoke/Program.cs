@@ -42,4 +42,19 @@ Check(false,"Eq",Local(enumeration));
 Check(false,"Add",Local(native));
 Check(false,"Eq",new HConst(null,new PrimitiveSig(Il2CppTypeEnum.Object,null)));
 Check(false,"Add",new HArg(0));
-Console.WriteLine("AGGREGATE_NUMERIC_OPERANDS_SMOKE_PASS rejected=8 accepted=8 (packed MatrixPosition, Vector2, typed fields, enum, native integer)");
+// StickHero DOTweenPro native aggregate recovery: Reset must carry the
+// entire Nullable<Color>; its constructor must carry complete Keyframes.
+// These checks exercise the scalar-annotation gate only. The separate
+// real emitted-IL regression in DotweenPathNativeV110 catches incorrect
+// ldloca Int64 receivers and Int64 constructor arguments.
+var color=Struct("UnityEngine","Color");
+var keyframe=Struct("UnityEngine","Keyframe");
+var nullableDef=new TypeDef { Namespace="System",Name="Nullable`1",IsValueType=true };
+var nullableColor=new GenericInstSig(nullableDef,[color]);
+Check(true,"ShrUn",Local(nullableColor,i8));
+Check(true,"I4",Local(keyframe,i8));
+Check(true,"ShrUn",new HField{Field=new FieldDef{Name="pathColor",Type=color},Type=i8});
+Check(true,"Add",new HArg(1){Type=i8},nullableColor);
+Check(false,"Add",new HField{Field=new FieldDef{Name="time",Type=f4},Type=f4});
+Check(false,"ShrUn",Local(i8));
+Console.WriteLine("AGGREGATE_NUMERIC_OPERANDS_SMOKE_PASS rejected=12 accepted=10 (packed MatrixPosition, Vector2, Nullable<Color>, Keyframe, typed fields, enum, native integer)");
