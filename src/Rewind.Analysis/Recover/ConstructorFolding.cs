@@ -133,24 +133,22 @@ internal static partial class ConstructorFolding
     private static readonly bool NoMarkedRawConstructors = Environment.GetEnvironmentVariable("REWIND_NO_MARKED_RAW_CONSTRUCTORS") != null;
 
     /// <summary>
-    /// In the finished method: an object allocated raw whose own constructor was not put back, but a base
-    /// class's constructor was, as a call on the object. A constructor run on anything but "this" inside a
-    /// constructor is no IL a verifier accepts. The code does what the original did, so it stays; the place is
-    /// marked with a note (one that does not stop the code) and the method is reported incomplete.
+    /// In the finished method: an object allocated raw whose own constructor was not put back, but a constructor
+    /// was, as a call on the object. A constructor run on anything but "this" inside a constructor is no IL a
+    /// verifier accepts, and C# cannot say it. The code does what the original did (the runtime runs it), so it
+    /// stays and the method counts as recovered, as it did before; a note says what the code does there.
     /// </summary>
     public static void MarkRawConstructors(HMethod method)
     {
         if (NoMarkedRawConstructors) return;
         foreach (HBlock block in method.Blocks)
-            for (int i = block.Statements.Count - 1; i >= 0; i--)
+            foreach (HStmt s in block.Statements)
             {
-                if (block.Statements[i] is not HAssign { Target: HLocal { Variable: var created }, Value: HTypeExpr { Op: HTypeOp.Allocate } allocation } ||
+                if (s is not HAssign { Target: HLocal { Variable: var created }, Value: HTypeExpr { Op: HTypeOp.Allocate } allocation } ||
                     !RunsConstructorOn(method, created))
                     continue;
-                string invalid = $"the constructor of {allocation.Target.ShortName} was not put back: a constructor runs on the object allocated raw";
-                if (method.Problems.Count < 64) method.Problems.Add(invalid);
-                method.SiteProblems.Add(invalid);
-                block.Statements.Insert(i, new HEval(new HOpaque("raw_constructor") { Problem = invalid, Remark = true }) { Address = block.Statements[i].Address });
+                string note = $"the constructor of {allocation.Target.ShortName} runs as a call on the object allocated raw (unverifiable IL, what the native code does)";
+                if (!method.Notes.Contains(note)) method.Notes.Add(note);
             }
     }
 
