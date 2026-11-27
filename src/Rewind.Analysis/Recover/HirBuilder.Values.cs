@@ -2520,10 +2520,13 @@ public sealed partial class HirBuilder
             }
             if (a.BaseSem is SVal { Type: PrimitiveSig { Element: Il2CppTypeEnum.I or Il2CppTypeEnum.U } }) return BinarySem(n);
             // An address into something no managed location was found in: the arithmetic stays, as the operand
-            // of a marker (a number added to a reference is no value IL has).
+            // of a marker (a number added to a reference is no value IL has). Moving a managed or unmanaged
+            // pointer on is IL ("ref Unsafe.Add(ref r, 1)"), and does what the native code did: it stays as it is,
+            // reported as before.
             string what = "address computation: " + (place is PUnknown unknown ? unknown.Why : place.GetType().Name[1..]);
             Problem(what);
             Sem arithmetic = BinarySem(n);
+            if (arithmetic is SVal { Expr: HBinary { Left.Type: ByRefSig or PointerSig } or HBinary { Right.Type: ByRefSig or PointerSig } }) return arithmetic;
             return arithmetic is SVal { Expr: var computed } ? new SVal(Site(new HOpaque("address", computed) { Type = TypeForBits(n.Type) }, what)) : arithmetic;
         }
         return BinarySem(n);
