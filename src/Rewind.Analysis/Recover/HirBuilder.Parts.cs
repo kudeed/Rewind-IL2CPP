@@ -482,11 +482,52 @@ public sealed partial class HirBuilder
         Problem("a reference stored over the fields of a struct");
     }
 
+    /// <summary>
+    /// A complete small struct held by one machine value has fields, not integer bits. Decompose only
+    /// a known, tightly covered scalar layout of exactly that width. Padding, unions, references and
+    /// partial values need their existing conservative paths. Snapshot the value once before exposing
+    /// its fields: a source getter may have effects, and destination writes may alias the source.
+    /// </summary>
+    private List<Part>? PartsOfStoredStruct(Sem value, int size, ulong address)
+    {
+        if (value is not SVal { Expr: { Type: { } type } whole } || !IsStructType(type) ||
+            size is <= 0 or > 8 || _p.Layouts.Of(type) is not { Known: true } layout || layout.Size != size)
+            return null;
+        var parts = new List<Part>();
+        if (!Leaves(whole, type, 0, size, 0, parts) || parts.Count == 0) return null;
+        parts.Sort((a, b) => a.Offset.CompareTo(b.Offset));
+        int end = 0;
+        foreach (Part part in parts)
+        {
+            if (part.Offset != end || part.Size <= 0 || part.Offset + part.Size > size ||
+                IsReference(part.Value.Type) || part.Value.Type is ByRefSig or PointerSig ||
+                BitsOf(part.Value.Type) != part.Size * 8)
+                return null;
+            // Every nested struct on the field path must have a known layout too.
+            for (HExpr current = part.Value; !ReferenceEquals(current, whole);)
+            {
+                if (current is not HField { Object: { } owner } || owner.Type == null || !_p.Layouts.Of(owner.Type).Known)
+                    return null;
+                current = owner;
+            }
+            end += part.Size;
+        }
+        if (end != size) return null;
+
+        HVar snapshot = Temp(type, size <= 4 ? VT.I32 : VT.I64);
+        Emit(new HAssign(new HLocal(snapshot) { Type = type }, whole), address);
+        var held = new List<Part>();
+        // The same verified layout under a fresh value local; it cannot alias any destination.
+        if (!Leaves(new HLocal(snapshot) { Type = type }, type, 0, size, 0, held))
+            throw new InvalidOperationException("A verified struct layout changed while taking its store snapshot.");
+        return held;
+    }
+
     /// <summary>Assigns the bytes of a value to the fields a wide store covers.</summary>
     private void StoreParts(List<Part> leaves, Node valueNode, ulong address)
     {
         Sem s = Eval(valueNode);
-        List<Part>? source = PartsOf(s);
+        List<Part>? source = PartsOf(s) ?? PartsOfStoredStruct(s, valueNode.Type.Bytes(), address);
         // Read every source before writing any destination: they may be the same struct.
         var assignments = new List<(HExpr Target, HExpr Value)>();
         HExpr? wide = null;

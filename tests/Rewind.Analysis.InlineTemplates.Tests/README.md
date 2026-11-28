@@ -17,3 +17,11 @@ The native evidence comes from PAP's ARM64 IL2CPP binary, not substitute SDK cod
 The two primary native end-to-end samples are `GameEndPodium/<LoadSkin>d__23::MoveNext` and `Paper2.GameFlow.Scenes.CoreScenesHandler/<LoadAndActivateScene>d__13::MoveNext`. The pre-change evidence is under `/data/home/game/pap_autonomous/20261128-v8-batch/resume-20261128-0212/value-snapshot-patch/whole-value-r1/` and `public-api-probe-r1/`. Final emitted C# compilation uses the actual Unity reference profile and explicit validation-only metadata for other game types. No generated metadata assembly is a runnable SDK implementation.
 
 No match depends on the names `UniTask`, `GetResult` or `SceneInstance`; each is established from recovered code, exact type/layout information and matching effects. SDK visibility and real runtime libraries are unchanged.
+
+## Complete scalar structs in wide stores
+
+PAP `Player::ResetTrailCollider` (token `0600059E`, RVA `0x3B29F88`) loads the complete eight-byte static `DummyColliderPoint` at `0x3B2A1D8`/`0x3B2A1E8`. Each `str d0` writes the first two fields of a `Vector3`; separate `str wzr` instructions set the third field to zero. `Player::EndBotLease` (token `06000521`, RVA `0x3B2F348`) has the same pattern at `0x3B2F73C`/`0x3B2F750`. Before this correction the HIR treated that typed `Vector2` as an integer and emitted `conv.i4(value)` and `value >>> 32`. This defect occurs in recovery before C# decompilation.
+
+`StructStores.cs` exercises the actual store/decomposition boundary with numerical values, signed zero, NaN payloads, infinities, a getter evaluated once, exception-before-write ordering, overlapping source/destination storage and closed nested generic layouts. The new path requires every byte of the complete small struct to belong to a known scalar field. It refuses partial words, unknown or overlapping layouts, padding and references. Field copying uses the recorded layout, without matching Unity or game names. Existing async, ARM64-result and stack-lifetime regressions run in the same executable.
+
+Native capture uses the unchanged ELF SHA-256 `cf0fe59687988793400852978382bef8626a29326f53d2ccedb16b4db79a2bec`; before/after bounded HIR receipts are kept under `/data/home/game/pap_autonomous/20261128-v9-rewind-parts/`. These tests validate this recovery boundary, not complete game runtime behavior.
