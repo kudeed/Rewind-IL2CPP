@@ -58,3 +58,28 @@ exception type, check that a proven no-return call runs once and cannot reach su
 and exercise the caller CFG. Unknown or returning callees, argument/effect changes, conditional or
 indirect transfers, and truncated/non-executable/function-boundary cases must remain unclassified.
 Nearby exception messages are deliberately insufficient to identify a helper.
+
+## Runtime API proof for empty-message exception factories
+
+The next recovery boundary uses independent identities in the original image: exported
+`il2cpp_get_corlib`, `il2cpp_class_from_name`, `il2cpp_runtime_object_init` and `il2cpp_raise_exception`,
+plus the signature library's identified `ObjectNew`. Only complete single-branch API aliases are
+followed. A candidate must preserve the exact corelib/namespace/type arguments into the class lookup,
+allocate that returned class, run its default constructor, and return the same object. The accepted
+caller supplies a two-word, zero-length string view, proving that the shared factory's message-setting
+arm is unreachable. The complete throw wrapper then passes this object and null method to the same
+backend as the exported raise API.
+
+The metadata check requires a unique core-library `System.Object`/`System.Exception` identity, the
+actual exception's core-library assembly and inheritance chain, and a unique public instance void
+parameterless constructor. Ambiguous names, user assembly lookalikes, open/abstract/value types or
+missing constructors are refused. The recognized standard exception kinds use the existing HIR and
+normalizer contracts; no game name or native RVA selects a result. The original index factory is
+`0x38E888C..0x38E88C0`, its shared constructor path is `0x38E912C..0x38E9174`, and the factory/raise
+wrapper is `0x38E887C..0x38E888C`. Those addresses are evidence, not matcher inputs.
+
+`ExceptionFactories.cs` interprets relocated native bytes with ABI-clobbering API fixtures and compares
+the constructed object, exception type, construction count, constructor failure and raise ordering.
+It refuses literal-only matches, missing/changed API identities, incompatible allocation contracts,
+changed register/stack flow, nonempty messages, metadata ambiguity, unknown extents and landing pads.
+The earlier 8-byte wrapper recognizer then forwards the newly proved no-return helper identity.

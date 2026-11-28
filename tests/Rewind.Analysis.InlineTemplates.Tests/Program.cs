@@ -227,6 +227,7 @@ internal static partial class Program
         ClosureReceivers();
         BranchVeneers();
         ExceptionStubs();
+        ExceptionFactories();
         Console.WriteLine(JsonSerializer.Serialize(new { passed = true, assertions, cases = Cases,
             scope = "complete async recovery chain: exact wrapper templates, discarded effects, ARM64 pair returns, proven stack lifetimes typed wide stores, guarded closure receivers, returning ARM64 load veneers and bounded no-return exception wrappers" }));
     }

@@ -24,6 +24,10 @@ public static class HelperShapes
         {
             if (!NoArm64Thunks && AddArm64Thunks(model, context, helpers) is > 0 and var thunks)
                 found.Add($"{thunks} thunks of support functions");
+            if (!NoArm64Exceptions && Arm64ExceptionFactories.Identify(context, context.FunctionStarts, model.Types,
+                    helpers, context.IsManaged, address => model.Image is ElfImage elf &&
+                        elf.ExceptionTableOf(address)?.HasLandingPads == true) is > 0 and var factories)
+                found.Add($"{factories} exception factories/raisers proved by runtime APIs and metadata");
             if (!NoArm64Exceptions && AddArm64ExceptionStubs(model, context, helpers) is > 0 and var exceptions)
                 found.Add($"{exceptions} exception throwers");
             return found.Count == 0 ? null : "shapes:   found by their code: " + string.Join("; ", found);
