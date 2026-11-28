@@ -23,6 +23,7 @@ namespace Rewind.Analysis.Recover;
 /// </summary>
 internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis program)
 {
+    private Il2CppModel Model => program.Model;
     private static readonly bool Disabled = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_FOLD") != null;
     private static readonly bool NoFlows = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_FLOWS") != null;
     private static readonly bool NoGenerics = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_GENERICS") != null;
@@ -875,6 +876,32 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             return null;
         }
 
+        /// <summary>
+        /// Whether the actual receiver can name the method's declaring type.
+        /// Inlining a method body is not enough to justify calling that
+        /// method on an unrelated receiver (for example Int32.Equals
+        /// must never be put back as String.Equals).
+        /// </summary>
+        public bool ReceiverCompatible(TypeSig? actual)
+        {
+            TypeSig expected = _template.Declaring ?? _method.DeclaringType.Sig;
+            if (expected.IsValueType && actual is (ByRefSig or PointerSig)) actual = actual.ElementType;
+            if (actual == null || actual.IsValueType != expected.IsValueType) return false;
+
+            bool SameInstantiation(TypeSig wanted, TypeSig found)
+            {
+                if (wanted.Definition == null || !ReferenceEquals(wanted.Definition, found.Definition)) return false;
+                if (wanted is GenericInstSig || found is GenericInstSig)
+                    return ReferenceEquals(wanted, found);
+                return wanted.Definition.GenericParameters.Length == 0 || ReferenceEquals(wanted, found);
+            }
+            TypeSig? Substitute(TypeSig current, TypeSig parent) =>
+                current is GenericInstSig instance
+                    ? _owner.Model.Sigs.Substitute(parent, instance.Arguments, [])
+                    : parent;
+            return InlineReceiverCompatibility.IsAssignable(expected, actual, SameInstantiation, Substitute);
+        }
+
         public bool Expression(HExpr? method, HExpr? site)
         {
             if (method == null || site == null) return method == null && site == null;
@@ -884,6 +911,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                 case HArg { Index: < 0 }:
                     // A struct's method is handed the address of the struct: the receiver is the place itself.
                     if (_method.DeclaringType.IsValueType && site is HAddressOf { Target: var self }) site = self;
+                    if (!ReceiverCompatible(site.Type)) return false;
                     if (This != null) return HirCleanup.Same(This, site);
                     // Something that does work (a call that hands over the object) only for a method that reads
                     // its object once, before it does anything else: then it is worked out first either way.
@@ -1374,7 +1402,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
     private HCall? MakeCall(Template template, Unifier unifier)
     {
         MethodDef m = template.Method;
-        if (!m.IsStatic && unifier.This == null) return null;
+        if (!m.IsStatic && (unifier.This == null || !unifier.ReceiverCompatible(unifier.This.Type))) return null;
         // (A struct worked out on the spot is a copy the method runs on: right for one that only reads it.)
         if (!m.IsStatic && m.DeclaringType.IsValueType && unifier.This is not (HLocal or HArg or HField or HElement or HDeref) && !ThisFirst(template)) return null;
         TypeSig? declaring = template.Declaring;
