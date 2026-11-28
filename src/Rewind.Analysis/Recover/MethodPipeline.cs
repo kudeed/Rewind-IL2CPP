@@ -657,6 +657,7 @@ public sealed class MethodPipeline
         HiddenImplementations.Run(result, _program);
         BaseConstructorCalls.Run(result, this, _program);
         MergedDelegateConstruction.Run(result);
+        TypeTestReceiverCasts.Run(result);
         ConstructorFolding.MarkRawConstructors(result);
         InitializerOrder.Run(result);
         UnsetLocals.Run(result);
