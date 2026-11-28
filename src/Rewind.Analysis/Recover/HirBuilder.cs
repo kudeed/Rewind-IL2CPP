@@ -35,9 +35,6 @@ public sealed partial class HirBuilder
     private readonly HashSet<Node> _materialize = [];
     private readonly Dictionary<Node, int> _position = [];
     private readonly Dictionary<Node, List<TypeSig>> _castTypes = [];
-    /// <summary>Virtual slots introduced below a statically known base type, resolved from descendant vtables.</summary>
-    private readonly Dictionary<(TypeDef Type, int Slot), MethodDef?> _derivedVirtualCache = [];
-    private readonly Dictionary<TypeDef, TypeDef[]> _derivedTypeCache = [];
     /// <summary>Where each object's class checks are (CastFact's At and From): a check holds only past its place.</summary>
     private readonly Dictionary<Node, List<(Block At, Node? From, IReadOnlyList<Node>? Over)>> _castPlaces = [];
     /// <summary>CastHoldsAtStart's answers, per object and block.</summary>
@@ -629,10 +626,13 @@ public sealed partial class HirBuilder
         foreach (var key in _castAtStart.Keys.Where(k => ReferenceEquals(k.Item1, obj)).ToList()) _castAtStart.Remove(key);
     }
 
-    private TypeSig? TestedType(Node obj)
+    private TypeSig? TestedType(Node obj) => TestedType(obj, _block);
+
+    private TypeSig? TestedType(Node obj, Block? at)
     {
+        if (_cfg == null || at == null || !_cfg.IsReachable(at)) return null;
         int guard = 0;
-        for (Block? b = _block; b != null && guard++ < 4096; b = _cfg.ImmediateDominator(b))
+        for (Block? b = at; b != null && guard++ < 4096; b = _cfg.ImmediateDominator(b))
             if (_typeFacts.TryGetValue(b, out List<(Node Object, TypeSig Type)>? facts))
                 foreach (var (o, t) in facts)
                     if (ReferenceEquals(o, obj))
@@ -640,11 +640,38 @@ public sealed partial class HirBuilder
         return null;
     }
 
-    /// <summary>The receiver's class after a dominating successful type test, or its ordinary inferred/cast type.</summary>
-    private TypeSig? VirtualReceiverType(Node obj, TypeSig? inferred)
+    /// <summary>
+    /// A class proved at the virtual use, or at an earlier pointer read when one is supplied. An interface
+    /// test does not identify a class-vtable slot. A check at the current call cannot justify a cast at an
+    /// earlier pointer read: only type-test facts dominating that read may refine it.
+    /// </summary>
+    private TypeSig? VirtualReceiverType(Node obj, TypeSig? inferred, Node? readAt = null)
     {
-        if (TestedType(obj) is { } tested) return tested;
-        return _castTypes.TryGetValue(obj, out List<TypeSig>? casts) && casts.Count == 1 ? casts[0] : inferred;
+        Block? at = readAt != null ? readAt.Block : _block;
+        if (_cfg == null || at == null || !_cfg.IsReachable(at)) return inferred;
+        TypeSig? tested = TestedType(obj, at);
+        if (tested?.Definition is { IsInterface: false }) return Refine(tested);
+        if ((readAt == null || ReferenceEquals(readAt, _node)) && ReferenceEquals(at, _block) &&
+            _node != null && ReferenceEquals(_node.Block, at) && _position.TryGetValue(_node, out int position) &&
+            (uint)position < (uint)at.Nodes.Count && ReferenceEquals(at.Nodes[position], _node))
+            if (CheckedClassHere(obj) is { Definition.IsInterface: false } checkedType) return Refine(checkedType);
+        return inferred;
+
+        TypeSig Refine(TypeSig known)
+        {
+            // A class test may be weaker than an already known concrete class, but definition equality is
+            // insufficient for generics: Base<int> is not Base<string>. Follow fully substituted bases.
+            if (inferred?.Definition is not { IsInterface: false }) return known;
+            int guard = 0;
+            for (TypeSig? current = inferred; current?.Definition is { IsInterface: false } definition && guard++ < 256;)
+            {
+                if (ReferenceEquals(current, known)) return inferred;
+                if (definition.BaseType == null) break;
+                current = _m.Sigs.Substitute(definition.BaseType,
+                    current is GenericInstSig generic ? generic.Arguments : [], []);
+            }
+            return known;
+        }
     }
 
     /// <summary>When a branch condition is a type test: the object, the type, and which way means "is an instance".</summary>
@@ -1365,7 +1392,7 @@ public sealed partial class HirBuilder
             case SFrame f when _fakeBoxes.TryGetValue(f.Offset, out TypeSig? boxed):
                 // A value given an object header on the stack so that it can be passed as an object: a box.
                 return new HTypeExpr(HTypeOp.Box, boxed, new HLocal(FrameVar(f.Offset + _header, boxed)) { Type = boxed }) { Type = _object };
-            case SVTable entry when VirtualPointer(entry) is { } virtualPointer:
+            case SVTable entry when VirtualPointer(entry, n) is { } virtualPointer:
                 return virtualPointer;
             case SLostRegister:
                 Problem(LostRegisterUsed);
