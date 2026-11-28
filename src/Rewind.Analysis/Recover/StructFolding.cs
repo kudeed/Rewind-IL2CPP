@@ -25,7 +25,7 @@ internal static class StructFolding
     public static void Run(HMethod method, ProgramAnalysis program, MethodPipeline pipeline)
     {
         if (Disabled) return;
-        bool any = false;
+        bool any = StructSnapshots.Run(method, program.Layouts);
         foreach (HBlock block in method.Blocks)
         {
             // Inner structs first: folding "a.p.x = ..; a.p.y = .." into "a.p = .." is what lets "a" fold next.

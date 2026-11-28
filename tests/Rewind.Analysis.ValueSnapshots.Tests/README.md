@@ -37,5 +37,14 @@ The capture receipt and full method IL are on mj8 under `/home/admin/unity/valid
 - Same-block, unchanged field values can become a whole-struct copy, including an exact constructed generic type.
 - Whole-source and nested-field changes, unknown calls, possibly aliasing pointer writes, address-taken locals, mutated struct locals, non-dominating definitions, and value-changing conversions prevent unsafe rereads.
 - Getter and destination expressions retain evaluation counts. A property-shaped name alone does not establish purity.
+- Complete same-block reads can capture the exact whole value before its original storage changes. Coverage comes from the closed type's layout, including recursively split fields and whole nested substruct reads.
+- Unknown, incomplete, overlapping, repeated, mixed-source, open-generic, converted, and cross-block reads do not authorize this transformation. Calls or stores interrupt a read window. An unchanged source does not acquire a redundant snapshot.
+- Reapplying snapshot recovery is a fixed point. Nested generic result data, reference identity, and nonzero tokens survive the clear.
 
-The interpreter handles only the HIR operations used by these fixtures and compares observable values/call counts. It is not an SDK substitute. The tests deliberately do not claim full pipeline, emitted-game runtime, or public-API reconstruction coverage. A new native lift of selected real methods is the next integration check after this bounded correction.
+The interpreter handles only the HIR operations used by these fixtures and compares observable values/call counts. It is not an SDK substitute. These fixtures alone do not claim full pipeline, emitted-game runtime, or public-API reconstruction coverage.
+
+## Native integration check
+
+The first bounded native relift after fixing leaf materialization recovered both selected methods in 47.011 seconds, with a peak resident set of 2,086,236 KiB. Auditing all four resumed-await branches found 14 saved values consumed after their original awaiters were cleared and no post-clear reread of the original fields. The remaining internal SDK accesses are a separate reconstruction step; the methods were not declared compilation- or runtime-complete.
+
+The HIR, resource receipt, input inventory, and four-branch audit are preserved on mj5 under `/data/home/game/pap_autonomous/20261128-v8-batch/resume-20261128-0212/value-snapshot-patch/native-hir-r2/`. `HIR.txt` has SHA-256 `2edcb4a094518a47a123e0840fb168d8bd24d5f25c76478e6aa451f4c2e925ce`.

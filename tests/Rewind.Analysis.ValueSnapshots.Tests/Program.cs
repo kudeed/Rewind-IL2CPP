@@ -20,12 +20,15 @@ internal static class Program
     private static readonly Type ValueType = Analysis.GetType("Rewind.Analysis.Recover.SVal", true)!;
     private static readonly Type Folding = Analysis.GetType("Rewind.Analysis.Recover.StructFromParts", true)!;
     private static readonly Type Definitions = Folding.GetNestedType("Definitions", BindingFlags.NonPublic)!;
+    private static readonly Type Snapshots = Analysis.GetType("Rewind.Analysis.Recover.StructSnapshots", true)!;
+    private static readonly SigFactory Signatures = new();
     private static readonly PrimitiveSig Object = Primitive(Il2CppTypeEnum.Object);
     private static readonly PrimitiveSig String = Primitive(Il2CppTypeEnum.String);
     private static readonly PrimitiveSig Int = Primitive(Il2CppTypeEnum.I4);
     private static readonly PrimitiveSig Short = Primitive(Il2CppTypeEnum.I2);
     private static readonly PrimitiveSig Bool = Primitive(Il2CppTypeEnum.Boolean);
     private static int assertions;
+    private static int definitionIndex;
     private static readonly List<object> Cases = [];
 
     private static void Check(bool condition, string message)
@@ -44,7 +47,7 @@ internal static class Program
 
     private static TypeDef Define(string name, bool valueType, params (string Name, TypeSig Type)[] fields)
     {
-        var definition = new TypeDef { Name = name, IsValueType = valueType, Assembly = new AssemblyModel { Name = "SnapshotFixture" } };
+        var definition = new TypeDef { Index = ++definitionIndex, Name = name, IsValueType = valueType, Assembly = new AssemblyModel { Name = "SnapshotFixture" } };
         definition.Sig = Key(new TypeDefSig(definition), name);
         definition.Fields = fields.Select((field, index) => new FieldDef {
             Name = field.Name, Type = field.Type, Index = index, DeclaringType = definition,
@@ -263,6 +266,148 @@ internal static class Program
         Cases.Add(new { name = "copy_semantics", result = "dominance, alias, conversion and evaluation-order checks" });
     }
 
+    private static LayoutCalculator TestLayouts(TypeSig root)
+    {
+        var layouts = (LayoutCalculator)RuntimeHelpers.GetUninitializedObject(typeof(LayoutCalculator));
+        var cache = new Dictionary<TypeSig, TypeLayout>();
+        typeof(LayoutCalculator).GetField("_cache", All)!.SetValue(layouts, cache);
+        TypeLayout Build(TypeSig type)
+        {
+            if (cache.TryGetValue(type, out var known)) return known;
+            var result = new TypeLayout { Known = false };
+            cache[type] = result;
+            int offset = 0, align = 1;
+            var fields = new List<FieldSlot>();
+            foreach (FieldDef field in type.Definition!.Fields.Where(f => !f.IsStatic))
+            {
+                TypeSig fieldType = Signatures.Substitute(field.Type, type is GenericInstSig generic ? generic.Arguments : [], []);
+                int size = fieldType is PrimitiveSig primitive ? primitive.SizeOf(8) :
+                    fieldType.Definition is { IsValueType: true, IsEnum: false } ? Build(fieldType).Size : 8;
+                int fieldAlign = Math.Min(Math.Max(size, 1), 8);
+                offset = (offset + fieldAlign - 1) / fieldAlign * fieldAlign;
+                fields.Add(new FieldSlot(field, fieldType, offset, size));
+                offset += size;
+                align = Math.Max(align, fieldAlign);
+            }
+            result.Fields = [.. fields]; result.Align = align; result.DataSize = offset;
+            result.Size = (offset + align - 1) / align * align; result.Known = true;
+            return result;
+        }
+        Build(root);
+        return layouts;
+    }
+
+    private static bool Snapshot(Fixture fixture, LayoutCalculator layouts) =>
+        (bool)Snapshots.GetMethod("Run", All)!.Invoke(null, [fixture.Method, layouts])!;
+
+    private static HExpr Rebase(HExpr value, HExpr from, HExpr to)
+    {
+        if (ReferenceEquals(value, from)) return to;
+        var field = (HField)value;
+        return new HField { Object = Rebase(field.Object!, from, to), Field = field.Field,
+            DeclaringType = field.DeclaringType, Type = field.Type };
+    }
+
+    private static void WholeSnapshotCases()
+    {
+        var pair = Define("SavedPair", true, ("source", Object), ("token", Short));
+        var good = FixtureOf(pair);
+        var values = ReadFields(good);
+        good.Block.Statements.Add(new HAssign(good.Source, Zero(pair.Sig)));
+        int at = WriteFields(good, values);
+        good.Block.Statements.Add(new HReturn(good.Destination));
+        var layouts = TestLayouts(pair.Sig);
+        Check(Snapshot(good, layouts), "complete saved fields receive a typed snapshot");
+        Check(good.Block.Statements[0] is HAssign { Target: HLocal { Type: var type }, Value: HField } && type!.Key == pair.Sig.Key,
+            "snapshot is inserted at the first read with the exact value type");
+        Check(!Snapshot(good, layouts), "repeating snapshot recovery makes no further change");
+        Check(Fold(good, at + 1), "existing copy recovery folds the untouched saved value across the original clear");
+        var source = new object();
+        var execution = new Machine(good, [source, (short)1977]);
+        execution.Run();
+        Check(ReferenceEquals(execution.Destination[pair.Fields[0]], source) && Equals(execution.Destination[pair.Fields[1]], (short)1977),
+            "whole copy preserves reference identity and nonzero token");
+        Check(execution.Source.Values.All(v => v is null || Equals(v, (short)0)), "whole snapshot retains the original clear");
+
+        void Reject(string name, Action<Fixture, List<HExpr>, LayoutCalculator> change)
+        {
+            var fixture = FixtureOf(pair);
+            var held = ReadFields(fixture);
+            var shape = TestLayouts(pair.Sig);
+            change(fixture, held, shape);
+            fixture.Block.Statements.Add(new HAssign(fixture.Source, Zero(pair.Sig)));
+            WriteFields(fixture, held);
+            Check(!Snapshot(fixture, shape), name);
+        }
+        Reject("partial field coverage is rejected", (f, _, _) => f.Block.Statements.RemoveAt(1));
+        Reject("clear inside the read window is rejected", (f, _, _) => f.Block.Statements.Insert(1, new HAssign(f.Source, Zero(pair.Sig))));
+        Reject("alias store inside read window is rejected", (f, _, _) => f.Block.Statements.Insert(1,
+            new HAssign(new HDeref(new HArg(0) { Type = new ByRefSig(pair.Sig) }) { Type = pair.Sig }, Zero(pair.Sig))));
+        Reject("unknown call inside read window is rejected", (f, _, _) => f.Block.Statements.Insert(1,
+            new HEval(new HCall { Method = new MethodDef { Name = "Unknown", DeclaringType = pair }, This = f.State })));
+        Reject("mixed struct sources do not establish full coverage", (f, _, _) =>
+            ((HAssign)f.Block.Statements[1]).Value = Field(Field(new HArg(1) { Type = f.State.Type }, f.State.Type!.Definition!.Fields[0]), pair.Fields[1]));
+        Reject("duplicate reads do not establish a whole-value copy", (f, _, _) => f.Block.Statements.Insert(1,
+            new HAssign(Local(f.Method.NewLocal(Object)), Field(f.Source, pair.Fields[0]))));
+        Reject("unknown layout is rejected", (_, _, shape) => shape.Of(pair.Sig).Known = false);
+        Reject("overlapping layout is rejected", (_, _, shape) => {
+            var field = shape.Of(pair.Sig).Fields[1];
+            shape.Of(pair.Sig).Fields[1] = field with { Offset = 0 };
+        });
+        Reject("getter names do not prove field reads", (f, _, _) => ((HAssign)f.Block.Statements[1]).Value = new HCall {
+            Method = new MethodDef { Name = "get_token", DeclaringType = pair, ReturnType = Short }, This = f.Source, Type = Short });
+        Reject("converted fields do not prove exact coverage", (f, _, _) => ((HAssign)f.Block.Statements[1]).Value =
+            new HConv(HConvKind.U1, Field(f.Source, pair.Fields[1])) { Type = Primitive(Il2CppTypeEnum.U1) });
+        Reject("field type mismatch is rejected", (f, _, _) => ((HAssign)f.Block.Statements[1]).Value = Field(f.Source, pair.Fields[1], Bool));
+        Reject("reads from different control-flow blocks are rejected", (f, _, _) => {
+            var other = new HBlock { Id = 1 };
+            other.Statements.Add(f.Block.Statements[1]); f.Block.Statements.RemoveAt(1); f.Method.Blocks.Add(other);
+        });
+        var unchanged = FixtureOf(pair);
+        WriteFields(unchanged, ReadFields(unchanged));
+        Check(!Snapshot(unchanged, TestLayouts(pair.Sig)), "unchanged sources do not acquire redundant snapshots");
+
+        // Closed generic awaiter -> task<T> -> a complete result substruct. The layout supplies substituted
+        // types; a whole EntityId read must count as its subtree, not require invented primitive reads.
+        var entity = Define("EntityId", true, ("data", Int));
+        var task = Define("Task`1", true);
+        var taskParameter = new GenericParam { Index = ++definitionIndex, Name = "T", Position = 0, OwnerType = task };
+        task.GenericParameters = [taskParameter];
+        task.Fields = [new FieldDef { Name = "source", DeclaringType = task, Type = Object, Attrs = FieldDef.InitOnly },
+            new FieldDef { Name = "result", DeclaringType = task, Type = Signatures.GenericParam(taskParameter), Attrs = FieldDef.InitOnly },
+            new FieldDef { Name = "token", DeclaringType = task, Type = Short, Attrs = FieldDef.InitOnly }];
+        var awaiter = Define("Awaiter`1", true);
+        var awaiterParameter = new GenericParam { Index = ++definitionIndex, Name = "T", Position = 0, OwnerType = awaiter };
+        awaiter.GenericParameters = [awaiterParameter];
+        awaiter.Fields = [new FieldDef { Name = "task", DeclaringType = awaiter,
+            Type = Signatures.GenericInst(task, [Signatures.GenericParam(awaiterParameter)]), Attrs = FieldDef.InitOnly }];
+        var closed = Signatures.GenericInst(awaiter, [entity.Sig]);
+        var generic = FixtureOf(awaiter, closed);
+        var genericLayouts = TestLayouts(closed);
+        FieldSlot taskSlot = genericLayouts.Of(closed).Fields[0];
+        HExpr taskValue = Field(generic.Source, awaiter.Fields[0], taskSlot.Type);
+        var reads = new List<(HExpr Field, HExpr Held)>();
+        foreach (FieldSlot field in genericLayouts.Of(taskSlot.Type).Fields)
+        {
+            HExpr read = Field(taskValue, field.Field, field.Type);
+            HExpr held = Local(generic.Method.NewLocal(field.Type));
+            generic.Block.Statements.Add(new HAssign(held, read)); reads.Add((read, held));
+        }
+        generic.Block.Statements.Add(new HAssign(generic.Source, Zero(closed)));
+        foreach (var read in reads) generic.Block.Statements.Add(new HAssign(Rebase(read.Field, generic.Source, generic.Destination), read.Held));
+        Check(Snapshot(generic, genericLayouts), "nested generic and complete substruct reads establish full coverage");
+        Check(generic.Block.Statements[0] is HAssign { Target: HLocal { Type: var captured } } && captured!.Key == closed.Key,
+            "largest complete generic owner is captured, not its task/result fragment");
+        Check(!Snapshot(generic, genericLayouts), "nested generic snapshot recovery is a fixed point");
+        var taskData = new Dictionary<FieldDef, object?> { [task.Fields[0]] = source,
+            [task.Fields[1]] = new Dictionary<FieldDef, object?> { [entity.Fields[0]] = 901 }, [task.Fields[2]] = (short)2367 };
+        var nestedExecution = new Machine(generic, [taskData]); nestedExecution.Run();
+        var copiedTask = (Dictionary<FieldDef, object?>)nestedExecution.Destination[awaiter.Fields[0]]!;
+        Check(ReferenceEquals(copiedTask[task.Fields[0]], source) && Equals(copiedTask[task.Fields[2]], (short)2367) &&
+            Equals(((Dictionary<FieldDef, object?>)copiedTask[task.Fields[1]]!)[entity.Fields[0]], 901), "generic nested result/source/token values survive clear");
+        Cases.Add(new { name = "typed_whole_snapshots", result = "complete layout paths, conservative rejection and fixed-point semantics" });
+    }
+
     // A deliberately small HIR interpreter: the assertions compare observable field values and call
     // counts, rather than asserting the implementation's statement count or local names.
     private sealed class Machine
@@ -282,12 +427,14 @@ internal static class Program
                 [fixture.State.Type.Definition.Fields[1]] = 0 };
             locals[fixture.Destination.Variable] = Default(fixture.Destination.Type!);
         }
+        private static TypeSig FieldType(TypeSig type, FieldDef field) =>
+            Signatures.Substitute(field.Type, type is GenericInstSig generic ? generic.Arguments : [], []);
         private static object? Default(TypeSig type) => type.Definition is { IsValueType: true } definition
-            ? definition.Fields.ToDictionary(f => f, f => Default(f.Type))
+            ? definition.Fields.ToDictionary(f => f, f => Default(FieldType(type, f)))
             : type is PrimitiveSig p ? p.Element switch { Il2CppTypeEnum.I2 => (short)0, Il2CppTypeEnum.I4 => 0,
                 Il2CppTypeEnum.Boolean => false, _ => null } : null;
         private static object? Clone(object? value, TypeSig? type) => type?.IsValueType == true && value is Dictionary<FieldDef, object?> fields
-            ? fields.ToDictionary(kv => kv.Key, kv => Clone(kv.Value, kv.Key.Type)) : value;
+            ? fields.ToDictionary(kv => kv.Key, kv => Clone(kv.Value, FieldType(type, kv.Key))) : value;
         private object? Place(HExpr expression) => expression switch {
             HArg => state, HLocal local => locals[local.Variable],
             HField field => ((Dictionary<FieldDef, object?>)Place(field.Object!)!)[field.Field],
@@ -319,6 +466,7 @@ internal static class Program
         SnapshotCase("handle_awaiter40", 40, [("source", Object, 0, 8, new object()), ("internalOp", Object, 8, 8, new object()),
             ("version", Int, 16, 4, 927), ("location", String, 24, 8, "podium-skin"), ("token", Short, 32, 2, (short)31415)]);
         CopyCases();
+        WholeSnapshotCases();
         Console.WriteLine(JsonSerializer.Serialize(new { passed = true, assertions, cases = Cases,
             scope = "synthetic IR semantics; original PAP native/IL evidence is documented in README" }));
     }
