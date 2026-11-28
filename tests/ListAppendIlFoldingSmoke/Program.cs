@@ -9,6 +9,24 @@ using MethodAttributes = Mono.Cecil.MethodAttributes;
 using FieldAttributes = Mono.Cecil.FieldAttributes;
 using MethodBody = Mono.Cecil.Cil.MethodBody;
 static void Check(bool pass,string why){if(!pass)throw new Exception(why);}
+if(args.Length==2)
+{
+    using var corpusResolver=new DefaultAssemblyResolver();
+    corpusResolver.AddSearchDirectory(Path.GetDirectoryName(Path.GetFullPath(args[0]))!);
+    using var corpus=AssemblyDefinition.ReadAssembly(args[0],new ReaderParameters{AssemblyResolver=corpusResolver,InMemory=true});
+    static IEnumerable<TypeDefinition> All(IEnumerable<TypeDefinition> t)=>t.SelectMany(x=>new[]{x}.Concat(All(x.NestedTypes)));
+    int sites=0,methods=0;
+    foreach(var m in All(corpus.MainModule.Types).SelectMany(t=>t.Methods).Where(m=>m.HasBody))
+    {
+        int n=ListAppendIlFolding.Run(m.Body);
+        if(n==0)continue;
+        m.Body.OptimizeMacros();sites+=n;methods++;
+        Console.WriteLine($"{m.MetadataToken.ToUInt32():X8} {n} {m.FullName}");
+    }
+    corpus.Write(args[1]);
+    Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(new{folded_sites=sites,changed_methods=methods}));
+    return;
+}
 using var resolver = new DefaultAssemblyResolver();
 resolver.AddSearchDirectory(Path.GetDirectoryName(typeof(List<>).Assembly.Location)!);
 using var asm = AssemblyDefinition.CreateAssembly(new AssemblyNameDefinition("ListAppendFixture",new Version(1,0)), "ListAppendFixture",
@@ -115,6 +133,102 @@ badLeave.Slow.Next.Next.Next.Next.Next.OpCode=OpCodes.Leave;
 var leaveShape=Shape(badLeave.M.Body);
 Check(ListAppendIlFolding.Run(badLeave.M.Body)==0&&Shape(badLeave.M.Body)==leaveShape,"leave accepted as ordinary branch");
 host.Methods.Remove(badLeave.M);
+// Receiver and item can be stable method arguments rather than locals.
+var directArgs=Fixture("DirectArguments",false,true);
+foreach(var i in directArgs.M.Body.Instructions)
+{
+    if(i.OpCode.Code==Code.Ldloc && i.Operand==directArgs.Value)
+    {i.OpCode=OpCodes.Ldarg;i.Operand=directArgs.M.Parameters[1];}
+    else if(i.OpCode.Code==Code.Ldloc && i.Operand==directArgs.Region[0].Operand)
+    { /* Receiver loads are replaced below, after saving the original operand. */ }
+}
+var listLocal=directArgs.Region[0].Operand;
+foreach(var i in directArgs.M.Body.Instructions.Where(i=>i.OpCode.Code==Code.Ldloc&&i.Operand==listLocal))
+{i.OpCode=OpCodes.Ldarg;i.Operand=directArgs.M.Parameters[0];}
+Check(ListAppendIlFolding.Run(directArgs.M.Body)==1,"stable parameter receiver/item");
+directArgs.M.Body.OptimizeMacros();
+
+var argRead=Fixture("ScheduledArgumentRead",true);
+argRead.Region[3].OpCode=OpCodes.Ldarg;
+argRead.Region[3].Operand=argRead.M.Parameters[1];
+Check(ListAppendIlFolding.Run(argRead.M.Body)==1,"scheduled argument field read");
+argRead.M.Body.OptimizeMacros();
+var badArgRead=Fixture("BadScheduledArgumentRead",true);
+badArgRead.Region[3].OpCode=OpCodes.Ldarg;
+badArgRead.Region[3].Operand=badArgRead.M.Parameters[0];
+var badArgShape=Shape(badArgRead.M.Body);
+Check(ListAppendIlFolding.Run(badArgRead.M.Body)==0&&Shape(badArgRead.M.Body)==badArgShape,"wrong scheduled receiver");
+host.Methods.Remove(badArgRead.M);
+
+var invalidArgument=Fixture("InvalidArgument",false);
+invalidArgument.Region[28].OpCode=OpCodes.Ldarg;invalidArgument.Region[28].Operand=invalidArgument.M.Parameters[1];
+var invalidShape=Shape(invalidArgument.M.Body);
+Check(ListAppendIlFolding.Run(invalidArgument.M.Body)==0&&Shape(invalidArgument.M.Body)==invalidShape,"different fast/slow value loads");
+host.Methods.Remove(invalidArgument.M);
+// Real scalar schedule and covariant reference storage (List<object>
+// receives string without a box). Construct the exact emitted IL pattern.
+MethodDefinition ScalarFixture(string name,TypeReference element,TypeReference input,bool arithmetic)
+{
+    var listType=new GenericInstanceType(open);listType.GenericArguments.Add(element);
+    var items=new FieldReference("_items",new ArrayType(gp),listType);
+    var ver=new FieldReference("_version",i32,listType);
+    var sz=new FieldReference("_size",i32,listType);
+    var count=new MethodReference("get_Count",i32,listType){HasThis=true};
+    var slowAdd=new MethodReference("AddWithResize",vd,listType){HasThis=true};
+    slowAdd.Parameters.Add(new ParameterDefinition(gp));
+    var m=new MethodDefinition(name,MethodAttributes.Public|MethodAttributes.Static,vd);host.Methods.Add(m);
+    m.Parameters.Add(new ParameterDefinition(listType));m.Parameters.Add(new ParameterDefinition(input));
+    if(arithmetic){m.Parameters.Add(new ParameterDefinition(input));m.Parameters.Add(new ParameterDefinition(input));}
+    m.Body=new MethodBody(m){InitLocals=true};
+    var il=m.Body.GetILProcessor();
+    VariableDefinition Local(TypeReference t){var v=new VariableDefinition(t);m.Body.Variables.Add(v);return v;}
+    var list=Local(listType);var array=Local(new ArrayType(element));var size=Local(i32);
+    var left=Local(input);var right=Local(input);var factor=Local(input);var value=Local(input);
+    il.Emit(OpCodes.Ldarg,m.Parameters[0]);il.Emit(OpCodes.Stloc,list);
+    il.Emit(OpCodes.Ldarg,m.Parameters[1]);il.Emit(OpCodes.Stloc,left);
+    if(arithmetic)
+    {
+        il.Emit(OpCodes.Ldarg,m.Parameters[2]);il.Emit(OpCodes.Stloc,right);
+        il.Emit(OpCodes.Ldarg,m.Parameters[3]);il.Emit(OpCodes.Stloc,factor);
+    }
+    else{il.Emit(OpCodes.Ldloc,left);il.Emit(OpCodes.Stloc,value);}
+    il.Emit(OpCodes.Ldloc,list);il.Emit(OpCodes.Ldfld,items);il.Emit(OpCodes.Stloc,array);
+    il.Emit(OpCodes.Ldloc,list);il.Emit(OpCodes.Ldloc,list);il.Emit(OpCodes.Ldfld,ver);
+    il.Emit(OpCodes.Ldc_I4,1);il.Emit(OpCodes.Add);il.Emit(OpCodes.Stfld,ver);
+    il.Emit(OpCodes.Ldloc,list);il.Emit(OpCodes.Callvirt,count);il.Emit(OpCodes.Stloc,size);
+    if(arithmetic)
+    {
+        il.Emit(OpCodes.Ldloc,left);il.Emit(OpCodes.Ldloc,right);il.Emit(OpCodes.Sub);il.Emit(OpCodes.Conv_R4);
+        il.Emit(OpCodes.Ldloc,factor);il.Emit(OpCodes.Mul);il.Emit(OpCodes.Conv_R4);il.Emit(OpCodes.Stloc,value);
+    }
+    var slow=Instruction.Create(OpCodes.Nop);var join=Instruction.Create(OpCodes.Nop);
+    il.Emit(OpCodes.Ldloc,array);il.Emit(OpCodes.Ldlen);il.Emit(OpCodes.Conv_I4);il.Emit(OpCodes.Ldloc,size);
+    il.Emit(OpCodes.Cgt_Un);il.Emit(OpCodes.Ldc_I4,0);il.Emit(OpCodes.Ceq);il.Emit(OpCodes.Brtrue,slow);
+    il.Emit(OpCodes.Nop);il.Emit(OpCodes.Ldloc,list);il.Emit(OpCodes.Ldloc,size);il.Emit(OpCodes.Ldc_I4,1);
+    il.Emit(OpCodes.Add);il.Emit(OpCodes.Stfld,sz);
+    il.Emit(OpCodes.Ldloc,array);il.Emit(OpCodes.Ldloc,size);il.Emit(OpCodes.Ldloc,value);
+    il.Emit(OpCodes.Stelem_Any,element);il.Emit(OpCodes.Br,join);
+    il.Append(slow);il.Emit(OpCodes.Ldloc,list);il.Emit(OpCodes.Ldloc,value);il.Emit(OpCodes.Callvirt,slowAdd);
+    il.Append(join);il.Emit(OpCodes.Ret);
+    return m;
+}
+var fp=mod.ImportReference(typeof(float));
+var scheduledFp=ScalarFixture("ScheduledFloat",fp,fp,true);
+var objectAppend=ScalarFixture("ObjectAppend",obj,mod.ImportReference(typeof(string)),false);
+foreach(var m in new[]{scheduledFp,objectAppend})
+{
+    Check(ListAppendIlFolding.Run(m.Body)==1,"extended scalar/reference "+m.Name);
+    m.Body.OptimizeMacros();
+}
+var badBox=ScalarFixture("BadBox",obj,i32,false);
+var badBoxShape=Shape(badBox.Body);
+Check(ListAppendIlFolding.Run(badBox.Body)==0&&Shape(badBox.Body)==badBoxShape,"reject unboxed value type");
+host.Methods.Remove(badBox);
+var badFp=ScalarFixture("BadFloatSchedule",fp,fp,true);
+badFp.Body.Instructions.First(x=>x.OpCode.Code==Code.Mul).OpCode=OpCodes.Div;
+var badFpShape=Shape(badFp.Body);
+Check(ListAppendIlFolding.Run(badFp.Body)==0&&Shape(badFp.Body)==badFpShape,"reject unproven scheduled op");
+host.Methods.Remove(badFp);
 using var memory=new MemoryStream();asm.Write(memory);
 var assembly=Assembly.Load(memory.ToArray());
 var runtimeHost=assembly.GetType("Fixture.AppendHost")!;
@@ -155,4 +269,36 @@ foreach(int capacity in new[]{0,1,128}){
 }
 try{protectedCall(null!,1);throw new Exception("lost protected list null check");}catch(NullReferenceException){}
 Check((int)counter.GetValue(null)! == protectedRuns+1,"finally must execute after null failure");
-Console.WriteLine($"LIST_APPEND_IL_FOLDING_SMOKE_PASS runtime_operations={runs} negative_patterns={negatives.Length+3} null_cases=3 protected_calls={protectedRuns+1}");
+var direct=(Action<List<int>,int>)runtimeHost.GetMethod("DirectArguments")!.CreateDelegate(typeof(Action<List<int>,int>));
+var argField=runtimeHost.GetMethod("ScheduledArgumentRead")!;
+var extList=new List<int>(1);var extExpected=new List<int>(1);
+for(int n=0;n<100;n++)
+{
+    direct(extList,n);extExpected.Add(n);
+    argField.Invoke(null,[extList,h]);extExpected.Add(123);runs+=2;
+    Check(extList.SequenceEqual(extExpected)&&extList.Capacity==extExpected.Capacity,"extended argument list semantics");
+}
+try{direct(null!,1);throw new Exception("lost direct receiver null check");}catch(NullReferenceException){}
+var enumBefore=extList.GetEnumerator();
+try{argField.Invoke(null,[extList,null]);throw new Exception("lost scheduled argument exception");}
+catch(TargetInvocationException ex)when(ex.InnerException is NullReferenceException){}
+Check(enumBefore.MoveNext()&&extList.SequenceEqual(extExpected),"pre-version scheduled field exception mutated list");
+var appendFp=runtimeHost.GetMethod("ScheduledFloat")!.CreateDelegate<Action<List<float>,float,float,float>>();
+var appendObject=runtimeHost.GetMethod("ObjectAppend")!.CreateDelegate<Action<List<object>,string>>();
+foreach(int capacity in new[]{0,1,128})
+{
+    var list=new List<float>(capacity);var expected=new List<float>(capacity);
+    var refs=new List<object>(capacity);var strings=new List<object>(capacity);
+    for(int n=0;n<100;n++)
+    {
+        float a=n*.125f,b=n*.01f,c=n*.375f;
+        appendFp(list,a,b,c);expected.Add((a-b)*c);
+        var str=n%17==0?null!:n.ToString();appendObject(refs,str);strings.Add(str);
+        runs+=2;
+        Check(list.Select(BitConverter.SingleToInt32Bits).SequenceEqual(expected.Select(BitConverter.SingleToInt32Bits))
+            &&list.Capacity==expected.Capacity,"bit-exact scheduled FP");
+        Check(refs.SequenceEqual(strings)&&refs.Capacity==strings.Capacity,"reference value storage");
+    }
+}
+try{appendFp(null!,1f,2f,3f);throw new Exception("lost scheduled FP null check");}catch(NullReferenceException){}
+Console.WriteLine($"LIST_APPEND_IL_FOLDING_SMOKE_PASS runtime_operations={runs} negative_patterns={negatives.Length+7} null_cases=6 protected_calls={protectedRuns+1}");

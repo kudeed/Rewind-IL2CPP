@@ -57,13 +57,13 @@ internal static class ListAppendIlFolding
         body.SimplifyMacros();
         int count = 0;
         foreach (Instruction candidate in body.Instructions.Where(Candidate).ToArray())
-            if (TryFold(body, candidate)) count++;
+            if (TryFold(body, candidate) || TryFold(body, candidate, extended: true)) count++;
         if (count == 0)
             foreach (var (i, opcode, operand) in original) { i.OpCode = opcode; i.Operand = operand; }
         return count;
     }
 
-    private static bool TryFold(MethodBody body, Instruction candidate)
+    private static bool TryFold(MethodBody body, Instruction candidate, bool extended = false)
     {
         var a = body.Instructions.ToArray();
         var ix = a.Select((i, n) => (i, n)).ToDictionary(x => x.i, x => x.n);
@@ -72,29 +72,68 @@ internal static class ListAppendIlFolding
         // The native scheduler may load the value from a typed public
         // instance field between loading _items and incrementing _version.
         // Keep this exact read and its original list-null-check ordering.
+        static TypeReference? LoadType(Instruction i) => i.OpCode.Code switch
+        {
+            Code.Ldloc when i.Operand is VariableDefinition v => v.VariableType,
+            Code.Ldarg when i.Operand is ParameterDefinition p => p.ParameterType,
+            _ => null
+        };
+        bool Load(Instruction i) => i.OpCode.Code == Code.Ldloc || extended && i.OpCode.Code == Code.Ldarg;
+        bool SameLoad(Instruction x, Instruction y) =>
+            x.OpCode.Code == y.OpCode.Code && x.Operand == y.Operand;
+        static bool FloatLocal(Instruction i) => i.Operand is VariableDefinition v &&
+            v.VariableType.MetadataType == MetadataType.Single;
+        bool ValueCompatible(TypeReference actual, TypeReference expected)
+        {
+            if (Same(actual, expected)) return true;
+            // Object accepts an actual managed reference without boxing.
+            // No guessed interface casts, array covariance or value-type conversion.
+            if (!extended || expected.MetadataType != MetadataType.Object ||
+                expected.Scope.Name is not ("mscorlib" or "System.Private.CoreLib") ||
+                actual.IsValueType || actual.ContainsGenericParameter ||
+                actual is ByReferenceType or PointerType or FunctionPointerType) return false;
+            try { return actual.Resolve() is { IsValueType: false }; }
+            catch (AssemblyResolutionException) { return false; }
+        }
+
         int scheduled = k + Shape.Length + 3 <= a.Length &&
-            a[k+3].OpCode.Code == Code.Ldloc &&
-            a[k+4].OpCode.Code == Code.Ldfld &&
+            Load(a[k+3]) &&
+            (a[k+4].OpCode.Code == Code.Ldfld || extended && a[k+4].OpCode.Code == Code.Callvirt) &&
             a[k+5].OpCode.Code == Code.Stloc ? 3 : 0;
-        var physical = a.Skip(k).Take(Shape.Length + scheduled).ToArray();
+        int post = k+12+scheduled;
+        // One proven nonthrowing, stack-balanced FP calculation. No calls,
+        // field access, integer division, overflow checks, or address writes.
+        int arithmetic = extended && post+8 <= a.Length &&
+            a.Skip(post).Take(8).Select(i=>i.OpCode.Code).SequenceEqual(
+                new[]{Code.Ldloc,Code.Ldloc,Code.Sub,Code.Conv_R4,Code.Ldloc,Code.Mul,Code.Conv_R4,Code.Stloc}) &&
+            new[]{0,1,4,7}.All(n=>FloatLocal(a[post+n])) ? 8 : 0;
+        var physical = a.Skip(k).Take(Shape.Length + scheduled + arithmetic).ToArray();
         var moved = physical.Skip(3).Take(scheduled).ToArray();
-        var b = physical.Take(3).Concat(physical.Skip(3 + scheduled)).ToArray();
-        if (!b.Select(i => i.OpCode.Code).SequenceEqual(Shape) ||
-            b[0].Operand is not VariableDefinition list ||
+        var computed = physical.Skip(12+scheduled).Take(arithmetic).ToArray();
+        var b = physical.Take(3).Concat(physical.Skip(3+scheduled).Take(9))
+            .Concat(physical.Skip(12+scheduled+arithmetic)).ToArray();
+        var listPositions = new[]{0,3,4,9,21};
+        if (b.Length != Shape.Length ||
+            !b.Select((i,n)=>i.OpCode.Code==Shape[n] ||
+                extended && (listPositions.Contains(n)||n==28) && i.OpCode.Code==Code.Ldarg).All(x=>x) ||
+            !Load(b[0]) || !Load(b[28]) ||
+            LoadType(b[0]) is not GenericInstanceType gt || !List(gt) ||
             b[2].Operand is not VariableDefinition array ||
             b[11].Operand is not VariableDefinition size ||
-            b[28].Operand is not VariableDefinition value ||
-            new[] { list, array, size, value }.Distinct().Count() != 4 ||
-            list.VariableType is not GenericInstanceType gt || !List(gt) ||
+            LoadType(b[28]) is not TypeReference valueType ||
+            b[0].Operand == b[28].Operand || array == size ||
+            b[0].Operand == array || b[0].Operand == size ||
+            b[28].Operand == array || b[28].Operand == size ||
             array.VariableType is not ArrayType { IsVector: true } at ||
             !Same(at.ElementType, gt.GenericArguments[0]) ||
             size.VariableType.MetadataType != MetadataType.Int32 ||
-            !Same(value.VariableType, gt.GenericArguments[0]) ||
+            !ValueCompatible(valueType, gt.GenericArguments[0]) ||
             b[29].Operand is not TypeReference stored || !Same(stored, at.ElementType)) return false;
+        object list=b[0].Operand, value=b[28].Operand;
         if (body.Method.DeclaringType.FullName == gt.ElementType.FullName &&
             body.Method.DeclaringType.Scope.Name == gt.ElementType.Scope.Name) return false;
         bool Local(VariableDefinition v, params int[] positions) => positions.All(n => b[n].Operand == v);
-        if (!Local(list, 3, 4, 9, 21) || !Local(array, 12, 26) || !Local(size, 15, 22, 27) ||
+        if (!listPositions.All(n=>SameLoad(b[0],b[n])) || !Local(array, 12, 26) || !Local(size, 15, 22, 27) ||
             !Constant(b[6], 1) || !Constant(b[17], 0) || !Constant(b[23], 1) ||
             b[19].Operand is not Instruction slow || b[30].Operand is not Instruction join ||
             !ix.TryGetValue(slow, out int f) || f + 4 >= a.Length) return false;
@@ -130,25 +169,38 @@ internal static class ListAppendIlFolding
             get.ReturnType.MetadataType != MetadataType.Int32 ||
             Resolve(get) is not { IsPublic: true, IsStatic: false } countMethod || countMethod.DeclaringType != def) return false;
 
-        VariableDefinition? readFrom = null;
-        FieldReference? readField = null;
         if (scheduled != 0)
         {
-            if (moved[0].Operand is not VariableDefinition source ||
-                moved[1].Operand is not FieldReference field ||
-                moved[2].Operand != value || new[] { list, array, size, value }.Contains(source) ||
-                source.VariableType.IsValueType || source.VariableType is ByReferenceType or PointerType ||
-                !Same(source.VariableType, field.DeclaringType) ||
-                !Same(field.FieldType, value.VariableType)) return false;
-            FieldDefinition? d;
-            try { d = field.Resolve(); }
-            catch (AssemblyResolutionException) { return false; }
-            if (d == null || !d.IsPublic || d.IsStatic || !Same(d.FieldType, value.VariableType)) return false;
-            readFrom = source; readField = field;
+            if (LoadType(moved[0]) is not TypeReference sourceType || moved[2].Operand is not VariableDefinition destination ||
+                (!extended && moved[2].Operand != value) || new[]{list,(object)array,size}.Contains(destination) ||
+                new[]{list,(object)array,size,value}.Contains(moved[0].Operand) ||
+                sourceType.IsValueType || sourceType is ByReferenceType or PointerType) return false;
+            if(moved[1].Operand is FieldReference field && moved[1].OpCode.Code==Code.Ldfld)
+            {
+                if (!Same(sourceType,field.DeclaringType) || !Same(field.FieldType,destination.VariableType)) return false;
+                FieldDefinition? d;
+                try { d = field.Resolve(); }
+                catch (AssemblyResolutionException) { return false; }
+                // A private field of the current method's declaring type is
+                // already legal. Keep the exact original read at its position.
+                if(d==null || d.IsStatic || (!d.IsPublic && !(extended && d.DeclaringType==body.Method.DeclaringType)) ||
+                    !Same(d.FieldType,destination.VariableType)) return false;
+            }
+            else if(extended && moved[1].OpCode.Code==Code.Callvirt &&
+                moved[1].Operand is MethodReference countRead && List(sourceType) &&
+                Same(countRead.DeclaringType,sourceType) && countRead.Name=="get_Count" &&
+                countRead.HasThis && countRead.Parameters.Count==0 && countRead.ReturnType.MetadataType==MetadataType.Int32 &&
+                destination.VariableType.MetadataType==MetadataType.Int32 &&
+                Resolve(countRead) is {IsPublic:true,IsStatic:false} sourceCount &&
+                sourceCount.DeclaringType.FullName==((GenericInstanceType)sourceType).ElementType.FullName &&
+                AssemblyIdentity(sourceCount.DeclaringType)==AssemblyIdentity(sourceType))
+            { /* Non-mutating exact List.Count; preserve its original exception order. */ }
+            else return false;
         }
+        if (computed.Any(i=>i.Operand==list || i.Operand==array || i.Operand==size)) return false;
         var fb = a.Skip(f).Take(4).ToArray();
-        if (fb[0].OpCode.Code != Code.Nop || fb[1].OpCode.Code != Code.Ldloc || fb[1].Operand != list ||
-            fb[2].OpCode.Code != Code.Ldloc || fb[2].Operand != value ||
+        if (fb[0].OpCode.Code != Code.Nop || !SameLoad(fb[1],b[0]) ||
+            !SameLoad(fb[2],b[28]) ||
             fb[3].OpCode.Code != Code.Callvirt || fb[3].Operand is not MethodReference resize ||
             resize.Name != "AddWithResize" || !Same(resize.DeclaringType, gt) || !resize.HasThis ||
             resize.ReturnType.MetadataType != MetadataType.Void || resize.Parameters.Count != 1 ||
@@ -181,7 +233,7 @@ internal static class ListAppendIlFolding
         if (Resolve(addRef) != add[0]) return false;
 
         var region = physical.Concat(fb).Concat(slowTail).ToHashSet();
-        if (region.Count != Shape.Length + scheduled + 4 + slowTail.Count || region.Contains(join) || !ix.ContainsKey(join) || region.Contains(a[0]) && a[0] != b[0]) return false;
+        if (region.Count != Shape.Length + scheduled + arithmetic + 4 + slowTail.Count || region.Contains(join) || !ix.ContainsKey(join) || region.Contains(a[0]) && a[0] != b[0]) return false;
         // No exception-region boundary may be moved or erased. Compare
         // each region's complete try/handler/filter membership against
         // the original entry, including the common continuation.
@@ -203,7 +255,8 @@ internal static class ListAppendIlFolding
         if (f == 0 || (a[f - 1].OpCode.FlowControl is not (FlowControl.Branch or FlowControl.Return or FlowControl.Throw))) return false;
         foreach (var i in a)
         {
-            if (i.OpCode.Code == Code.Ldloca && new object[] { list, array, size, value }.Contains(i.Operand)) return false;
+            if ((i.OpCode.Code is Code.Ldloca or Code.Ldarga) && new object[] { list, array, size, value }.Contains(i.Operand)) return false;
+            if (i.OpCode.Code==Code.Starg && (i.Operand==list || i.Operand==value)) return false;
             if (region.Contains(i)) continue;
             if (i.Operand == array || i.Operand == size) return false;
             if (i.Operand is Instruction target && target != b[0] && region.Contains(target)) return false;
@@ -212,6 +265,31 @@ internal static class ListAppendIlFolding
         // Both original paths do exactly one version increment, then
         // append at old size or call the framework resize helper. The
         // public Add(T) implements that same operation, on the same locals.
+        object? savedSource=scheduled!=0?moved[0].Operand:null;
+        object? savedField=scheduled!=0?moved[1].Operand:null;
+        if (extended)
+        {
+            // Keep both scheduled regions at their original positions.
+            // Before any potentially throwing pre-version read, reproduce
+            // the list null check with the proven nonmutating Count getter.
+            // The only post-version schedule accepted above is pure FP
+            // arithmetic, so moving the single Add after it cannot expose
+            // an exception or callback between the original mutations.
+            var listOp=b[0].OpCode;var valueOp=b[28].OpCode;
+            var keep=moved.Concat(computed).ToHashSet();
+            foreach(var i in region) if(!keep.Contains(i)){i.OpCode=OpCodes.Nop;i.Operand=null;}
+            if(scheduled!=0 || arithmetic!=0)
+            {
+                b[0].OpCode=listOp;b[0].Operand=list;
+                b[1].OpCode=OpCodes.Callvirt;b[1].Operand=get;
+                b[2].OpCode=OpCodes.Pop;
+            }
+            b[12].OpCode=listOp;b[12].Operand=list;
+            b[13].OpCode=valueOp;b[13].Operand=value;
+            b[14].OpCode=OpCodes.Callvirt;b[14].Operand=addRef;
+            b[15].OpCode=OpCodes.Br;b[15].Operand=join;
+            return true;
+        }
         foreach (var i in region) { i.OpCode = OpCodes.Nop; i.Operand = null; }
         int w = 0;
         void Put(OpCode op, object? operand = null)
@@ -221,14 +299,13 @@ internal static class ListAppendIlFolding
         }
         if (scheduled != 0)
         {
-            // Count is the exact public, non-mutating framework accessor.
-            // Preserve the original list-null check before the field read;
-            // _items is otherwise a private implementation detail.
             Put(OpCodes.Ldloc, list);
             Put(OpCodes.Callvirt, get);
             Put(OpCodes.Pop);
-            Put(OpCodes.Ldloc, readFrom);
-            Put(OpCodes.Ldfld, readField);
+            // Preserve old canonical emitted form (the legacy matcher
+            // already proved this source field and destination local).
+            Put(OpCodes.Ldloc, savedSource);
+            Put(OpCodes.Ldfld, savedField);
             Put(OpCodes.Stloc, value);
         }
         Put(OpCodes.Ldloc, list);
