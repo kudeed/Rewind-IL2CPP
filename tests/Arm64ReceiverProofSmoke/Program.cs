@@ -159,6 +159,18 @@ foreach(var c in argCases){
  if(actual!=c.Expected){Console.Error.WriteLine(c.Name+": "+actual+" expected "+c.Expected);failed++;}
 }
 Console.WriteLine($"UNUSED_METADATA_ARG_SMOKE positive={argCases.Count(c=>c.Expected)} negative={argCases.Count(c=>!c.Expected)} failed={failed}");
+// Exact call-site proof: indirect transfer, wrong destination, wrong
+// branch kind and unaligned/unmapped sites cannot justify a receiver.
+var directSite=new CodeImage(new[]{0x94000002u,Ret,Kill,Ret});
+if(!Arm64ReceiverProof.ExactDirectTransfer(directSite,0x1000,0x1008,false))failed++;
+var tailSite=new CodeImage(new[]{0x14000002u,Ret,Kill,Ret});
+if(!Arm64ReceiverProof.ExactDirectTransfer(tailSite,0x1000,0x1008,true))failed++;
+foreach(var wrong in new[]{0xd63f0000u,0xd61f0000u,0x94000001u,0x14000002u})
+    if(Arm64ReceiverProof.ExactDirectTransfer(new CodeImage(new[]{wrong,Ret,Kill,Ret}),0x1000,0x1008,false))failed++;
+if(Arm64ReceiverProof.ExactDirectTransfer(directSite,0x1001,0x1008,false)||
+   Arm64ReceiverProof.ExactDirectTransfer(directSite,0x1000,0x1010,false)||
+   Arm64ReceiverProof.ExactDirectTransfer(directSite,0x1000,0x1008,true))failed++;
+Console.WriteLine($"EXACT_DIRECT_RECEIVER_SITE_SMOKE positive=2 negative=7 failed={failed}");
 Console.WriteLine($"RECEIVER_PROOF_SMOKE positive={cases.Count(c=>c.Expected)} negative={cases.Count(c=>!c.Expected)+3} failed={failed}");
 return failed==0?0:1;
 sealed class CodeImage:NativeImage{

@@ -10,6 +10,19 @@ namespace Rewind.Analysis.Arm64;
 /// </summary>
 public static class Arm64ReceiverProof
 {
+    // The IR call must still be backed by the exact direct ARM64
+    // transfer. Never infer receiver independence for indirect calls,
+    // thunk aliases, or a synthetic IR node at an unrelated address.
+    public static bool ExactDirectTransfer(NativeImage image,ulong pc,ulong target,bool tail)
+    {
+        if(image.Arch!=CpuArch.Arm64||pc==0||target==0||(pc&3)!=0||(target&3)!=0||
+            !image.IsMapped(pc,4)||!image.IsMapped(target,4)||
+            image.SectionAt(pc) is not {IsExecutable:true}||
+            image.SectionAt(target) is not {IsExecutable:true})return false;
+        var ins=A64Decoder.Decode(image.U32(pc),pc);
+        return ins.Op==(tail?A64Op.B:A64Op.Bl)&&ins.Target==target;
+    }
+
     // Exact repeated direct call with a bit-zero test on its boolean return.
     // The second call's incoming x0 is the first call's result, not this.
     public static bool RepeatedBooleanCall(NativeImage image, ulong pc, ulong target)

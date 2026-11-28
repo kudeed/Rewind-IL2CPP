@@ -1825,6 +1825,13 @@ public sealed partial class HirBuilder
                             _h.Notes.Add($"receiver-independent direct call at 0x{call.Addr:X} to 0x{method.Address:X}");
                             break;
                         }
+                        else if (CanRestoreProvenStaleReceiver(call,method,classArgs,methodArgs,isVirtual,
+                            alternatives,receiverOverride,shift))
+                        {
+                            thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                            _h.Notes.Add($"receiver-independent proven same-type stale x0 at 0x{call.Addr:X} to 0x{method.Address:X}");
+                            break;
+                        }
                         else Problem(UnkeptReceiver);
                         thisExpr = new HConst(null, p.Type);
                     }
@@ -1874,6 +1881,14 @@ public sealed partial class HirBuilder
                     {
                         thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
                         _h.Notes.Add($"receiver-independent bool scalar at 0x{call.Addr:X} to 0x{method.Address:X}");
+                    }
+                    else if (Eval(node) is SVal { Expr: { } invalidScalar } &&
+                             IsReceiverScalar(invalidScalar.Type ?? (invalidScalar as HLocal)?.Variable.Type) &&
+                             CanRestoreProvenStaleReceiver(call,method,classArgs,methodArgs,isVirtual,
+                                 alternatives,receiverOverride,shift))
+                    {
+                        thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                        _h.Notes.Add($"receiver-independent proven same-type stale x0 at 0x{call.Addr:X} to 0x{method.Address:X}");
                     }
                     else
                     {
@@ -2409,6 +2424,26 @@ public sealed partial class HirBuilder
             _receiverProofs[(method.Address,allowArglessThrow,allowVoidReturn,allowIndirectStructReturn)] = proved;
         }
         return proved;
+    }
+
+    // Same-class only. The recovered receiver is already non-reference
+    // data (or a native zero); the original object is not being cast.
+    // x0 must be unused on every original callee entry path. No guessed
+    // cross-type field/singleton is allowed by this default rule.
+    private bool CanRestoreProvenStaleReceiver(Node call,MethodDef method,TypeSig[] classArgs,TypeSig[] methodArgs,
+        bool isVirtual,List<MethodDef>? alternatives,Node? receiverOverride,int shift)
+    {
+        if(Environment.GetEnvironmentVariable("REWIND_NO_PROVEN_STALE_RECEIVER")!=null||
+           !ReferenceEquals(method.DeclaringType,_method.DeclaringType)||method.IsVirtual||
+           call.Op is not (Op.Call or Op.TailCall)||
+           !_p.Model.MethodsByAddress.TryGetValue(method.Address,out var targets)||targets.Count!=1||
+           !ReferenceEquals(targets[0],method)||
+           !Rewind.Analysis.Arm64.Arm64ReceiverProof.ExactDirectTransfer(_p.Model.Image,call.Addr,method.Address,call.Op==Op.TailCall))
+            return false;
+        bool aggregate=IsIndirectStructReturn(method,classArgs,methodArgs);
+        return CanRestoreUnusedReceiver(call,method,classArgs,methodArgs,isVirtual,alternatives,
+            receiverOverride,shift,allowArglessThrow:true,allowVoidReturn:method.ReturnType.IsVoid,
+            allowIndirectStructReturn:aggregate);
     }
 
     // The metadata initializer has one logical argument. Accept an inline
