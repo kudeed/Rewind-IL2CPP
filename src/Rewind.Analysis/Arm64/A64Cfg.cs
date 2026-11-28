@@ -21,6 +21,9 @@ public sealed class A64Cfg
     public List<A64Block> Blocks = [];
     public List<string> Problems = [];
 
+    /// <summary>Branch sites replaced by a proved returning load veneer, mapped to the original load address.</summary>
+    public Dictionary<ulong, ulong> LoadBranchVeneers = [];
+
     private const int MaxInstructions = 200_000;
 
     public static A64Cfg Build(ICodeContext context, ulong start) => Build(context, start, null);
@@ -112,6 +115,14 @@ public sealed class A64Cfg
                         ulong target = ins.Target;
                         if (!InFunction(target))
                         {
+                            if (TryLoadBranchVeneer(context, ins, start, limit, out A64Instruction load))
+                            {
+                                // The exact return is the next instruction here. Keep the load at the branch
+                                // site so normal block/call-site boundaries and register SSA remain intact.
+                                instructions[ip] = load;
+                                cfg.LoadBranchVeneers[ip] = target;
+                                break;
+                            }
                             ends[ip] = (BlockEnd.TailCall, []);
                             goto nextBlock;
                         }
@@ -204,6 +215,40 @@ public sealed class A64Cfg
             cfg.Blocks.Insert(0, entry);
         }
         return cfg;
+    }
+
+    /// <summary>
+    /// A linker may move one register-relative load out of line as "ldr xN, [xN, #offset]; b site+4".
+    /// Such a branch is not a call: it preserves every other register and resumes the same function. Accept
+    /// only this complete eight-byte shape, without crossing a known function entry or following more code.
+    /// </summary>
+    private static bool TryLoadBranchVeneer(ICodeContext context, in A64Instruction branch, ulong start, ulong limit,
+        out A64Instruction load)
+    {
+        load = default;
+        ulong target = branch.Target, next = branch.NextAddress;
+        if (branch.Op != A64Op.B || (target & 3) != 0 || target > ulong.MaxValue - 8 ||
+            next <= branch.Address || next < start || next >= limit || context.IsFunctionStart(next) ||
+            context.IsFunctionStart(target) || context.IsFunctionStart(target + 4) || context.IsNoReturn(target))
+            return false;
+        NativeImage image = context.Image;
+        ImageSection? section = image.SectionAt(target);
+        if (section == null || !section.IsExecutable || target + 8 > section.End || !image.IsMapped(target, 8))
+            return false;
+        uint word = image.U32(target);
+        // Unsigned-offset LDR of one complete 64-bit general register. No literal/PC-relative access,
+        // writeback, vector transfer, stack/zero register or additional instruction is folded.
+        if ((word & 0xFFC00000) != 0xF9400000) return false;
+        A64Instruction original = A64Decoder.Decode(word, target);
+        A64Instruction resume = A64Decoder.Decode(image.U32(target + 4), target + 4);
+        if (original.Op != A64Op.Ldr || original.Vector || !original.Is64 || original.Signed ||
+            original.Size != 8 || original.Mode != A64Mode.Offset || original.Rd >= A64Instruction.Zr ||
+            original.Rd != original.Rn || resume.Op != A64Op.B || resume.Target != next)
+            return false;
+        // This instruction has no PC-relative operand. Relocating its decoded address preserves the
+        // machine effect while leaving the function extent and its exception-region addresses unchanged.
+        load = A64Decoder.Decode(word, branch.Address);
+        return true;
     }
 
     /// <summary>

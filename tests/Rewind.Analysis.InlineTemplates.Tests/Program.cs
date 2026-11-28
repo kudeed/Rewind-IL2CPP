@@ -225,8 +225,9 @@ internal static partial class Program
         StackResultLifetimes();
         WholeStructStores();
         ClosureReceivers();
+        BranchVeneers();
         Console.WriteLine(JsonSerializer.Serialize(new { passed = true, assertions, cases = Cases,
-            scope = "complete async recovery chain: exact wrapper templates, discarded effects, ARM64 pair returns, proven stack lifetimes typed wide stores and guarded closure receivers" }));
+            scope = "complete async recovery chain: exact wrapper templates, discarded effects, ARM64 pair returns, proven stack lifetimes typed wide stores, guarded closure receivers and returning ARM64 load veneers" }));
     }
 
     private static void NestedCandidateDiscovery()
