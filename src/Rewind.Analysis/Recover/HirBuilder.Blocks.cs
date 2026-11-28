@@ -237,6 +237,7 @@ public sealed partial class HirBuilder
     private bool TryEmitCopy(Node toAddress, Node fromAddress, int size, ulong address, bool quiet)
     {
         if (TryEmitLeadingPaddingCopy(toAddress, fromAddress, size, address)) return true;
+        if (TryEmitPartialFrameCopy(toAddress, fromAddress, size, address)) return true;
         Place? to = BlockPlace(toAddress, size, null), from = BlockPlace(fromAddress, size, null);
         if (to == null && from is PLocation { Type: var known } && CopiesWhole(known, size)) to = BlockPlace(toAddress, size, known);
         else if (from == null && to is PLocation { Type: var known2 } && CopiesWhole(known2, size)) from = BlockPlace(fromAddress, size, known2);

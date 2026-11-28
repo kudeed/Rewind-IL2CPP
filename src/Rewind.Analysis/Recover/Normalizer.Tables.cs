@@ -28,7 +28,7 @@ public sealed partial class Normalizer
                 if (!TableRead(load.In[0], size, out ulong table, out Node index)) continue;
                 // The value compared with the bound: the index itself or what was widened into it.
                 Node compared = index.Op is Op.ZExt or Op.SExt ? index.In[0] : index;
-                if (Bound(b, index, compared) is not long last || last >= MaxTableEntries) continue;
+                if ((Bound(b, index, compared) ?? InductionTableBound(_fn, b, compared)) is not long last || last >= MaxTableEntries) continue;
                 // String-pointer tables are often longer than the original
                 // linear-choice budget, and a long linear chain cannot later
                 // be canonicalized as a choice among metadata slots.
@@ -103,15 +103,20 @@ public sealed partial class Normalizer
         else if (scaled.Op == Op.Mul && scaled.In[1].IsConstValue(size)) index = scaled.In[0];
         else return false;
         // A narrower value widened: its unsigned bound then bounds the index too.
-        return index.Op is Op.ZExt or Op.SExt && index.In[0].Type.IsInt() && index.In[0].Type.Bytes() <= 4;
+        return index.Type.IsInt() && (index.Op is not (Op.ZExt or Op.SExt) || index.In[0].Type.IsInt() && index.In[0].Type.Bytes() <= 4);
     }
 
     /// <summary>
     /// The largest index the code reaching <paramref name="b"/> allows: an unsigned comparison of the index
     /// with a constant, on the edge into a chain of single-predecessor blocks ending here.
     /// </summary>
-    private static long? Bound(Block b, Node index, Node compared)
+    internal static long? Bound(Block b, Node index, Node compared)
     {
+        // Zero extension of an IR predicate admits exactly the two original table entries.
+        // Sign extension would turn true into -1 and must retain the load.
+        if (index.Op == Op.ZExt && compared.Type == VT.I1 && compared.Op is
+            Op.CmpEq or Op.CmpNe or Op.CmpLtS or Op.CmpLeS or Op.CmpLtU or Op.CmpLeU or
+            Op.FCmpEq or Op.FCmpLt or Op.FCmpLe or Op.FCmpUnord) return 1;
         Block child = b;
         for (int depth = 0; depth < 4 && child.Preds.Count == 1; depth++)
         {
@@ -142,9 +147,48 @@ public sealed partial class Normalizer
                         _ => null,
                     };
                     if (bound is long k && k >= 0) return k;
+                    // (x & ~K) == 0 on this edge proves the unsigned domain [0,K].
+                    // Require every high bit and no low bit in the original operand width.
+                    if (c.Op is Op.CmpEq or Op.CmpNe && taken == (c.Op == Op.CmpEq))
+                    {
+                        Node? masked = c.In[1].IsConstValue(0) ? c.In[0] : c.In[0].IsConstValue(0) ? c.In[1] : null;
+                        if (masked is { Op: Op.And, In.Length: 2 } && masked.Type.Bits() is >= 8 and <= 32)
+                        {
+                            Node? mask = masked.In[0].IsConst && Is(masked.In[1]) ? masked.In[0] :
+                                masked.In[1].IsConst && Is(masked.In[0]) ? masked.In[1] : null;
+                            if (mask != null)
+                            {
+                                ulong low = (~mask.UImm) & masked.Type.Mask();
+                                if (low < MaxTableEntries && (low & (low + 1)) == 0) return (long)low;
+                            }
+                        }
+                    }
                 }
             }
             child = p;
+        }
+        return null;
+    }
+
+    // Exact zero-based, unit-stride induction terminated by next != N. The sole
+    // backedge supplies that same next value; N <= 256 proves no modular wrap.
+    internal static long? InductionTableBound(Function fn, Block use, Node index)
+    {
+        if (fn.TryRegions.Count != 0 || index is not { Op: Op.Phi, Type: VT.I64, In.Length: 2, Block: {} head } ||
+            !head.Phis.Contains(index) || head.Preds.Count != 2) return null;
+        var cfg = new Cfg(fn);
+        if (!cfg.Dominates(head, use)) return null;
+        for (int back = 0; back < 2; back++)
+        {
+            Block tail = head.Preds[back]; Node next = index.In[back];
+            if (!index.In[1-back].IsConstValue(0) || tail == head || !cfg.Dominates(head, tail) ||
+                next is not { Op: Op.Add, Type: VT.I64, In.Length: 2 } || next.Block != tail ||
+                !(next.In[0] == index && next.In[1].IsConstValue(1) || next.In[1] == index && next.In[0].IsConstValue(1)) ||
+                tail.Succs.Count != 2 || tail.Succs[0] != head || tail.Succs[1] == head ||
+                tail.Terminator is not { Op: Op.Branch, In.Length: 1 } branch ||
+                branch.In[0] is not { Op: Op.CmpNe, In.Length: 2 } cmp) continue;
+            Node? end = cmp.In[0] == next && cmp.In[1].IsConst ? cmp.In[1] : cmp.In[1] == next && cmp.In[0].IsConst ? cmp.In[0] : null;
+            if (end is { Type: VT.I64 } && end.Imm is > 0 and <= MaxTableEntries) return end.Imm - 1;
         }
         return null;
     }
@@ -184,7 +228,7 @@ public sealed partial class Normalizer
         bool result = n.Op switch
         {
             Op.Select when n.Block != null => IsSlotChoice(Resolve(n.In[1]), depth + 1, open) && IsSlotChoice(Resolve(n.In[2]), depth + 1, open),
-            Op.Phi when n.Block is { } block && n.In.Length == block.Preds.Count && n.In.Length is >= 2 and <= 8 =>
+            Op.Phi when n.Block is { } block && n.In.Length == block.Preds.Count && n.In.Length is >= 2 and <= 32 =>
                 n.In.All(i => IsSlotChoice(Resolve(i), depth + 1, open)),
             _ => false,
         };

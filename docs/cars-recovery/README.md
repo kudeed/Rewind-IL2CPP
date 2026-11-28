@@ -53,3 +53,16 @@ Two positive and eight negative cases pass, including the original System.Random
 dotnet build tests/BranchOverloadSmoke/BranchOverloadSmoke.csproj -c Release -nodeReuse:false -p:UseSharedCompilation=false
 dotnet tests/BranchOverloadSmoke/bin/Release/net10.0/FsmConstructionSmoke.dll ORIGINAL_SO ORIGINAL_METADATA signatures FRESH_OUTPUT_DIRECTORY
 ```
+
+## Bounded lookup tables and partial struct tails
+
+The selected 27-type queue is now 26 rejected methods (native19), down from 32 at native18. Six formerly rejected methods recover cleanly: Car.FixedStep, TrafficCar.OnDrawGizmosSelected, DiagonalSlicedUIButtonImage.AddRadialCorner and FindQuadCorner, UpgradeUI.EnsureReferences, and UnderwaterFishShoals.BuildMeshes. ModifyGeneratedMesh retains one explicit array-cursor gap.
+
+Table expansion now proves zero-extended predicate domains, exact unsigned mask domains, and zero-based unit-step loops with a checked constant termination value. It preserves the existing immutable table reader and raw scalar bits. Metadata slot choices admit up to 32 predecessors, with every leaf still required to resolve through the original metadata. Struct-tail copies require a complete public numeric field cover and exact nonoverlapping stack slots; unknown layouts, gaps, private fields, readonly fields and partial overlaps remain rejected. Public Color32 bytes cover its private numeric union alias exactly.
+
+The full 6,293-method comparison changed eight formerly rejected bodies; 6,285 bodies and all 796 previously clean declarations remain identical. Original type, field and method contracts are unchanged. This does not establish scene wiring or whole-game completion; the previously documented exception-helper boundary defect remains open.
+
+```sh
+dotnet build tests/BoundedTablesAndStructTailsSmoke -c Release -nodeReuse:false -p:UseSharedCompilation=false
+dotnet tests/BoundedTablesAndStructTailsSmoke/bin/Release/net10.0/FsmConstructionSmoke.dll ORIGINAL_SO ORIGINAL_METADATA signatures FRESH_OUTPUT_DIRECTORY
+```
