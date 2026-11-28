@@ -229,6 +229,48 @@ badFp.Body.Instructions.First(x=>x.OpCode.Code==Code.Mul).OpCode=OpCodes.Div;
 var badFpShape=Shape(badFp.Body);
 Check(ListAppendIlFolding.Run(badFp.Body)==0&&Shape(badFp.Body)==badFpShape,"reject unproven scheduled op");
 host.Methods.Remove(badFp);
+// Test branch-local default construction without merging temporary writes.
+// The slow-copy local is observable after the join, so collapsing both
+// arms to one assignment would change the result.
+var defaultBranch=Fixture("DefaultBranch",false);
+var bm=defaultBranch.M;var bi=bm.Body.GetILProcessor();
+var fastTmp=new VariableDefinition(i32);var slowTmp=new VariableDefinition(i32);
+bm.Body.Variables.Add(fastTmp);bm.Body.Variables.Add(slowTmp);
+var observable=new FieldDefinition("BranchLocal",FieldAttributes.Public|FieldAttributes.Static,i32);host.Fields.Add(observable);
+var val=defaultBranch.Value;
+var fl=defaultBranch.Region[28];
+bi.InsertBefore(fl,Instruction.Create(OpCodes.Ldloca,fastTmp));
+bi.InsertBefore(fl,Instruction.Create(OpCodes.Initobj,i32));fl.Operand=fastTmp;
+var sl=defaultBranch.Slow.Next; // before slow receiver
+bi.InsertBefore(sl,Instruction.Create(OpCodes.Ldloca,slowTmp));
+bi.InsertBefore(sl,Instruction.Create(OpCodes.Initobj,i32));
+bi.InsertBefore(sl,Instruction.Create(OpCodes.Ldloc,slowTmp));
+bi.InsertBefore(sl,Instruction.Create(OpCodes.Stloc,val));
+bi.InsertAfter(defaultBranch.Join,Instruction.Create(OpCodes.Stsfld,observable));
+bi.InsertAfter(defaultBranch.Join,Instruction.Create(OpCodes.Ldloc,val));
+Check(ListAppendIlFolding.Run(bm.Body)==1,"branch-local default shape");
+Check(bm.Body.Instructions.Count(i=>i.Operand is MethodReference r&&r.Name=="Add")==2,"both original arms kept");
+bm.Body.OptimizeMacros();
+
+// A scheduled array value read must retain its bounds/null exceptions
+// before changing the list version. A pure continuation remains unchanged.
+var arrayRead=Fixture("ArrayReadSchedule",false);
+var am=arrayRead.M;var ai=am.Body.GetILProcessor();var ap=new ParameterDefinition(new ArrayType(i32));am.Parameters.Add(ap);
+var beforeVersion=arrayRead.Region[3];
+foreach(var i in new[]{Instruction.Create(OpCodes.Ldarg,ap),Instruction.Create(OpCodes.Ldarg,am.Parameters[1]),
+    Instruction.Create(OpCodes.Ldelem_Any,i32),Instruction.Create(OpCodes.Stloc,arrayRead.Value)})ai.InsertBefore(beforeVersion,i);
+Check(ListAppendIlFolding.Run(am.Body)==1,"array schedule branch proof");
+am.Body.OptimizeMacros();
+
+var badScheduledBranch=Fixture("BadScheduledBranch",false);
+var badIl=badScheduledBranch.M.Body.GetILProcessor();
+badIl.InsertBefore(badScheduledBranch.Region[3],Instruction.Create(OpCodes.Ldarg,badScheduledBranch.M.Parameters[0]));
+badIl.InsertBefore(badScheduledBranch.Region[3],Instruction.Create(OpCodes.Callvirt,resize));
+badIl.InsertBefore(badScheduledBranch.Region[3],Instruction.Create(OpCodes.Stloc,badScheduledBranch.Value));
+var badScheduledBranchShape=Shape(badScheduledBranch.M.Body);
+Check(ListAppendIlFolding.Run(badScheduledBranch.M.Body)==0&&Shape(badScheduledBranch.M.Body)==badScheduledBranchShape,
+    "reject scheduled unproven mutating call");
+host.Methods.Remove(badScheduledBranch.M);
 using var memory=new MemoryStream();asm.Write(memory);
 var assembly=Assembly.Load(memory.ToArray());
 var runtimeHost=assembly.GetType("Fixture.AppendHost")!;
@@ -301,4 +343,27 @@ foreach(int capacity in new[]{0,1,128})
     }
 }
 try{appendFp(null!,1f,2f,3f);throw new Exception("lost scheduled FP null check");}catch(NullReferenceException){}
+var appendDefault=runtimeHost.GetMethod("DefaultBranch")!.CreateDelegate<Action<List<int>,int>>();
+var readArray=runtimeHost.GetMethod("ArrayReadSchedule")!.CreateDelegate<Action<List<int>,int,int[]>>();
+var observed=runtimeHost.GetField("BranchLocal")!;
+int branchRuns=0;
+foreach(int capacity in new[]{0,1,128})
+{
+    var ints=new List<int>(capacity);var expected=new List<int>(capacity);
+    for(int n=0;n<100;n++)
+    {
+        bool expands=ints.Count==ints.Capacity;
+        appendDefault(ints,7);expected.Add(0);
+        Check((int)observed.GetValue(null)! == (expands?0:7),"branch-local value changed");
+        Check(ints.SequenceEqual(expected)&&ints.Capacity==expected.Capacity,"default branch append");
+        readArray(ints,1,[10,20,30]);expected.Add(20);
+        Check(ints.SequenceEqual(expected)&&ints.Capacity==expected.Capacity,"scheduled array append");
+        runs+=2;branchRuns+=2;
+    }
+    var old=ints.GetEnumerator();
+    try{readArray(ints,8,[1]);throw new Exception("missing array bounds check");}catch(IndexOutOfRangeException){}
+    Check(old.MoveNext()&&ints.SequenceEqual(expected),"array exception changed list version");
+}
+try{readArray(null!,99,[1]);throw new Exception("missing receiver null check");}catch(NullReferenceException){}
+Console.WriteLine($"BRANCH_PRESERVING_APPEND_SMOKE_PASS operations={branchRuns} negative=1 exception_order=4");
 Console.WriteLine($"LIST_APPEND_IL_FOLDING_SMOKE_PASS runtime_operations={runs} negative_patterns={negatives.Length+7} null_cases=6 protected_calls={protectedRuns+1}");

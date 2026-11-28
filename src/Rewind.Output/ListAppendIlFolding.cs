@@ -57,7 +57,7 @@ internal static class ListAppendIlFolding
         body.SimplifyMacros();
         int count = 0;
         foreach (Instruction candidate in body.Instructions.Where(Candidate).ToArray())
-            if (TryFold(body, candidate) || TryFold(body, candidate, extended: true)) count++;
+            if (TryFold(body, candidate) || TryFold(body, candidate, extended: true) || TryPreserveBranches(body, candidate)) count++;
         if (count == 0)
             foreach (var (i, opcode, operand) in original) { i.OpCode = opcode; i.Operand = operand; }
         return count;
@@ -312,6 +312,229 @@ internal static class ListAppendIlFolding
         Put(OpCodes.Ldloc, value);
         Put(OpCodes.Callvirt, addRef);
         Put(OpCodes.Br, join);
+        return true;
+    }
+
+    // A fallback for complete diamonds whose branches have their own
+    // initialized element temporaries or different continuation loads.
+    // Preserve the capacity decision and both original arms. Only replace
+    // the framework internals with public Capacity, Count and Add.
+    private static bool TryPreserveBranches(MethodBody body,Instruction candidate)
+    {
+        // Protected regions require a separate proof of exceptional exits.
+        if(body.HasExceptionHandlers)return false;
+        var a=body.Instructions.ToArray();
+        var ix=a.Select((i,n)=>(i,n)).ToDictionary(x=>x.i,x=>x.n);
+        int k=ix[candidate]-1;
+        if(k<0||k+30>=a.Length)return false;
+        static TypeReference? LoadType(Instruction i)=>i.OpCode.Code switch
+        {
+            Code.Ldloc when i.Operand is VariableDefinition v=>v.VariableType,
+            Code.Ldarg when i.Operand is ParameterDefinition p=>p.ParameterType,
+            _=>null
+        };
+        var receiver=a[k];
+        if(LoadType(receiver) is not GenericInstanceType gt||!List(gt)||
+           a[k+2].OpCode.Code!=Code.Stloc||a[k+2].Operand is not VariableDefinition array||
+           array.VariableType is not ArrayType{IsVector:true} at||!Same(at.ElementType,gt.GenericArguments[0]))return false;
+        var element=gt.GenericArguments[0];
+        bool Receiver(Instruction i)=>i.OpCode.Code==receiver.OpCode.Code&&i.Operand==receiver.Operand;
+        bool Local(Instruction i,Code c,VariableDefinition v)=>i.OpCode.Code==c&&i.Operand==v;
+        TypeDefinition? def;
+        try{def=gt.ElementType.Resolve();}catch(AssemblyResolutionException){return false;}
+        if(def==null||!Same(def,gt.ElementType)||def.GenericParameters.Count!=1||
+           Same(body.Method.DeclaringType,def))return false;
+        bool Field(Instruction i,Code op,string name,bool items=false)
+        {
+            if(i.OpCode.Code!=op||i.Operand is not FieldReference f||f.Name!=name||!Same(f.DeclaringType,gt))return false;
+            FieldDefinition? d;try{d=f.Resolve();}catch(AssemblyResolutionException){return false;}
+            return d!=null&&d.DeclaringType==def&&!d.IsStatic&&(d.IsPrivate||d.IsAssembly)&&
+                (items?d.FieldType is ArrayType{IsVector:true} t&&ElementParameter(t.ElementType,gt):d.FieldType.MetadataType==MetadataType.Int32);
+        }
+        MethodDefinition? Resolve(MethodReference m){try{return m.Resolve();}catch(AssemblyResolutionException){return null;}}
+        if(!Field(candidate,Code.Ldfld,"_items",true))return false;
+
+        // The optional schedule before the version increment may contain
+        // a complete, typed array read or a field read. Keep it in place,
+        // including its original exceptions. No calls except exact List.Count.
+        int n=k+3;
+        while(n+6<a.Length&&n-k<=32&&!(Receiver(a[n])&&Receiver(a[n+1])&&Field(a[n+2],Code.Ldfld,"_version")))
+            n++;
+        if(n+30>=a.Length||!Receiver(a[n])||!Receiver(a[n+1])||!Field(a[n+2],Code.Ldfld,"_version")||
+           !Constant(a[n+3],1)||a[n+4].OpCode.Code!=Code.Add||!Field(a[n+5],Code.Stfld,"_version"))return false;
+        var scheduled=a.Skip(k+3).Take(n-k-3).ToArray();
+
+        // A bounded stack/type interpreter for read-only pre-version
+        // schedules. Integer arithmetic is unchecked, array accesses
+        // preserve their exceptions; the list's original null check
+        // occurs first. All stores are to unrelated locals.
+        var stack=new Stack<TypeReference>();
+        TypeReference? Pop()=>stack.TryPop(out var v)?v:null;
+        bool IsInt(TypeReference t)=>t.MetadataType is MetadataType.Int32 or MetadataType.Int64 or MetadataType.UInt32 or MetadataType.UInt64;
+        bool RefAssignable(TypeReference source,TypeReference target)
+        {
+            if(Same(source,target))return true;
+            if(source.IsValueType||target.IsValueType||source is TypeSpecification||target is TypeSpecification)return false;
+            try
+            {
+                var seen=new HashSet<string>();TypeDefinition? d=source.Resolve();
+                while(d!=null&&seen.Add(d.FullName))
+                {if(Same(d,target))return true;d=d.BaseType?.Resolve();}
+            }
+            catch(AssemblyResolutionException){}
+            return false;
+        }
+        foreach(var ins in scheduled)
+        {
+            if(ins.Operand==receiver.Operand||ins.Operand==array)return false;
+            if(LoadType(ins) is {} load){stack.Push(load);continue;}
+            switch(ins.OpCode.Code)
+            {
+                case Code.Ldc_I4:stack.Push(body.Method.Module.TypeSystem.Int32);break;
+                case Code.Ldc_I8:stack.Push(body.Method.Module.TypeSystem.Int64);break;
+                case Code.Conv_I4:case Code.Conv_I8:
+                    if(Pop() is not {} converted||!IsInt(converted))return false;
+                    stack.Push(ins.OpCode.Code==Code.Conv_I4?body.Method.Module.TypeSystem.Int32:body.Method.Module.TypeSystem.Int64);break;
+                case Code.Add:case Code.Sub:
+                    if(Pop() is not {} right||Pop() is not {} left||!IsInt(left)||!IsInt(right)||!Same(left,right))return false;
+                    stack.Push(left);break;
+                case Code.Ldlen:
+                    if(Pop() is not ArrayType{IsVector:true})return false;
+                    // The immediately following Conv_I4 in emitted shapes
+                    // restores the original array length to int.
+                    stack.Push(body.Method.Module.TypeSystem.Int64);break;
+                case Code.Ldelem_Any:
+                    if(Pop() is not {} index||index.MetadataType!=MetadataType.Int32||
+                       Pop() is not ArrayType{IsVector:true} arr||ins.Operand is not TypeReference et||!Same(et,arr.ElementType))return false;
+                    stack.Push(et);break;
+                case Code.Ldfld:
+                    if(Pop() is not {} owner||ins.Operand is not FieldReference fr||
+                       !RefAssignable(owner,fr.DeclaringType))return false;
+                    FieldDefinition? fd;try{fd=fr.Resolve();}catch(AssemblyResolutionException){return false;}
+                    if(fd==null||fd.IsStatic||(!fd.IsPublic&&fd.DeclaringType!=body.Method.DeclaringType)||
+                       fr.FieldType.ContainsGenericParameter)return false;
+                    stack.Push(fr.FieldType);break;
+                case Code.Callvirt:
+                    if(Pop() is not GenericInstanceType cg||!List(cg)||ins.Operand is not MethodReference cr||
+                       !Same(cr.DeclaringType,cg)||cr.Name!="get_Count"||!cr.HasThis||cr.Parameters.Count!=0||
+                       cr.ReturnType.MetadataType!=MetadataType.Int32||Resolve(cr) is not {IsPublic:true,IsStatic:false} cm||
+                       !Same(cm.DeclaringType,cg.ElementType))return false;
+                    stack.Push(cr.ReturnType);break;
+                case Code.Stloc:
+                    if(ins.Operand is not VariableDefinition dest||Pop() is not {} val||
+                       !Same(val,dest.VariableType)||stack.Count!=0)return false;
+                    break;
+                default:return false;
+            }
+        }
+        if(stack.Count!=0)return false;
+        int c=n+6;
+        if(!Receiver(a[c])||a[c+1].OpCode.Code!=Code.Callvirt||a[c+1].Operand is not MethodReference get||
+           !Same(get.DeclaringType,gt)||get.Name!="get_Count"||!get.HasThis||get.Parameters.Count!=0||
+           get.ReturnType.MetadataType!=MetadataType.Int32||Resolve(get) is not {IsPublic:true,IsStatic:false} countMethod||
+           countMethod.DeclaringType!=def||a[c+2].OpCode.Code!=Code.Stloc||a[c+2].Operand is not VariableDefinition size||
+           size.VariableType.MetadataType!=MetadataType.Int32||scheduled.Any(i=>i.Operand==size))return false;
+        int b=c+3;
+        if(!Local(a[b],Code.Ldloc,array)||a[b+1].OpCode.Code!=Code.Ldlen||a[b+2].OpCode.Code!=Code.Conv_I4||
+           !Local(a[b+3],Code.Ldloc,size)||a[b+4].OpCode.Code!=Code.Cgt_Un||!Constant(a[b+5],0)||
+           a[b+6].OpCode.Code!=Code.Ceq||a[b+7].OpCode.Code!=Code.Brtrue||a[b+7].Operand is not Instruction slow||
+           !ix.TryGetValue(slow,out int f)||f<=b+16||f>=a.Length-4)return false;
+        int fast=b+8;
+        if(a[fast].OpCode.Code!=Code.Nop||!Receiver(a[fast+1])||!Local(a[fast+2],Code.Ldloc,size)||
+           !Constant(a[fast+3],1)||a[fast+4].OpCode.Code!=Code.Add||!Field(a[fast+5],Code.Stfld,"_size")||
+           !Local(a[fast+6],Code.Ldloc,array)||!Local(a[fast+7],Code.Ldloc,size))return false;
+        int v=fast+8,store;
+        VariableDefinition? fastTemp=null,slowTemp=null,slowCopy=null;
+        Instruction? fastValue=null;
+        bool DefaultAt(int i,out VariableDefinition? local)
+        {
+            local=null;
+            if(i+2>=a.Length||a[i].OpCode.Code!=Code.Ldloca||a[i].Operand is not VariableDefinition t||
+               !element.IsValueType||!Same(t.VariableType,element)||a[i+1].OpCode.Code!=Code.Initobj||
+               a[i+1].Operand is not TypeReference ty||!Same(ty,element)||!Local(a[i+2],Code.Ldloc,t))return false;
+            local=t;return true;
+        }
+        if(DefaultAt(v,out fastTemp))store=v+3;
+        else if(LoadType(a[v]) is {} vt&&Same(vt,element)){fastValue=a[v];store=v+1;}
+        else return false;
+        if(store>=f||a[store].OpCode.Code!=Code.Stelem_Any||a[store].Operand is not TypeReference st||!Same(st,element))return false;
+        // Preserve only straight-line continuation loads/stores in the
+        // fast arm before its original unconditional join.
+        int end=store+1;
+        while(end+1<f&&LoadType(a[end]) is {} type&&a[end+1].OpCode.Code==Code.Stloc&&
+              a[end+1].Operand is VariableDefinition dst&&Same(type,dst.VariableType)&&dst!=size&&dst!=array&&dst!=receiver.Operand)end+=2;
+        if(end>=a.Length||a[end].OpCode.Code!=Code.Br||a[end].Operand is not Instruction join||
+           !ix.TryGetValue(join,out int j)||end+1!=f||j<=f||a[f].OpCode.Code!=Code.Nop)return false;
+        int si=f+1;
+        if(fastTemp!=null)
+        {
+            if(si+3>=a.Length||!DefaultAt(si,out slowTemp)||slowTemp==fastTemp||a[si+3].OpCode.Code!=Code.Stloc||
+               a[si+3].Operand is not VariableDefinition copy||!Same(copy.VariableType,element)||
+               copy==slowTemp||copy==fastTemp||copy==array||copy==size)return false;
+            slowCopy=copy;si+=4;
+        }
+        if(si+2>=j||!Receiver(a[si])||LoadType(a[si+1]) is not {} sv||!Same(sv,element)||
+           (fastTemp!=null?!Local(a[si+1],Code.Ldloc,slowCopy!):
+            a[si+1].OpCode.Code!=fastValue!.OpCode.Code||a[si+1].Operand!=fastValue.Operand)||
+           a[si+2].OpCode.Code!=Code.Callvirt||a[si+2].Operand is not MethodReference resize||
+           resize.Name!="AddWithResize"||!Same(resize.DeclaringType,gt)||!resize.HasThis||
+           resize.ReturnType.MetadataType!=MetadataType.Void||resize.Parameters.Count!=1||
+           !ElementParameter(resize.Parameters[0].ParameterType,gt)||
+           Resolve(resize) is not {IsPrivate:true,IsStatic:false} rm||rm.DeclaringType!=def)return false;
+        // Slow tail may read a field of the exact receiver's owning class
+        // and store a local. Both continuations stay as originally emitted.
+        // No unknown call or control flow in the matched region.
+        int e=si+3;
+        while(e<j)
+        {
+            if(a[e].OpCode.Code==Code.Nop){e++;continue;}
+            if(e+2<j&&LoadType(a[e]) is {} own&&a[e+1].OpCode.Code==Code.Ldfld&&
+               a[e+1].Operand is FieldReference rf&&Same(own,rf.DeclaringType)&&
+               a[e+2].OpCode.Code==Code.Stloc&&a[e+2].Operand is VariableDefinition rd&&
+               Same(rd.VariableType,rf.FieldType)&&rd!=array&&rd!=size&&rd!=receiver.Operand){e+=3;continue;}
+            if(e+1<j&&LoadType(a[e]) is {} ot&&a[e+1].OpCode.Code==Code.Stloc&&
+               a[e+1].Operand is VariableDefinition od&&Same(od.VariableType,ot)&&od!=array&&od!=size&&od!=receiver.Operand){e+=2;continue;}
+            if(e==j-1&&a[e].OpCode.Code==Code.Br&&a[e].Operand==join){e++;continue;}
+            return false;
+        }
+        var region=a.Skip(k).Take(j-k).ToHashSet();
+        foreach(var i in a)
+        {
+            if((i.OpCode.Code is Code.Ldloca or Code.Ldarga)&&
+                (i.Operand==array||i.Operand==size||i.Operand==receiver.Operand||
+                 i.Operand==fastValue?.Operand||
+                 (i.Operand==fastTemp||i.Operand==slowTemp)&&i!=a[v]&&i!=a[f+1]))return false;
+            if(!region.Contains(i)&&(i.Operand==array||i.Operand==size))return false;
+            if(i.OpCode.Code==Code.Starg&&(i.Operand==receiver.Operand||i.Operand==fastValue?.Operand))return false;
+            if(!region.Contains(i)&&i.Operand is Instruction target&&target!=receiver&&region.Contains(target))return false;
+            if(!region.Contains(i)&&i.Operand is Instruction[] ts&&ts.Any(t=>t!=receiver&&region.Contains(t)))return false;
+            // The only interior branch targets are the original capacity
+            // decision's slow arm and the common join.
+            if(region.Contains(i)&&i.Operand is Instruction target2&&region.Contains(target2)&&
+               !(i==a[b+7]&&target2==slow))return false;
+        }
+        var adds=def.Methods.Where(m=>m.Name=="Add"&&m.IsPublic&&!m.IsStatic&&!m.HasGenericParameters&&
+            m.ReturnType.MetadataType==MetadataType.Void&&m.Parameters.Count==1&&ElementParameter(m.Parameters[0].ParameterType,gt)).ToArray();
+        var caps=def.Methods.Where(m=>m.Name=="get_Capacity"&&m.IsPublic&&!m.IsStatic&&!m.HasGenericParameters&&
+            m.ReturnType.MetadataType==MetadataType.Int32&&m.Parameters.Count==0).ToArray();
+        if(adds.Length!=1||caps.Length!=1)return false;
+        var addRef=new MethodReference("Add",resize.ReturnType,gt){HasThis=true,CallingConvention=resize.CallingConvention};
+        addRef.Parameters.Add(new ParameterDefinition(resize.Parameters[0].ParameterType));
+        var capRef=new MethodReference("get_Capacity",caps[0].ReturnType,gt){HasThis=true,CallingConvention=caps[0].CallingConvention};
+        if(Resolve(addRef)!=adds[0]||Resolve(capRef)!=caps[0])return false;
+        // Keep the original array local for metadata stability, but never
+        // read or write it after this transformation. Capture Capacity
+        // before any scheduled read, preserving the original null check.
+        var cap=new VariableDefinition(body.Method.Module.TypeSystem.Int32);
+        body.Variables.Add(cap);
+        void Nop(Instruction i){i.OpCode=OpCodes.Nop;i.Operand=null;}
+        candidate.OpCode=OpCodes.Callvirt;candidate.Operand=capRef;a[k+2].Operand=cap;
+        foreach(var i in a.Skip(n).Take(6))Nop(i);
+        a[b].Operand=cap;Nop(a[b+1]);Nop(a[b+2]);
+        foreach(var i in a.Skip(fast+1).Take(5))Nop(i);
+        a[fast+6].OpCode=receiver.OpCode;a[fast+6].Operand=receiver.Operand;Nop(a[fast+7]);
+        a[store].OpCode=OpCodes.Callvirt;a[store].Operand=addRef;
+        a[si+2].Operand=addRef;
         return true;
     }
 }
