@@ -93,9 +93,18 @@ public sealed partial class Normalizer
 
         int index=ci.Slots.FindIndex(s=>s.Kind==ArgSlotKind.IntReg&&s.Index==0);
         if(index<0||index>=call.In.Length||ReferenceEquals(call.In[index],checkedObject))return;
-        // Ensure no intervening effect in the guard after reading the value.
         int readAt=guard.Nodes.IndexOf(checkedObject);
-        if(readAt<0||guard.Nodes.Skip(readAt+1).Any(n=>!n.Dead&&n!=guard.Terminator&&n.IsEffect))return;
+        if(readAt<0||checkedObject.Dead)return;
+        bool crossesEffect=guard.Nodes.Skip(readAt+1).Any(n=>!n.Dead&&n!=guard.Terminator&&n.IsEffect);
+        // An earlier call may have overwritten x0 after the exact checked
+        // instance was saved. Keep that call and reuse the original Load node;
+        // do not read the static field again at the call. HirBuilder captures a
+        // Load that crosses a call/store (or leaves its block) at its original
+        // position. The null check still occurs after those earlier effects:
+        // FirstDirectCall permits no heap effect between the guard and callee.
+        // This extension requires the precise original native direct transfer,
+        // in addition to the unique metadata target and unused-x0 entry proof.
+        if(crossesEffect&&!Arm64ReceiverProof.ExactDirectTransfer(program.Model.Image,call.Addr,ci.Target,call.Op==Op.TailCall))return;
         call.In[index]=checkedObject;
         _result.ReceiverNotes.Add($"guarded receiver at 0x{call.Addr:X} to 0x{ci.Target:X} via {owner.ReflectionName}::{fields[0].Name}");
     }
