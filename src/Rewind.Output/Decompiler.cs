@@ -396,6 +396,21 @@ public static partial class Decompiler
             internal static int Sign(System.Numerics.BigInteger value) => value.Sign;
             private static class RefCell<T> { internal static T Value; }
             internal static uint StringHash(string s) { uint num = 0u; if (s != null) { num = 2166136261u; for (int i = 0; i < s.Length; i++) num = (s[i] ^ num) * 16777619u; } return num; }
+            internal static UnityEngine.Vector3 Slerp(in UnityEngine.Vector3 a, in UnityEngine.Vector3 b, float t) => UnityEngine.Vector3.Slerp(a, b, t);
+            internal static UnityEngine.Vector3 RotateTowards(in UnityEngine.Vector3 current, in UnityEngine.Vector3 target, float maxRadiansDelta, float maxMagnitudeDelta) => UnityEngine.Vector3.RotateTowards(current, target, maxRadiansDelta, maxMagnitudeDelta);
+            internal static UnityEngine.Vector3 Normalize(in UnityEngine.Vector3 v) => UnityEngine.Vector3.Normalize(v);
+            internal static UnityEngine.Vector3 Cross(in UnityEngine.Vector3 a, in UnityEngine.Vector3 b) => UnityEngine.Vector3.Cross(a, b);
+            internal static UnityEngine.Vector3 Project(in UnityEngine.Vector3 v, in UnityEngine.Vector3 onNormal) => UnityEngine.Vector3.Project(v, onNormal);
+            internal static UnityEngine.Vector3 ProjectOnPlane(in UnityEngine.Vector3 v, in UnityEngine.Vector3 planeNormal) => UnityEngine.Vector3.ProjectOnPlane(v, planeNormal);
+            internal static UnityEngine.Quaternion Slerp(in UnityEngine.Quaternion a, in UnityEngine.Quaternion b, float t) => UnityEngine.Quaternion.Slerp(a, b, t);
+            internal static UnityEngine.Quaternion Lerp(in UnityEngine.Quaternion a, in UnityEngine.Quaternion b, float t) => UnityEngine.Quaternion.Lerp(a, b, t);
+            internal static UnityEngine.Quaternion AngleAxis(float angle, in UnityEngine.Vector3 axis) => UnityEngine.Quaternion.AngleAxis(angle, axis);
+            internal static UnityEngine.Quaternion FromToRotation(in UnityEngine.Vector3 from, in UnityEngine.Vector3 to) => UnityEngine.Quaternion.FromToRotation(from, to);
+            internal static UnityEngine.Quaternion Inverse(in UnityEngine.Quaternion q) => UnityEngine.Quaternion.Inverse(q);
+            internal static UnityEngine.Quaternion LookRotation(in UnityEngine.Vector3 forward, in UnityEngine.Vector3 upwards) => UnityEngine.Quaternion.LookRotation(forward, upwards);
+            internal static UnityEngine.Matrix4x4 TRS(in UnityEngine.Vector3 pos, in UnityEngine.Quaternion q, in UnityEngine.Vector3 s) => UnityEngine.Matrix4x4.TRS(pos, q, s);
+            internal static UnityEngine.Matrix4x4 Inverse(in UnityEngine.Matrix4x4 m) => m.inverse;
+            internal static bool TestPlanesAABB(UnityEngine.Plane[] planes, in UnityEngine.Bounds bounds) => UnityEngine.GeometryUtility.TestPlanesAABB(planes, bounds);
         }
         """ + "\n";
 
