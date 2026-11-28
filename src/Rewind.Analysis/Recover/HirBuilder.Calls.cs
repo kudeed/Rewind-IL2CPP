@@ -753,8 +753,7 @@ public sealed partial class HirBuilder
         if (objectNode != null)
         {
             HExpr receiver = Value(objectNode);
-            TypeSig? receiverType = receiver.Type;
-            if (_castTypes.TryGetValue(objectNode, out List<TypeSig>? casts) && casts.Count == 1) receiverType = casts[0];
+            TypeSig? receiverType = VirtualReceiverType(objectNode, receiver.Type);
             if (receiverType != null) receiverType = Declared(receiverType);
             MethodDef? method = FindVirtual(receiverType, invoker.Slot);
             if (method == null) why = $"virtual slot {invoker.Slot} not found on {receiverType?.DisplayName ?? "unknown type"}";
@@ -1947,7 +1946,54 @@ public sealed partial class HirBuilder
             if (def.BaseType == null) break;
             t = _m.Sigs.Substitute(def.BaseType, t is GenericInstSig g ? g.Arguments : [], []);
         }
-        return found;
+        return found ?? (start?.Definition is { } root ? FindVirtualIntroducedBelow(root, slot) : null);
+    }
+
+    /// <summary>
+    /// A callvirt can use a slot introduced by a type test below the receiver's declared type. For example,
+    /// BehaviorDesigner tests Task is ParentTask before calling ParentTask.OverrideStatus, and A* tests Path is
+    /// ABPath before reading ABPath.endPointKnownBeforeCalculation. The receiver can still have the base type
+    /// in the value-flow model, so resolving only its declared type loses the call. The vtables of all known
+    /// descendants tell us which method owns the slot. Resolve it only when those implementations have a
+    /// common declaring ancestor that itself declares that slot; unrelated new slots with the same number
+    /// therefore remain unresolved.
+    /// </summary>
+    private MethodDef? FindVirtualIntroducedBelow(TypeDef root, int slot)
+    {
+        if (_derivedVirtualCache.TryGetValue((root, slot), out MethodDef? cached)) return cached;
+
+        var implementations = new HashSet<MethodDef>();
+        if (!_derivedTypeCache.TryGetValue(root, out TypeDef[]? descendants))
+            _derivedTypeCache[root] = descendants = _m.Types.Where(t => !ReferenceEquals(t, root) && IsSameOrDerived(t, root)).ToArray();
+        foreach (TypeDef candidate in descendants)
+        {
+            if ((uint)slot >= (uint)candidate.VTable.Length) continue;
+            MethodDef? method = _m.DecodeVTableEntry(candidate.VTable[slot]).Method;
+            if (method is { IsVirtual: true, IsStatic: false }) implementations.Add(method);
+        }
+
+        MethodDef? resolved = null;
+        if (implementations.Count != 0)
+        {
+            // Walk the first implementation's declaring hierarchy from nearest to farthest. The first type
+            // that is an ancestor of every implementation and declares this slot is the shared base contract.
+            for (TypeDef? ancestor = implementations.First().DeclaringType; ancestor != null;
+                 ancestor = ancestor.BaseType?.Definition)
+            {
+                if (!implementations.All(m => IsSameOrDerived(m.DeclaringType, ancestor))) continue;
+                resolved = ancestor.Methods.FirstOrDefault(m => m.HasSlot && m.Slot == slot && m.IsVirtual && !m.IsStatic);
+                if (resolved != null) break;
+            }
+        }
+        _derivedVirtualCache[(root, slot)] = resolved;
+        return resolved;
+    }
+
+    private static bool IsSameOrDerived(TypeDef type, TypeDef expectedBase)
+    {
+        for (TypeDef? current = type; current != null; current = current.BaseType?.Definition)
+            if (ReferenceEquals(current, expectedBase)) return true;
+        return false;
     }
 
     /// <summary>
@@ -1966,8 +2012,7 @@ public sealed partial class HirBuilder
                 method = iface.Definition?.Methods.FirstOrDefault(m => m.HasSlot && m.Slot == it.Slot);
             else if (s is SVTable { MethodInfo: false } vt)
             {
-                TypeSig? receiverType = Peek(vt.Object) is SVal { Type: { } t } ? t : null;
-                if (_castTypes.TryGetValue(vt.Object, out List<TypeSig>? casts) && casts.Count == 1) receiverType = casts[0];
+                TypeSig? receiverType = VirtualReceiverType(vt.Object, Peek(vt.Object) is SVal { Type: { } t } ? t : null);
                 if (receiverType != null) method = FindVirtual(Declared(receiverType), vt.Slot);
             }
             if (method == null || method.IsStatic || method.GenericParameters.Length != 0 || method.DeclaringType.GenericParameters.Length != 0) return null;
@@ -2008,8 +2053,7 @@ public sealed partial class HirBuilder
         foreach (Node leaf in leaves)
         {
             if (Peek(leaf) is not SVTable { MethodInfo: false, Interface: null } vt) return null;
-            TypeSig? receiverType = Peek(vt.Object) is SVal { Type: { } t } ? t : null;
-            if (_castTypes.TryGetValue(vt.Object, out List<TypeSig>? casts) && casts.Count == 1) receiverType = casts[0];
+            TypeSig? receiverType = VirtualReceiverType(vt.Object, Peek(vt.Object) is SVal { Type: { } t } ? t : null);
             MethodDef? method = receiverType != null ? FindVirtual(Declared(receiverType), vt.Slot) : null;
             if (method == null || method.IsStatic || method.GenericParameters.Length != 0 || method.DeclaringType.GenericParameters.Length != 0) return null;
             // (One object throughout: the call's receiver is then the object every way read the class of.)
@@ -2065,8 +2109,7 @@ public sealed partial class HirBuilder
         }
         else
         {
-            TypeSig? receiverType = receiver.Type;
-            if (_castTypes.TryGetValue(entry.Object, out List<TypeSig>? casts) && casts.Count == 1) receiverType = casts[0];
+            TypeSig? receiverType = VirtualReceiverType(entry.Object, receiver.Type);
             method = FindVirtual(receiverType, entry.Slot);
             if (method != null && receiverType is GenericInstSig g && ReferenceEquals(g.Definition, method.DeclaringType)) declaring = g;
             else if (method != null && method.DeclaringType.GenericParameters.Length != 0) return null; // declared in a generic base: not followed
@@ -2139,8 +2182,7 @@ public sealed partial class HirBuilder
         else if (target is SVTable { MethodInfo: false } vt)
         {
             HExpr receiver = Value(vt.Object);
-            TypeSig? receiverType = receiver.Type;
-            if (_castTypes.TryGetValue(vt.Object, out List<TypeSig>? casts) && casts.Count == 1) receiverType = casts[0];
+            TypeSig? receiverType = VirtualReceiverType(vt.Object, receiver.Type);
             if (receiverType != null) receiverType = Declared(receiverType);
             MethodDef? method = FindVirtual(receiverType, vt.Slot);
             if (method != null)
@@ -2696,8 +2738,7 @@ public sealed partial class HirBuilder
                 Node? slotNode = buffer ? IntAt(call, 1) : a0, objectNode = buffer ? IntAt(call, 2) : a1;
                 if (slotNode == null || !slotNode.IsConst || objectNode == null) break;
                 HExpr receiver = Value(objectNode);
-                TypeSig? receiverType = receiver.Type;
-                if (_castTypes.TryGetValue(objectNode, out List<TypeSig>? casts) && casts.Count == 1) receiverType = casts[0];
+                TypeSig? receiverType = VirtualReceiverType(objectNode, receiver.Type);
                 MethodDef? method = FindVirtual(receiverType, (int)slotNode.UImm);
                 if (method == null) break;
                 TypeSig[] classArgs = receiverType is GenericInstSig g && ReferenceEquals(g.Definition, method.DeclaringType) ? g.Arguments : [];

@@ -35,6 +35,9 @@ public sealed partial class HirBuilder
     private readonly HashSet<Node> _materialize = [];
     private readonly Dictionary<Node, int> _position = [];
     private readonly Dictionary<Node, List<TypeSig>> _castTypes = [];
+    /// <summary>Virtual slots introduced below a statically known base type, resolved from descendant vtables.</summary>
+    private readonly Dictionary<(TypeDef Type, int Slot), MethodDef?> _derivedVirtualCache = [];
+    private readonly Dictionary<TypeDef, TypeDef[]> _derivedTypeCache = [];
     /// <summary>Where each object's class checks are (CastFact's At and From): a check holds only past its place.</summary>
     private readonly Dictionary<Node, List<(Block At, Node? From, IReadOnlyList<Node>? Over)>> _castPlaces = [];
     /// <summary>CastHoldsAtStart's answers, per object and block.</summary>
@@ -635,6 +638,13 @@ public sealed partial class HirBuilder
                     if (ReferenceEquals(o, obj))
                         return t;
         return null;
+    }
+
+    /// <summary>The receiver's class after a dominating successful type test, or its ordinary inferred/cast type.</summary>
+    private TypeSig? VirtualReceiverType(Node obj, TypeSig? inferred)
+    {
+        if (TestedType(obj) is { } tested) return tested;
+        return _castTypes.TryGetValue(obj, out List<TypeSig>? casts) && casts.Count == 1 ? casts[0] : inferred;
     }
 
     /// <summary>When a branch condition is a type test: the object, the type, and which way means "is an instance".</summary>
