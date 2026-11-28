@@ -33,6 +33,8 @@ for method in ['BehaviorManager::RunTask', 'BehaviorManager::RunParentTask', 'Be
             f'{method} has no unresolved virtual dispatch')
 
 bs = a.behavior_source.read_text(encoding='utf-8')
+require('internal int AddToTaskList(' in bs, 'ILSpy source preparation emits AddToTaskList instead of rejecting the entire method')
+require('part(s) of this method were not recovered' in bs, 'AddToTaskList keeps explicit gap markers; no missing logic is silently hidden')
 for snippet in ['((ParentTask)task3).OverrideStatus()', '((ParentTask)task).CanRunParallelChildren()',
                 '((Composite)task3).OnReevaluationStarted()', '((ParentTask)task).OverrideStatus(TaskStatus.Running)']:
     require(snippet in bs, f'generated BehaviorDesigner source contains {snippet}')

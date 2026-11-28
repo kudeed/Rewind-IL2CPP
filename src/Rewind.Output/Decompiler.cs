@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection.Metadata;
 using System.Text;
+using Mono.Cecil.Cil;
 using ICSharpCode.Decompiler;
 using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.CSharp.OutputVisitor;
@@ -173,6 +174,12 @@ public static partial class Decompiler
         foreach (string warning in emitter.Warnings.Take(20)) options.Log("warning: " + warning);
         options.Log($"wrote {result.AssembliesWritten.Count} assemblies to {assemblyDirectory} ({sw.ElapsedMilliseconds} ms)");
 
+        if (options.WriteSource)
+        {
+            int normalized = NormalizeDeadVirtualFunctionPointers(result.AssembliesWritten);
+            if (normalized != 0) options.Log($"source preparation: {normalized} unused virtual function pointers normalized for C# decompilation");
+        }
+
         Directory.CreateDirectory(options.OutputDirectory);
         File.WriteAllText(Path.Combine(options.OutputDirectory, "recovery-report.tsv"), report.ToString());
 
@@ -191,6 +198,109 @@ public static partial class Decompiler
             options.Log($"C# source: {result.Types} types written to {sourceDirectory}, {result.TypesWithErrors} with parts the C# decompiler rejected ({sw.ElapsedMilliseconds} ms)");
         }
         return result;
+    }
+
+
+    /// <summary>
+    /// IL2CPP can leave a virtual method pointer in a local that is never read, because the corresponding
+    /// indirect call could not be reconstructed and is already represented by an opaque recovery marker.
+    /// ILSpy tries to turn even this dead ldvirtftn into a delegate and can fail the entire containing method.
+    /// Replace only such dead function-pointer stores with a native-int zero, preserving ldvirtftn's null check.
+    /// The opaque marker remains the explicit record of the unrecovered call; no live function pointer is changed.
+    /// </summary>
+    private static int NormalizeDeadVirtualFunctionPointers(IEnumerable<string> assemblies)
+    {
+        int changed = 0;
+        foreach (string path in assemblies)
+        {
+            using Mono.Cecil.AssemblyDefinition assembly = Mono.Cecil.AssemblyDefinition.ReadAssembly(path,
+                new Mono.Cecil.ReaderParameters { InMemory = true, ReadingMode = Mono.Cecil.ReadingMode.Deferred });
+            bool dirty = false;
+            foreach (Mono.Cecil.ModuleDefinition module in assembly.Modules)
+            foreach (Mono.Cecil.TypeDefinition type in AllTypes(module.Types))
+            foreach (Mono.Cecil.MethodDefinition method in type.Methods)
+            {
+                if (!method.HasBody) continue;
+                MethodBody body = method.Body;
+                var loaded = new HashSet<VariableDefinition>();
+                foreach (Instruction instruction in body.Instructions)
+                    if (TryGetLoadedVariable(instruction, body, out VariableDefinition? variable) && variable != null) loaded.Add(variable);
+
+                foreach (Instruction instruction in body.Instructions.ToArray())
+                {
+                    if (instruction.OpCode != OpCodes.Ldvirtftn || instruction.Next is not { } store ||
+                        !TryGetStoredVariable(store, body, out VariableDefinition? target) || target == null || loaded.Contains(target)) continue;
+                    if (instruction.Previous is not { } receiver || !IsSimpleLoad(receiver) || IsBranchTarget(body, instruction)) continue;
+
+                    // ldvirtftn consumes its receiver and throws NullReferenceException for null. Keep that
+                    // observable check, then push a harmless native-int value for the proven-dead local.
+                    var il = body.GetILProcessor();
+                    Instruction duplicate = il.Create(OpCodes.Dup);
+                    Instruction branch = il.Create(OpCodes.Brtrue_S, instruction);
+                    Instruction nullPop = il.Create(OpCodes.Pop);
+                    Mono.Cecil.TypeReference exceptionType = new("System", "NullReferenceException", module, module.TypeSystem.CoreLibrary);
+                    var constructor = new Mono.Cecil.MethodReference(".ctor", module.TypeSystem.Void, exceptionType)
+                    {
+                        HasThis = true,
+                        CallingConvention = Mono.Cecil.MethodCallingConvention.Default,
+                    };
+                    Instruction createException = il.Create(OpCodes.Newobj, constructor);
+                    Instruction throwException = il.Create(OpCodes.Throw);
+                    Instruction nonNullPop = il.Create(OpCodes.Pop);
+                    Instruction zero = il.Create(OpCodes.Ldc_I4_0);
+                    Instruction nativeInt = il.Create(OpCodes.Conv_I);
+                    branch.Operand = nonNullPop;
+                    foreach (Instruction replacement in new[] { duplicate, branch, nullPop, createException, throwException, nonNullPop, zero, nativeInt })
+                        il.InsertBefore(instruction, replacement);
+                    il.Remove(instruction);
+                    body.MaxStackSize = Math.Max(body.MaxStackSize, body.MaxStackSize + 1);
+                    changed++;
+                    dirty = true;
+                }
+            }
+            if (dirty) assembly.Write(path);
+        }
+        return changed;
+    }
+
+    private static IEnumerable<Mono.Cecil.TypeDefinition> AllTypes(IEnumerable<Mono.Cecil.TypeDefinition> types)
+    {
+        foreach (Mono.Cecil.TypeDefinition type in types)
+        {
+            yield return type;
+            foreach (Mono.Cecil.TypeDefinition nested in AllTypes(type.NestedTypes)) yield return nested;
+        }
+    }
+
+    private static bool IsSimpleLoad(Instruction instruction) => instruction.OpCode.Code is
+        Code.Ldarg or Code.Ldarg_S or Code.Ldarg_0 or Code.Ldarg_1 or Code.Ldarg_2 or Code.Ldarg_3 or
+        Code.Ldloc or Code.Ldloc_S or Code.Ldloc_0 or Code.Ldloc_1 or Code.Ldloc_2 or Code.Ldloc_3;
+
+    private static bool IsBranchTarget(MethodBody body, Instruction target) => body.Instructions.Any(i =>
+        ReferenceEquals(i.Operand, target) || i.Operand is Instruction[] targets && targets.Any(t => ReferenceEquals(t, target)));
+
+    private static bool TryGetStoredVariable(Instruction instruction, MethodBody body, out VariableDefinition? variable)
+    {
+        variable = instruction.OpCode.Code switch
+        {
+            Code.Stloc_0 => body.Variables[0], Code.Stloc_1 => body.Variables[1],
+            Code.Stloc_2 => body.Variables[2], Code.Stloc_3 => body.Variables[3],
+            Code.Stloc or Code.Stloc_S => instruction.Operand as VariableDefinition,
+            _ => null,
+        };
+        return variable != null;
+    }
+
+    private static bool TryGetLoadedVariable(Instruction instruction, MethodBody body, out VariableDefinition? variable)
+    {
+        variable = instruction.OpCode.Code switch
+        {
+            Code.Ldloc_0 => body.Variables[0], Code.Ldloc_1 => body.Variables[1],
+            Code.Ldloc_2 => body.Variables[2], Code.Ldloc_3 => body.Variables[3],
+            Code.Ldloc or Code.Ldloc_S or Code.Ldloca or Code.Ldloca_S => instruction.Operand as VariableDefinition,
+            _ => null,
+        };
+        return variable != null;
     }
 
     /// <summary>
