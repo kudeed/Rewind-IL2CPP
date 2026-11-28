@@ -88,8 +88,11 @@ public sealed partial class HirBuilder
         bool stable = run.Owner is HElement { Array: HArg or HLocal, Index: var index } && IsPure(index) ||
             run.Owner is HLocal local && (bothFrames || !_frameVars.Values.Contains(local.Variable));
         if (trace) Console.Error.WriteLine($"partial-copy stable={stable} fields=" + string.Join(",", _p.Layouts.Of(run.Type).Fields.Select(f => $"{f.Field.Name}@{f.Offset}:{f.Size}:{f.Field.Attrs}")));
-        if (!stable || WholePublicFieldRange(_p.Layouts.Of(run.Type), run.Offset, size) is not { } fields ||
-            fields.Any(f => !ExactNumericalValue(f.Type, []))) return false;
+        if (!stable || WholePublicFieldRange(_p.Layouts.Of(run.Type), run.Offset, size) is not { } fields) return false;
+        // Copying a complete, already typed frame value preserves private members
+        // without reading them individually. An untyped/non-frame end still needs
+        // the existing exact numerical layout proof.
+        if (!bothFrames && fields.Any(f => !ExactNumericalValue(f.Type, []))) return false;
         foreach (var field in fields)
         {
             long start = (long)frame + field.Offset - run.Offset;
@@ -103,7 +106,7 @@ public sealed partial class HirBuilder
                 if (offset != start || type.Key != field.Type.Key || layout.Size != field.Size) return false;
                 exact = true;
             }
-            if (!toFrame && !exact) return false;
+            if ((!toFrame || bothFrames && !ExactNumericalValue(field.Type, [])) && !exact) return false;
         }
         foreach (var field in fields)
         {

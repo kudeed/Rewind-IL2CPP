@@ -79,3 +79,11 @@ Targeted tests cover two accepted and seven rejected class guards, four accepted
 dotnet build tests/ClassGuardsAndAffineLoopsSmoke -c Release -nodeReuse:false -p:UseSharedCompilation=false
 dotnet tests/ClassGuardsAndAffineLoopsSmoke/bin/Release/net10.0/FsmConstructionSmoke.dll ORIGINAL_SO ORIGINAL_METADATA signatures FRESH_OUTPUT_DIRECTORY
 ```
+
+## Complete selected recovery closure
+
+The 27 selected types now recover all 828 declarations (827 native bodies and one abstract declaration), with no recovery gaps, receiver mismatches or emitter errors. The complete candidate and CLI build with zero warnings and errors.
+
+Shared fixes preserve metadata initialization across loops, bounded stack alignment and helper argument extents, AAPCS register slots, closed generic descriptors, typed structure copies, explicit array bounds checks and original exception protection intervals. Preparation is moved before a synthetic exception gate only when native landing-pad metadata proves it unprotected. Scalar sincos outputs have their verified four- or eight-byte write extent. No game addresses, decompiled game code or artifacts are included in these changes.
+
+The complete assembly comparison preserves all original type, field and method contracts and every unselected body. The 6,290 original methods exclude three generated recovery marker methods; the marker holder disappears when no selected gaps remain. Exactly 141 bodies change, including 29 previously clean structural changes reviewed against pinned IL and original native evidence. This also corrects an incomplete Vector3 axis reference and separates an exception local from an iterator scratch lifetime. Source projection and scene integration remain separate work.

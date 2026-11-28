@@ -62,6 +62,11 @@ public sealed partial class HirBuilder
             if (n.In[1].IsConst && StackOffsetOf(n.In[0], depth + 1) is int a) return a + (int)IrBuilder.SImm(n.In[1]);
             if (n.In[0].IsConst && StackOffsetOf(n.In[1], depth + 1) is int b) return b + (int)IrBuilder.SImm(n.In[0]);
         }
+        if (_p.Model.Image.Arch == Rewind.Binary.CpuArch.Arm64 && n.Type == VT.I64 &&
+            n.Op == Op.Or && n.In.Length == 2 && n.In[1].IsConst &&
+            n.In[1].UImm < 16 && StackOffsetOf(n.In[0], depth + 1) is int aligned &&
+            ((uint)aligned & (uint)n.In[1].UImm) == 0)
+            return aligned + (int)n.In[1].UImm;
         if (n.Op == Op.Sub && n.In.Length == 2 && n.In[1].IsConst && StackOffsetOf(n.In[0], depth + 1) is int c) return c - (int)IrBuilder.SImm(n.In[1]);
         return null;
     }
@@ -94,14 +99,18 @@ public sealed partial class HirBuilder
         }
         accesses.Sort();
         int cellStart = accesses[0].Start, cellEnd = accesses[0].End;
-        bool mixed = false;
         var cluster = new List<(int Start, int End)> { accesses[0] };
         void Close()
         {
             int width = cellEnd - cellStart;
-            if (!mixed || Typed(cellStart, cellEnd)) return;
+            if (Typed(cellStart, cellEnd)) return;
             if (width <= 8)
             {
+                // An eight-byte slot observed only at that width needs no bit
+                // view. Keep its normal reference/struct voting available.
+                // Narrow uniform slots still need their observed extent when
+                // an address-only query would otherwise invent eight bytes.
+                if (width == 8 && cluster.All(a => a.Start == cellStart && a.End == cellEnd)) return;
                 _rawCells[cellStart] = width <= 1 ? 1 : width <= 2 ? 2 : width <= 4 ? 4 : 8;
                 return;
             }
@@ -120,7 +129,6 @@ public sealed partial class HirBuilder
         {
             if (start < cellEnd)
             {
-                if (start != cellStart || end != cellEnd) mixed = true;
                 cellEnd = Math.Max(cellEnd, end);
                 cluster.Add((start, end));
                 continue;
@@ -128,7 +136,6 @@ public sealed partial class HirBuilder
             Close();
             cellStart = start;
             cellEnd = end;
-            mixed = false;
             cluster = [(start, end)];
         }
         Close();
@@ -370,8 +377,18 @@ public sealed partial class HirBuilder
     };
 
     /// <summary>What a bool can hold: a bool, or the number 0 or 1.</summary>
-    private static bool IsTruthValue(HExpr e) =>
-        IsBoolType(e.Type) || e is HConst { Value: false or true or 0 or 1 or 0L or 1L or (byte)0 or (byte)1 };
+    internal static bool IsTruthValue(HExpr e)
+    {
+        if (IsBoolType(e.Type) || e is HConst { Value: false or true or 0 or 1 or 0L or 1L or (byte)0 or (byte)1 }) return true;
+        static bool Integral(TypeSig? t) => t is PrimitiveSig { Element: Il2CppTypeEnum.Boolean or Il2CppTypeEnum.Char or Il2CppTypeEnum.I1 or Il2CppTypeEnum.U1 or
+            Il2CppTypeEnum.I2 or Il2CppTypeEnum.U2 or Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4 or Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8 or Il2CppTypeEnum.I or Il2CppTypeEnum.U } or { Definition.IsEnum: true };
+        // Integral conversions preserve the exact range {0, 1}.
+        if (e is HConv conversion && Integral(conversion.Type) && IsTruthValue(conversion.Operand)) return true;
+        // For any integral bit pattern, x & 1 is exactly zero or one. Keep the original
+        // expression and its evaluation; only the stack-slot range proof becomes precise.
+        return e is HBinary { Op: HBinaryOp.And } bits && Integral(bits.Type) &&
+            (bits.Left is HConst { Value: true or 1 or 1L or 1U or 1UL or (sbyte)1 or (byte)1 or (short)1 or (ushort)1 or (char)1 } || bits.Right is HConst { Value: true or 1 or 1L or 1U or 1UL or (sbyte)1 or (byte)1 or (short)1 or (ushort)1 or (char)1 });
+    }
 
     private static readonly bool NoScalarConflicts = Environment.GetEnvironmentVariable("REWIND_NO_SCALAR_CONFLICTS") != null;
     private static readonly bool NoAddressTargetTypes = Environment.GetEnvironmentVariable("REWIND_NO_ADDRESS_TARGET_TYPES") != null;
@@ -381,7 +398,7 @@ public sealed partial class HirBuilder
     private static readonly bool NoStructSlots = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_SLOTS") != null;
     private static readonly bool NoBoolConflicts = Environment.GetEnvironmentVariable("REWIND_NO_BOOL_CONFLICTS") != null;
 
-    private void CheckFrameVariables()
+    private void CheckFrameVariables(bool reportProblems = true)
     {
         foreach (var (offset, votes) in _frameVotes)
             if (votes.Count(v => !ReferenceEquals(v, _long)) > 1) FrameConflicts.Add(offset);
@@ -402,12 +419,16 @@ public sealed partial class HirBuilder
             {
                 FrameConflicts.Add(spans[i - 1].Start);
                 FrameConflicts.Add(spans[i].Start);
-                if (reported) continue;
+                if (reported || !reportProblems) continue;
                 reported = true;
                 Problem($"stack memory seen as two different objects ({spans[i - 1].Variable.Type.ShortName} and {spans[i].Variable.Type.ShortName})" +
                         (Environment.GetEnvironmentVariable("REWIND_FRAME_DEBUG") != null ? $" [{spans[i - 1].Variable.Name} @{spans[i - 1].Start} and {spans[i].Variable.Name} @{spans[i].Start}]" : ""));
             }
     }
+
+    // Early builds still register every physical overlap for lifetime splitting.
+    // Pipeline callers validate the surviving views after struct/copy/dead-store folding.
+    internal void ValidateFinalFrameViews() => CheckFrameVariables();
 
     private void RefineFrameTypes()
     {
@@ -881,7 +902,7 @@ public sealed partial class HirBuilder
 
     // ---- driver ------------------------------------------------------------------------------------------------
 
-    public HMethod Build()
+    public HMethod Build(bool deferFrameValidation = false)
     {
         foreach (string p in _fn.Problems) Problem("lift: " + p);
         _h.Notes.AddRange(_l.Normalization.ReceiverNotes);
@@ -945,7 +966,7 @@ public sealed partial class HirBuilder
         CheckStructAssignments();
         foreach (var (offset, type) in _frameTypes) _h.FrameTypes[offset] = type;
         HirCleanup.Run(_h);
-        CheckFrameVariables();
+        CheckFrameVariables(reportProblems: !deferFrameValidation);
         if (HirCleanup.CheckTryRegions(_h) is { } broken) Problem("exception handling not reconstructed: " + broken);
         return _h;
     }
@@ -1256,7 +1277,7 @@ public sealed partial class HirBuilder
 
     private static bool IsPointerLike(Sem s) => s switch
     {
-        SRef or SKlass or SObjKlass or SStatics or SFrame or SUnboxed or SNewObject or SHierarchy or SInterfaceEntry or SNativeCode => true,
+        SRef or SKlass or SObjKlass or SStatics or SArrayBounds or SFrame or SUnboxed or SNewObject or SHierarchy or SInterfaceEntry or SNativeCode => true,
         SMethod or SRgctx => true,
         SVal v => IsReference(v.Type) || v.Type is PointerSig or ByRefSig || v.Type is PrimitiveSig { Element: Il2CppTypeEnum.I or Il2CppTypeEnum.U },
         _ => false,
@@ -1360,6 +1381,8 @@ public sealed partial class HirBuilder
             case SFrame f when _fakeBoxes.TryGetValue(f.Offset, out TypeSig? boxed):
                 // A value given an object header on the stack so that it can be passed as an object: a box.
                 return new HTypeExpr(HTypeOp.Box, boxed, new HLocal(FrameVar(f.Offset + _header, boxed)) { Type = boxed }) { Type = _object };
+            case SFrame f when FramePlace(f.Offset, -1) is PLocation typedFrame:
+                return new HAddressOf(typedFrame.Location) { Type = _m.Sigs.ByRef(typedFrame.Type) };
             case SVTable entry when VirtualPointer(entry) is { } virtualPointer:
                 return virtualPointer;
             case SLostRegister:
@@ -1470,6 +1493,19 @@ public sealed partial class HirBuilder
     }
 
     /// <summary>Assignments that give a successor's merged values their value along the edge from this block.</summary>
+    // ResolvePlace has already checked every field identity, byte offset and access size.
+    // A nested value-type field at offset zero remains rooted in the same static storage.
+    internal static bool IsStaticFieldPath(HExpr expression)
+    {
+        for (int depth = 0; depth < 16 && expression is HField field; depth++)
+        {
+            if (field.Object == null) return field.Field.IsStatic;
+            if (field.Field.IsStatic || !IsStructType(field.Object.Type)) return false;
+            expression = field.Object;
+        }
+        return false;
+    }
+
     private List<HAssign> PhiCopies(Block from, Block to)
     {
         var copies = new List<HAssign>();
@@ -1491,8 +1527,8 @@ public sealed partial class HirBuilder
             // statics ("Vector3.zero" inlined to the address of Vector3.zeroVector): the field.
             if (!NoStaticRefs && variable.Type is ByRefSig { ElementType: var staticElement } && Peek(input) is SStatics &&
                 _p.Layouts.SizeOf(staticElement) is { Known: true, Size: > 0 } staticSize &&
-                ResolvePlace(input, staticSize.Size) is PLocation { Location: HField { Object: null } staticField } staticPlace &&
-                staticPlace.Type.Key == staticElement.Key)
+                ResolvePlace(input, staticSize.Size) is PLocation { Location: HField staticField } staticPlace &&
+                staticPlace.Type.Key == staticElement.Key && IsStaticFieldPath(staticField))
             {
                 copies.Add(new HAssign(new HLocal(variable) { Type = variable.Type }, new HAddressOf(staticField) { Type = variable.Type }));
                 continue;

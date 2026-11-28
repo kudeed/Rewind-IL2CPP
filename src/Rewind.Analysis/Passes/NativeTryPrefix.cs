@@ -22,13 +22,23 @@ internal static class NativeTryPrefix
     internal static int Run(Function fn, IReadOnlyList<CallSite> sites)
     {
         if (Environment.GetEnvironmentVariable("REWIND_NO_NATIVE_TRY_PREFIX") != null ||
-            fn.TryRegions.Count != 1 || !fn.Params.TryGetValue(fn.Regs.StackPointer, out Node? sp)) return 0;
+            fn.TryRegions.Count == 0 || !fn.Params.TryGetValue(fn.Regs.StackPointer, out Node? sp)) return 0;
         int result = 0;
-        foreach (var (gate, region) in fn.TryGates().ToArray())
+        int Depth(int region)
         {
-            if (region != 0 || gate.Scope != -1 || fn.TryRegions[region].Outer != -1) continue;
+            int depth = 0;
+            for (int scope = fn.TryRegions[region].Outer; scope >= 0 && depth <= fn.TryRegions.Count; depth++)
+                scope = fn.TryRegions[scope >> 1].Outer;
+            return depth;
+        }
+        // Move through an inner gate before its outer gate. Every moved
+        // memory operation/call must have explicit native evidence that no
+        // landing pad protects it, including the surrounding region.
+        foreach (var (gate, region) in fn.TryGates().OrderByDescending(g => Depth(g.Region)).ToArray())
+        {
+            if (gate.Scope != fn.TryRegions[region].Outer) continue;
             Block body = gate.Succs[1];
-            if (body.Scope != 0 || body.Preds.Count != 1 || body.Preds[0] != gate ||
+            if (body.Scope != 2 * region || body.Preds.Count != 1 || body.Preds[0] != gate ||
                 body.Phis.Any(p => !p.Dead) || body.Terminator == null) continue;
             var inside = body.Nodes.ToHashSet();
             var moved = new List<Node>();
@@ -48,18 +58,24 @@ internal static class NativeTryPrefix
                 }
                 else if (n.Op is Op.Load or Op.Store)
                 {
-                    if (!Stack(n.In[0]) || !Unprotected(n.Addr,sites)) break;
+                    if (!Unprotected(n.Addr,sites)) break;
                     if (callSeen && n.Op == Op.Store && n.In[1].Type == VT.I64 && Stack(n.In[1])) parked = true;
                 }
                 else if (n.Op is not (Op.Add or Op.Sub or Op.Proj or Op.Const or Op.Trunc or Op.ZExt or Op.SExt or Op.Concat or
-                    Op.CmpEq or Op.CmpNe or Op.And or Op.Or or Op.Xor)) break;
+                    Op.CmpEq or Op.CmpNe or Op.And or Op.Or or Op.Xor or Op.Shl or Op.ShrU or Op.ShrS or
+                    Op.BitsToF or Op.FToBits)) break;
                 moved.Add(n); available.Add(n);
             }
             // Only this compiler shape is accepted: at least one definitely
             // unprotected call, and a subsequent parked stack pointer.
             // The ordinary TryPrologues pass handles store-only prefixes.
             if (!callSeen || !parked) continue;
-            int at = gate.Nodes.IndexOf(gate.Terminator!);
+            // The TryEntry predicate is the artificial exceptional fork.
+            // Put preparation before it as well as before the branch, so an
+            // enclosing gate can move this prefix out in its own turn.
+            int at = gate.Terminator is { In.Length: 1 } branch
+                ? gate.Nodes.IndexOf(branch.In[0]) : -1;
+            if (at < 0) continue;
             foreach (Node n in moved)
             {
                 body.Nodes.Remove(n);

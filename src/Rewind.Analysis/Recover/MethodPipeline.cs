@@ -330,12 +330,22 @@ public sealed class MethodPipeline
         MethodAbi abi = _program.Abi.For(method, classArgs, methodArgs);
         Function fn = _lifter.Lift(address != 0 ? address : method.Address);
         CheckShape(fn, "lifting");
+        // Keep the original LSDA-addressed prefix before normalization can
+        // replace memory pieces with address-less synthetic nodes. Nested
+        // gates must see the parked pointers that precede every protected call.
+        int nativePrefix = 0;
+        if (_program.Model.Image is Rewind.Binary.ElfImage originalElf &&
+            _program.Model.Image.Arch == Rewind.Binary.CpuArch.Arm64 && fn.TryRegions.Count != 0 &&
+            originalElf.ExceptionTableOf(fn.Address) is { } originalTable)
+            nativePrefix = NativeTryPrefix.Run(fn, originalTable.CallSites);
         // (Landing pads: only calls raise exceptions, so what a try statement stores before its first call is
         // stored before it.)
         if (!fn.Regs.SharedPositions && Environment.GetEnvironmentVariable("REWIND_NO_TRY_PROLOGUES") == null) TryPrologues.Run(fn);
         MathCalls.Run(fn, _program.Helpers);
         TrimReturns(fn, abi);
+        if (_program.Model.Image.Arch == Rewind.Binary.CpuArch.Arm64) AlignedStackAddresses.Run(fn);
         NormalizeResult normalization = _normalizer.Run(fn);
+        if (nativePrefix != 0) normalization.ReceiverNotes.Add($"original native try prefix: {nativePrefix} nodes before protected calls");
         CheckShape(fn, "normalizing");
         if (Environment.GetEnvironmentVariable("REWIND_NO_CONSTANT_DIVISIONS") == null && ConstantDivisions.Run(fn)) DeadCode.Run(fn);
         if (Environment.GetEnvironmentVariable("REWIND_NO_ARG_TRIM") == null && TrimCallArguments(fn))
@@ -345,7 +355,7 @@ public sealed class MethodPipeline
         }
         if (_program.Model.Image is Rewind.Binary.ElfImage elf &&
             _program.Model.Image.Arch == Rewind.Binary.CpuArch.Arm64 &&
-            fn.TryRegions.Count == 1 && elf.ExceptionTableOf(fn.Address) is { } table)
+            fn.TryRegions.Count != 0 && elf.ExceptionTableOf(fn.Address) is { } table)
         {
             int moved = NativeTryPrefix.Run(fn, table.CallSites);
             if (moved > 0)
@@ -1028,7 +1038,10 @@ public sealed class MethodPipeline
         // otherwise make one object of the whole frame, and what keeps the call unknown may be the very slot
         // that needs separating (a delegate kept where a struct was). Checked against the last build (below).
         var assumed = new List<(Node Call, int Input, int Reach)>();
-        for (int round = 0; round < 3 && builder.FrameConflicts.Count != 0; round++)
+        bool NeedsStackRecovery() => builder.FrameConflicts.Count != 0 || result.Problems.Any(problem =>
+            problem.StartsWith("Frame value used as data", StringComparison.Ordinal) ||
+            problem.Contains("address without a typed base", StringComparison.Ordinal));
+        for (int round = 0; round < 3 && NeedsStackRecovery(); round++)
         {
             ParkedAddresses.Canonicalize(fn);
             Dictionary<int, int> boxes = InPlaceBoxes(fn);
@@ -1044,10 +1057,15 @@ public sealed class MethodPipeline
                 assumed.Add((call, input, reach));
                 return reach;
             }
-            if (StackSplitting.Run(fn, current.FrameConflicts, Extent,
+            // Call choices were unknown during the initial parked-address
+            // pass. Reuse the actual typed signatures now: unused captured
+            // registers no longer make a private pointer slot appear escaped.
+            // Rewrite proven parks before splitting the pointed-to lifetimes.
+            bool parksChanged = Environment.GetEnvironmentVariable("REWIND_NO_PARKED") == null && ParkedAddresses.Run(fn, Extent);
+            int split = StackSplitting.Run(fn, current.FrameConflicts, Extent,
                     (call, input) => WritesOnly(call, input, current), ReadsOnly, WritesAndNothingElse, current.ReachThrough,
-                    (call, input) => TakesLowHalf(current, call, input), current.ScalarSlotConflicts) <= 0)
-                break;
+                    (call, input) => TakesLowHalf(current, call, input), current.ScalarSlotConflicts);
+            if (!parksChanged && split <= 0) break;
             Dictionary<int, int> after = InPlaceBoxes(fn);
             ParkedAddresses.Canonicalize(fn);
             lifted.Frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, after, current), StackArguments(lifted.Abi, fn.Regs),
@@ -1095,6 +1113,11 @@ public sealed class MethodPipeline
         ListAppendFolding.Run(result, _program.Model.Sigs, _program.Model.Image);
         ListClearFolding.Run(result, _program.Model.Sigs);
         ListValueClearFolding.Run(result, _program.Model.Sigs, new LayoutCalculator(_program.Model));
+        // A temporary used only by a copy that has since become a typed struct
+        // assignment is no surviving frame view. Validate all remaining views;
+        // never carry a diagnostic about a removed local into the final body.
+        HirCleanup.Run(result);
+        builder.ValidateFinalFrameViews();
         return result;
     }
 
@@ -1139,13 +1162,13 @@ public sealed class MethodPipeline
     private (HirBuilder Builder, HMethod Result) BuildRounds(LiftedMethod lifted, bool mergedAddresses = true)
     {
         var builder = new HirBuilder(_program, lifted, null, _program.FrameHints?.Invoke(lifted.Function.Address)) { MergedAddresses = mergedAddresses };
-        HMethod result = builder.Build();
+        HMethod result = builder.Build(deferFrameValidation: true);
         // Types of merged values and of stack objects are discovered while building; when any was, build
         // again knowing them.
         for (int round = 0; round < 4 && (builder.PhiTypesRefined || builder.FrameTypesRefined || builder.DispatchRefined); round++)
         {
             builder = new HirBuilder(_program, lifted, builder.PhiTypes, builder.RefinedFrameTypes, builder.DispatchPhis) { MergedAddresses = mergedAddresses };
-            result = builder.Build();
+            result = builder.Build(deferFrameValidation: true);
         }
         // Each build may learn types the next one starts from. Still learning after the last one means this
         // result was translated with types that have since changed: it cannot be trusted as it is.
@@ -1301,6 +1324,9 @@ public sealed class MethodPipeline
         // modf never reads the previous integer-part output. Its scalar FP input and pointer
         // use separate register banks on ARM64 and shared argument positions on x64.
         if (target.Helper is { Kind: HelperKind.Modf }) return position == (_program.Abi.Regs.SharedPositions ? 1 : 0);
+        if (target.Helper is { Kind: HelperKind.SinCos })
+            return position == (_program.Abi.Regs.SharedPositions ? 1 : 0) ||
+                   position == (_program.Abi.Regs.SharedPositions ? 2 : 1);
         if (target.Helper != null || !target.IsManaged) return false;
         bool all = true, any = false;
         void Consider(MethodDef method, MethodAbi abi)
@@ -1534,11 +1560,15 @@ public sealed class MethodPipeline
         method = chosen.Method;
         abi = chosen.Abi;
         foreach (AbiParam p in abi.Params)
-            if (p.Position + chosen.Shift == position)
+        {
+            int width = p.Pass == PassKind.IntegerPair ? 2 :
+                p.Position >= _program.Abi.Regs.FirstStackPosition && p.Pass == PassKind.FloatAggregate ? (p.Size + 7) / 8 : 1;
+            if (position >= p.Position + chosen.Shift && position < p.Position + chosen.Shift + width)
             {
                 parameter = p;
                 break;
             }
+        }
         return true;
     }
 
@@ -1596,6 +1626,13 @@ public sealed class MethodPipeline
         }
         if (p == null)
         {
+            // AAPCS64 places an indirect result in x8 independently of x0-x7.
+            // Unoccupied register positions below x8 are not arguments merely
+            // because x8 is the numerically last parameter. Account for complete
+            // pairs/stack aggregates in Chosen before accepting a proven gap.
+            if (!NoUntakenInputs && abi.Known && _program.Model.Image.Arch == Rewind.Binary.CpuArch.Arm64 &&
+                built.ChosenCalls.TryGetValue(call, out var exact) && exact.Shift == 0 &&
+                call.Aux is CallInfo { Indirect: false }) return StackPromotion.NotTaken;
             // Past the last thing the method takes: what the register or the stack slot held before the call
             // (the address handed to an earlier one, say), no argument of this one. The call reaches nothing
             // through it.
@@ -1649,11 +1686,22 @@ public sealed class MethodPipeline
         CallTarget target = _program.Resolve(info.Target);
         if (target.Helper != null)
         {
+            // Helper inputs obey the same verified slot contract used by
+            // lifting. A captured register outside that contract cannot let
+            // the helper read or overwrite a stack object.
+            if (_program.ShapeOf(info.Target)?.Slots is { } helperSlots &&
+                !helperSlots.Contains(slot)) return StackPromotion.NotTaken;
             // modf(x, &whole) writes the whole part there, one number as wide as x, and nothing else. (Without a
             // bound, the address of a pasted Math.Round's local reached the whole frame, and nothing on the stack
             // became a value: the registers a catch handler saves stayed stores, of what it cannot know.)
             if (!NoHelperExtents && target.Helper.Kind == HelperKind.Modf &&
                 position == (_program.Abi.Regs.SharedPositions ? 1 : 0)) return target.Helper.IsDouble ? 8 : 4;
+            // sincos has two scalar output pointers, in integer registers
+            // x0/x1 on AAPCS64, separately from its floating-point input.
+            if (!NoHelperExtents && target.Helper.Kind == HelperKind.SinCos &&
+                (position == (_program.Abi.Regs.SharedPositions ? 1 : 0) ||
+                 position == (_program.Abi.Regs.SharedPositions ? 2 : 1)))
+                return target.Helper.IsDouble ? 8 : 4;
             return HelperReads(call, info, target.Helper.Kind, position);
         }
 

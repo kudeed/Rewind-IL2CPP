@@ -379,6 +379,7 @@ public sealed partial class Normalizer(ProgramAnalysis program)
     {
         if (Environment.GetEnvironmentVariable("REWIND_NO_LATE_METADATA_GOT") == null)
             FoldMetadataGotLoads();
+        FoldKnownClassInitFlags();
         // A read through a choice of slots (a select or phi of their addresses) reads the chosen slot's value.
         var chosen = new List<Node>();
         foreach (Block b in _fn.Blocks)
@@ -386,12 +387,13 @@ public sealed partial class Normalizer(ProgramAnalysis program)
             foreach (Node n in b.Nodes)
             {
                 if (n.Op != Op.Load || n.Type != VT.I64) continue;
-                if (!n.In[0].IsConst)
+                // ADRP + ADD can remain a full-width constant expression in SSA.
+                // Interpret the complete address before asking whether its slot is known.
+                if (!TryConstantSlotAddress(n.In[0], 0, out ulong va))
                 {
                     if (!n.Dead && IsSlotChoice(Resolve(n.In[0]), 0, [])) chosen.Add(n);
                     continue;
                 }
-                ulong va = (ulong)n.In[0].Imm;
                 if (!IsMetadataSlot(va)) continue;
                 _replace[n] = SlotValue(va);
                 n.Dead = true;
@@ -406,6 +408,19 @@ public sealed partial class Normalizer(ProgramAnalysis program)
             n.Dead = true;
         }
         foreach (Block b in _fn.Blocks) b.Nodes.RemoveAll(n => n.Dead);
+    }
+
+    private bool TryConstantSlotAddress(Node value, int depth, out ulong address)
+    {
+        address = 0;
+        value = Resolve(value);
+        if (depth > 16 || value.Type != VT.I64) return false;
+        if (value.IsConst) { address = value.UImm; return true; }
+        if (value.Op is not (Op.Add or Op.Sub) || value.In.Length != 2 ||
+            !TryConstantSlotAddress(value.In[0], depth + 1, out ulong left) ||
+            !TryConstantSlotAddress(value.In[1], depth + 1, out ulong right)) return false;
+        address = value.Op == Op.Add ? unchecked(left + right) : unchecked(left - right);
+        return true;
     }
 
     // Late SSA simplification can expose ADRP + constant after the lifter has
@@ -1504,6 +1519,11 @@ public sealed partial class Normalizer(ProgramAnalysis program)
                 if (ReferenceEquals(target, other) || Function.IsTryEntry(term.In[0])) continue;
                 ThrowKind kind = ClassifyThrowBlock(target, out Node? a, out Node? b);
                 if (kind == ThrowKind.None) continue;
+                // The exception kind alone does not prove that a later managed array
+                // operation performs this check, or that no side effects intervene.
+                // Retain the native branch and its exact IndexOutOfRangeException.
+                // A future elimination needs an array/index and ordering proof.
+                if (kind == ThrowKind.IndexOutOfRange) continue;
                 // A type mismatch throwing NullReferenceException is still a program branch.
                 // Removing it as an ordinary null guard erases the successful subtype proof.
                 if (kind == ThrowKind.NullReference && IsNativeClassCheck(term.In[0],

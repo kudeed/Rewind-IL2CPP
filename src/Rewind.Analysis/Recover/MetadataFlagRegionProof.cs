@@ -6,6 +6,47 @@ namespace Rewind.Analysis.Recover;
 /// <summary>Recognizes a metadata-only cold arm, including register spills and a reload of that class's static-field pointer.</summary>
 public static class MetadataFlagRegionProof
 {
+    // Optimized loops can carry the private initialization byte in a register:
+    // phi(load(flag), 1, phi(...)). Require every leaf to be that exact byte or
+    // the initialized value, and require a real load rather than a pure cycle.
+    private static bool GuardFlag(Function fn, Node condition, out Node load, out bool initializedTrue)
+    {
+        if (Normalizer.FlagCondition(condition, out load, out initializedTrue)) return true;
+        load = null!;
+        initializedTrue = false;
+        if (condition.Op is not (Op.CmpEq or Op.CmpNe) || condition.In.Length != 2) return false;
+        Node value = condition.In[0], zero = condition.In[1];
+        if (value.IsConstValue(0)) (value, zero) = (zero, value);
+        if (!zero.IsConstValue(0)) return false;
+        var pending = new Stack<Node>();
+        var seen = new HashSet<Node>();
+        pending.Push(value);
+        ulong? address = null;
+        while (pending.Count != 0)
+        {
+            Node n = pending.Pop();
+            if (!seen.Add(n)) continue;
+            if (seen.Count > 128) return false;
+            if (Normalizer.FlagConstant(n, out ulong literal) && literal == 1) continue;
+            if (n.Op == Op.Phi && n.In.Length != 0 && n.Type.IsInt())
+            {
+                foreach (Node input in n.In) pending.Push(input);
+            }
+            else if (n.Op is Op.ZExt or Op.Trunc && n.In.Length == 1 && n.In[0].Type.IsInt() && n.Type.Bits() >= 8)
+                pending.Push(n.In[0]);
+            else if (n is { Op: Op.Load, Type: VT.I8, In.Length: 1 } &&
+                StableMetadataPagePhiProof.TryAddress(fn, n.In[0], out ulong at))
+            {
+                if (address != null && address != at) return false;
+                address = at;
+                load = n;
+            }
+            else return false;
+        }
+        initializedTrue = condition.Op == Op.CmpNe;
+        return load != null;
+    }
+
     public static bool TryProve(Function fn, Block guard, NativeImage image, Func<ulong,bool> metadataInit,
         Func<ulong,bool> metadataSlot, int staticFieldsOffset, out Node flag, out Node store, out ulong address)
     {
@@ -13,7 +54,7 @@ public static class MetadataFlagRegionProof
         if(image.Arch!=CpuArch.Arm64 || image.Format!=ImageFormat.Elf || staticFieldsOffset<=0 ||
             guard.Terminator is not {Op:Op.Branch,In.Length:1} term || guard.Succs.Count!=2 ||
             guard.Scope!=-1 && (guard.Scope<0 || (guard.Scope&1)!=0 || !fn.TryRegions.Any(r=>r.Index==guard.Scope/2)) ||
-            !Normalizer.FlagCondition(term.In[0],out var read,out bool initializedTrue) || read.Block!=guard ||
+            !GuardFlag(fn,term.In[0],out var read,out bool initializedTrue) ||
             !StableMetadataPagePhiProof.TryAddress(fn,read.In[0],out ulong va) || metadataSlot(va) ||
             image.SectionAt(va) is not {IsWritable:true,IsExecutable:false})return false;
         // Preserve all native exception boundaries. A metadata-only arm may be

@@ -29,7 +29,9 @@ internal static class AffineLoopOffsets
                 for (int back = 0; back < 2; back++)
                 {
                     var tail = head.Preds[back];
-                    if (tail == head || !cfg.Dominates(head, tail) || !index.In[1-back].IsConstValue(0) ||
+                    // A loop with no separate latch has a self backedge; the same paired
+                    // phi recurrence proves the identity without requiring another block.
+                    if (!cfg.Dominates(head, tail) || !index.In[1-back].IsConstValue(0) ||
                         !Step(index.In[back], index, out long step) || step is not (1 or -1)) continue;
                     foreach (var offset in head.Phis.ToArray())
                     {

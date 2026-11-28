@@ -55,6 +55,7 @@ public sealed partial class HirBuilder
 
     private Sem Compute(Node n)
     {
+        if (n.Op == Op.Or && StackOffsetOf(n, 0) is int frameOffset) return new SFrame(frameOffset);
         switch (n.Op)
         {
             case Op.Const: return ConstSem(n);
@@ -1011,6 +1012,7 @@ public sealed partial class HirBuilder
     private sealed record PLocation(HExpr Location, TypeSig Type) : Place;
     private sealed record PPair(HExpr Low, HExpr High) : Place;
     private sealed record PArrayLength(HExpr Array) : Place;
+    private sealed record PArrayBounds(HExpr Array, int Rank) : Place;
     /// <summary>One of two fields of different classes, chosen by a test: a value to read ("c ? (Renderer)a : b"), no place to write.</summary>
     private sealed record PChosenValue(HExpr Value) : Place;
     private sealed record PObjKlass(Node Object) : Place;
@@ -1156,7 +1158,13 @@ public sealed partial class HirBuilder
             // Multiples are followed inward only through full-width arithmetic: a 32-bit product wraps before
             // it is widened, so what is inside it does not distribute.
             bool wide = n.Type == VT.I64 && budget > 0;
-            if (n.Op == Op.Add && budget-- > 0)
+            if (n.Op == Op.Or && StackOffsetOf(n, 0) is int frameOffset &&
+                _fn.Params.TryGetValue(_fn.Regs.StackPointer, out Node? frameBase))
+            {
+                Term(frameBase, k);
+                offset += k * frameOffset;
+            }
+            else if (n.Op == Op.Add && budget-- > 0)
             {
                 pending.Push((n.In[0], k));
                 pending.Push((n.In[1], k));
@@ -1841,6 +1849,21 @@ public sealed partial class HirBuilder
                 }
                 return new PInternal("class data");
             }
+            case SArrayBounds bounds when _ptr == 8 && a.Index == null && size is 4 or 8 && a.Offset >= 0 && a.Offset % 16 is 0 or 8:
+            {
+                int dimension = checked((int)(a.Offset / (2 * _ptr)));
+                if (dimension >= bounds.Rank) return new PUnknown("array bounds dimension exceeds rank");
+                bool lowerBound = a.Offset % (2 * _ptr) != 0;
+                if (lowerBound && size != 4) return new PUnknown("array lower bound read includes native padding");
+                string accessor = lowerBound ? "GetLowerBound" : "GetLength";
+                MethodDef? get = _m.FindType("System.Array")?.Methods.SingleOrDefault(m => !m.IsStatic && m.Name == accessor &&
+                    m.Parameters is [{ Type: PrimitiveSig { Element: Il2CppTypeEnum.I4 } }] &&
+                    m.ReturnType is PrimitiveSig { Element: Il2CppTypeEnum.I4 });
+                if (get == null) return new PUnknown("class library lacks exact System.Array." + accessor + "(Int32)");
+                HExpr value = new HCall { Method = get, This = bounds.Array, Arguments = [new HConst(dimension, _int)], Type = _int };
+                if (size == 8) value = new HConv(HConvKind.I8, value) { Type = _long };
+                return new PChosenValue(value);
+            }
             case SStatics st:
             {
                 if (a.Index != null) return new PUnknown("indexed static access");
@@ -1908,13 +1931,18 @@ public sealed partial class HirBuilder
 
         switch (type)
         {
-            case SzArraySig array:
+            case ArraySig:
+            case SzArraySig:
             {
+                TypeSig array = type;
+                TypeSig elementType = array.ElementType!;
                 if (a.Index == null && a.Offset == 0) return new PObjKlass(a.Base!);
                 int lengthOffset = _header + _ptr;      // { klass, monitor, bounds, max_length, elements... }
                 int dataOffset = lengthOffset + _ptr;
+                if (array is ArraySig rectangular && a.Index == null && a.Offset == _header)
+                    return new PArrayBounds(e, rectangular.Rank);
                 if (a.Index == null && a.Offset == lengthOffset) return new PArrayLength(e);
-                var (elementSize, _, known) = _p.Layouts.SizeOf(array.ElementType);
+                var (elementSize, _, known) = _p.Layouts.SizeOf(elementType);
                 if (!known || elementSize <= 0) return new PUnknown("array element size unknown");
                 if (a.Index == null && a.Offset < dataOffset) return new PInternal("array header");
                 long rel = a.Offset - dataOffset;
@@ -1941,10 +1969,10 @@ public sealed partial class HirBuilder
                     index = new HConst((int)(rel / elementSize), _int);
                     inside = rel % elementSize;
                 }
-                var element = new HElement { Array = e, Index = index, Type = array.ElementType };
-                bool isStruct = array.ElementType.Definition is { IsValueType: true, IsEnum: false } && array.ElementType is not PrimitiveSig;
-                if (inside == 0 && (!isStruct || size < 0 || size == elementSize)) return new PLocation(element, array.ElementType);
-                if (isStruct) return FieldPlace(element, array.ElementType, (int)inside, size);
+                var element = new HElement { Array = e, Index = index, Type = elementType };
+                bool isStruct = elementType.Definition is { IsValueType: true, IsEnum: false } && elementType is not PrimitiveSig;
+                if (inside == 0 && (!isStruct || size < 0 || size == elementSize)) return new PLocation(element, elementType);
+                if (isStruct) return FieldPlace(element, elementType, (int)inside, size);
                 return new PUnknown("partial array element access");
             }
             case PointerSig pointer:
@@ -2288,6 +2316,8 @@ public sealed partial class HirBuilder
                 return new SPair(pair.Low, pair.High);
             case PParts parts:
                 return new SParts(parts.Leaves, parts.Size);
+            case PArrayBounds bounds:
+                return new SArrayBounds(bounds.Array, bounds.Rank);
             case PArrayLength len:
                 return new SVal(new HArrayLength(len.Array) { Type = _int });
             case PChosenValue chosen:
@@ -2652,6 +2682,45 @@ public sealed partial class HirBuilder
 
     // ---- additions that are addresses --------------------------------------------------------------------------
 
+    // Pure native address intermediates need no managed value. Actual memory operations
+    // decompose the original SSA address and still diagnose every unresolved field/access.
+    // Reject escapes, value stores, comparisons, phis and unknown call arguments.
+    private bool OnlyInteriorAddressUses(Node address)
+    {
+        var pending = new Stack<Node>();
+        var seen = new HashSet<Node>();
+        pending.Push(address);
+        bool reachesMemory = false;
+        while (pending.Count != 0)
+        {
+            Node current = pending.Pop();
+            if (!seen.Add(current)) continue;
+            if (seen.Count > 256 || !_uses.TryGetValue(current, out List<Node>? uses)) return false;
+            foreach (Node use in uses)
+            {
+                if (use.Dead) continue;
+                if (use.Op is Op.Load or Op.Store && ReferenceEquals(use.In[0], current) &&
+                    (use.Op == Op.Load || !ReferenceEquals(use.In[1], current)))
+                {
+                    reachesMemory = true;
+                    continue;
+                }
+                if (use.Op is Op.Add or Op.Sub && use.In.Length == 2 &&
+                    (ReferenceEquals(use.In[0], current) && use.In[1].IsConst ||
+                     use.Op == Op.Add && ReferenceEquals(use.In[1], current) && use.In[0].IsConst))
+                {
+                    pending.Push(use);
+                    continue;
+                }
+                if (use.Op is Op.Call or Op.TailCall &&
+                    Enumerable.Range(0, use.In.Length).Where(i => ReferenceEquals(use.In[i], current)).All(i => !TakesSpillInput(use, i)))
+                    continue;
+                return false;
+            }
+        }
+        return reachesMemory;
+    }
+
     private Sem AddSem(Node n)
     {
         AddressParts a = Decompose(n);
@@ -2675,12 +2744,13 @@ public sealed partial class HirBuilder
                     return new SRef(loc.Location, loc.Type);
                 case PUnboxed u when u.Offset == 0:
                     return new SUnboxed(u.Object);
-                case PArrayLength or PObjKlass or PInternal or PVTable or PStatics or PKlassOf or PMethodCode or PRgctx or PRgctxItem:
+                case PArrayLength or PArrayBounds or PObjKlass or PInternal or PVTable or PStatics or PKlassOf or PMethodCode or PRgctx or PRgctxItem:
                     return SJunk.Instance;
             }
             if (a.BaseSem is SVal { Type: PrimitiveSig { Element: Il2CppTypeEnum.I or Il2CppTypeEnum.U } }) return BinarySem(n);
             // An address into something no managed location was found in: the arithmetic stays, as the operand
             // of a marker (a number added to a reference is no value IL has).
+            if (OnlyInteriorAddressUses(n)) return SJunk.Instance;
             string what = "address computation: " + (place is PUnknown unknown ? unknown.Why : place.GetType().Name[1..]);
             Problem(what);
             Sem arithmetic = BinarySem(n);

@@ -81,6 +81,20 @@ public static class Arm64ReceiverProof
                 // GP/FP transfers, half precision and all other SIMD operations remain unproved.
                 case A64Op.FMov when i.FpSize is 4 or 8 && (i.Word & 0xff3ffc00u) == 0x1e204000u:
                     break;
+                // These operations exclusively read/write scalar FP registers
+                // (and possibly NZCV), never the incoming general register.
+                case A64Op.Movi or A64Op.FMovImm or A64Op.FAbs or A64Op.FNeg or A64Op.FSqrt or A64Op.FCvt or A64Op.FRint or
+                    A64Op.FAdd or A64Op.FSub or A64Op.FMul or A64Op.FDiv or A64Op.FMax or A64Op.FMin or
+                    A64Op.FMaxNm or A64Op.FMinNm or A64Op.FNMul or A64Op.FMAdd or A64Op.FMSub or
+                    A64Op.FNMAdd or A64Op.FNMSub or A64Op.FCmp or A64Op.FCmpe or A64Op.FCcmp or
+                    A64Op.FCcmpe or A64Op.FCsel:
+                    break;
+                case A64Op.FMovFromGp or A64Op.FMovFromGpHigh or A64Op.Scvtf or A64Op.Ucvtf:
+                    if (i.Rn == register) return false;
+                    break;
+                case A64Op.FMovToGp or A64Op.FMovToGpHigh or A64Op.FCvtToInt:
+                    kill = i.Rd == register;
+                    break;
                 case A64Op.Adr or A64Op.Adrp or A64Op.MovZ or A64Op.MovN:
                     kill = i.Rd == register; break;
                 case A64Op.MovK:

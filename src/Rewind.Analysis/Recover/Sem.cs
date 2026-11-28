@@ -36,6 +36,12 @@ internal sealed class SObjKlass(Node obj) : Sem
 }
 
 /// <summary>Pointer to a class's static field block.</summary>
+internal sealed class SArrayBounds(HExpr array, int rank) : Sem
+{
+    public HExpr Array = array;
+    public int Rank = rank;
+}
+
 internal sealed class SStatics(TypeSig type) : Sem
 {
     public TypeSig Type = type;

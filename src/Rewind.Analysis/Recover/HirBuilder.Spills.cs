@@ -188,6 +188,16 @@ public sealed partial class HirBuilder
     {
         if (address == 0) return false;
         if (_emptyFunctions.TryGetValue(address, out bool known)) return known;
+        if (_p.Model.Image.Arch == Rewind.Binary.CpuArch.Arm64)
+        {
+            var arm = Rewind.Analysis.Arm64.A64Cfg.Build(_p.Context, address);
+            bool nothing = arm.Problems.Count == 0 && arm.Blocks.Count == 1 && arm.Blocks[0].Instructions.Count != 0 &&
+                arm.Blocks[0].Instructions[^1].Word == 0xD65F03C0u;
+            for (int i = 0; nothing && i < arm.Blocks[0].Instructions.Count - 1; i++)
+                nothing = arm.Blocks[0].Instructions[i].Op == Rewind.Analysis.Arm64.A64Op.Nop;
+            return _emptyFunctions[address] = nothing;
+        }
+        if (_p.Model.Image.Arch != Rewind.Binary.CpuArch.X64) return _emptyFunctions[address] = false;
         X64Cfg cfg = X64Cfg.Build(_p.Context, address);
         bool empty = cfg.Blocks.Count == 1 && cfg.Blocks[0].Instructions.Count != 0 && cfg.Blocks[0].Instructions[^1].Mnemonic == Iced.Intel.Mnemonic.Ret;
         for (int i = 0; empty && i < cfg.Blocks[0].Instructions.Count - 1; i++)
@@ -203,6 +213,43 @@ public sealed partial class HirBuilder
                 if (at >= o.Offset && at < o.Offset + o.Size)
                     return o.Offset + o.Size - at;
         return 256;
+    }
+
+    // The lifter captures possible argument registers before it knows the
+    // signature. A stale stack pointer in an input no candidate takes cannot
+    // overwrite a parked address. Keep unknown and indirect calls conservative.
+    private readonly Dictionary<Node, HashSet<int>?> _spillCallPositions = [];
+
+    private bool TakesSpillInput(Node call, int input)
+    {
+        if (call.Aux is not CallInfo { Indirect: false, Intrinsic: null } info || input >= info.Slots.Count) return true;
+        int position = _fn.Regs.IntPositionOfSlot(info.Slots[input]);
+        if (position < 0) return true;
+        if (!_spillCallPositions.TryGetValue(call, out HashSet<int>? positions))
+        {
+            CallTarget target = _p.Resolve(info.Target);
+            var candidates = target.Methods.Select(m => _p.Abi.For(m, [], []))
+                .Concat(target.Insts.Select(inst => _p.Abi.For(inst))).ToArray();
+            if (target.Helper != null && _p.ShapeOf(info.Target)?.Slots is { } helperSlots)
+            {
+                // Reuse the lifter's verified helper contract. Captured stale
+                // registers beyond that contract cannot write a parked pointer.
+                positions = helperSlots.Select(_fn.Regs.IntPositionOfSlot).Where(p => p >= 0).ToHashSet();
+            }
+            else if (target.Helper == null && candidates.Length != 0 && candidates.All(abi => abi.Known))
+            {
+                positions = [];
+                foreach (var abi in candidates)
+                    foreach (var parameter in abi.Params)
+                    {
+                        positions.Add(parameter.Position);
+                        if (parameter.Pass == Rewind.Analysis.Abi.PassKind.IntegerPair)
+                            positions.Add(parameter.Position + 1);
+                    }
+            }
+            _spillCallPositions[call] = positions;
+        }
+        return positions == null || positions.Contains(position);
     }
 
     private void PlanSlot(int slot)
@@ -262,9 +309,11 @@ public sealed partial class HirBuilder
                     // A call handed a stack address may write the object there: all of it when its type is known,
                     // else what follows the address in the stack object it lies in (the frame was told apart
                     // into objects on that understanding), else anything at and after the address.
-                    foreach (Node input in n.In)
-                        if (StackOffsetOf(input, 0) is int arg && arg <= slot &&
-                            slot < arg + (_frameTypes.TryGetValue(arg, out TypeSig? pointee) ? Math.Max(1, _p.Layouts.SizeOf(pointee).Size) : RestOfObject(arg)))
+                    for (int input = 0; input < n.In.Length; input++)
+                        if (TakesSpillInput(n, input) && StackOffsetOf(n.In[input], 0) is int arg && arg <= slot &&
+                            (Rewind.Analysis.Passes.BlockCopies.Access(n, input, _p.Helpers, out int bytes, out _, out bool writes)
+                                ? writes && slot < (long)arg + bytes
+                                : slot < (long)arg + (_frameTypes.TryGetValue(arg, out TypeSig? pointee) ? Math.Max(1, _p.Layouts.SizeOf(pointee).Size) : RestOfObject(arg))))
                         {
                             list.Add((n, true, DefKind.Other, 0));
                             break;
@@ -313,6 +362,7 @@ public sealed partial class HirBuilder
                 }
             }
         }
+        if (changed) return; // No reaching-definition proof until the worklist has converged.
 
         var spillTarget = new Dictionary<Node, long>();
         foreach (var list in events.Values)

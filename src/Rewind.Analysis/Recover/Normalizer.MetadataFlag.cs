@@ -78,6 +78,14 @@ public sealed partial class Normalizer
                 provenFlag.In[0] = _b.Const(VT.I64, unchecked((long)provenAddress));
                 provenStore.In[0] = _b.Const(VT.I64, unchecked((long)provenAddress));
                 provenStore.In[1] = _b.Const(VT.I8, 1);
+                // Other reads can feed a register-carried loop flag. They
+                // name the same proven private byte, even before constant
+                // folding simplifies their page/address expressions.
+                foreach (Block block in _fn.Blocks)
+                    foreach (Node read in block.Nodes)
+                        if (!read.Dead && read is { Op: Op.Load, Type: VT.I8, In.Length: 1 } &&
+                            StableMetadataPagePhiProof.TryAddress(_fn, read.In[0], out ulong same) && same == provenAddress)
+                            read.In[0] = _b.Const(VT.I64, unchecked((long)provenAddress));
                 sites++;
                 continue;
             }

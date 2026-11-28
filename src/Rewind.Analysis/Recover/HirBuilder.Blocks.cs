@@ -116,6 +116,9 @@ public sealed partial class HirBuilder
             changed = false;
             foreach (var (to, from, size) in copies)
             {
+                // A memcpy can cover only a prefix of a larger job struct. Propagate
+                // the complete copied fields, never the uninitialised rest of that owner.
+                if (SpreadCopiedFrameFields(to, from, size) || SpreadCopiedFrameFields(from, to, size)) changed = true;
                 bool knownTo = FrameObjectAt(to) != null, knownFrom = FrameObjectAt(from) != null;
                 if (knownTo == knownFrom) continue;
                 if (StructAt(knownTo ? to : from, size) is not { } type) continue;
@@ -123,6 +126,53 @@ public sealed partial class HirBuilder
                 changed = true;
             }
         }
+    }
+
+    private bool SpreadCopiedFrameFields(int typed, int temporary, int size)
+    {
+        if (size <= 0 || (long)typed < (long)temporary + size && (long)temporary < (long)typed + size ||
+            FrameObjectAt(typed) is not int ownerStart) return false;
+        TypeSig owner = _frameTypes[ownerStart];
+        if (!IsStructType(owner) || Open(owner)) return false;
+        FieldSlot[]? fields = WholePublicFieldRange(_p.Layouts.Of(owner), typed - ownerStart, size);
+        if (fields == null) return false;
+        var planned = new List<(int Start, TypeSig Type)>();
+        var replaced = new HashSet<int>();
+        foreach (FieldSlot field in fields)
+        {
+            long begin = (long)temporary + field.Offset - (typed - ownerStart);
+            if (begin < int.MinValue || begin + field.Size > int.MaxValue || field.Size <= 0) return false;
+            int at = (int)begin;
+            foreach (var (existingAt, existingType) in _frameTypes)
+            {
+                var existingSize = _p.Layouts.SizeOf(existingType);
+                if (!existingSize.Known || existingSize.Size <= 0) return false;
+                if ((long)existingAt >= begin + field.Size || begin >= (long)existingAt + existingSize.Size) continue;
+                // An existing pointer/int may be an exact member of NativeArray<T>.
+                // Preserve contradictory or crossing views for lifetime splitting.
+                if (existingAt < at || (long)existingAt + existingSize.Size > begin + field.Size ||
+                    !SameFrameFieldView(field.Type, existingAt - at, existingType, existingSize.Size)) return false;
+                replaced.Add(existingAt);
+            }
+            planned.Add((at, field.Type));
+        }
+        if (planned.All(p => _frameTypes.TryGetValue(p.Start, out TypeSig? held) && held.Key == p.Type.Key)) return false;
+        foreach (int at in replaced) _frameTypes.Remove(at);
+        foreach (var (at, type) in planned) _frameTypes[at] = type;
+        return true;
+    }
+
+    private bool SameFrameFieldView(TypeSig owner, int offset, TypeSig view, int size)
+    {
+        for (int depth = 0; depth < 8; depth++)
+        {
+            if (offset == 0 && owner.Key == view.Key && _p.Layouts.SizeOf(owner) is { Known: true, Size: var whole } && whole == size) return true;
+            if (!IsStructType(owner) || Open(owner) || _p.Layouts.FieldAt(owner, offset) is not { } field ||
+                offset < field.Offset || (long)offset + size > (long)field.Offset + field.Size) return false;
+            offset -= field.Offset;
+            owner = field.Type;
+        }
+        return false;
     }
 
     /// <summary>
@@ -275,6 +325,13 @@ public sealed partial class HirBuilder
         }
         if (quiet) return false;
         _h.Notes.Add($"copy of {size} bytes between different things ({Describe(to)} from {Describe(from)})");
+        if (IsFrameAddress(toAddress, out int copyTo) && IsFrameAddress(fromAddress, out int copyFrom))
+        {
+            string LayoutAt(int start) => string.Join("; ", _frameTypes.Where(p =>
+                (long)p.Key < (long)start + size && (long)start < (long)p.Key + Math.Max(1, _p.Layouts.SizeOf(p.Value).Size))
+                .OrderBy(p => p.Key).Select(p => $"{p.Key}:{p.Value.DisplayName}/{_p.Layouts.SizeOf(p.Value).Size}"));
+            _h.Notes.Add($"rejected frame copy at 0x{address:X}: {size} bytes, destination {copyTo} [{LayoutAt(copyTo)}], source {copyFrom} [{LayoutAt(copyFrom)}]");
+        }
         NoteFrameMisfit(toAddress);
         NoteFrameMisfit(fromAddress);
         return false;

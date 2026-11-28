@@ -38,7 +38,12 @@ public static class TryPrologues
                 moved.Add(n);
             }
             if (!moved.Any(n => n.Op == Op.Store)) continue;
-            int at = gate.Nodes.Count - 1; // before the branch on the gate
+            // The TryEntry predicate is the artificial exceptional fork.
+            // Put preparation before it as well as before the branch, so an
+            // enclosing gate can move this prefix out in its own turn.
+            int at = gate.Terminator is { In.Length: 1 } branch
+                ? gate.Nodes.IndexOf(branch.In[0]) : -1;
+            if (at < 0) continue;
             foreach (Node n in moved)
             {
                 body.Nodes.Remove(n);

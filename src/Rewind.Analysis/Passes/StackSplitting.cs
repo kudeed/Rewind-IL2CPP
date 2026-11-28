@@ -132,6 +132,25 @@ public static class StackSplitting
         return calls;
     }
 
+    /// <summary>A merged address used exclusively for direct, fixed-width reads and writes.</summary>
+    private static List<(Node User, int Extent, bool Reads, bool Writes)>? MergedMemory(Node phi, Function fn,
+        ref Dictionary<Node, List<(Node User, int Input)>>? uses)
+    {
+        uses ??= UsesOf(fn);
+        if (!uses.TryGetValue(phi, out var users) || users.Count is < 1 or > 32) return null;
+        var accesses = new List<(Node, int, bool, bool)>();
+        foreach (var (by, input) in users)
+        {
+            if (input != 0 || by.Block == null) return null;
+            if (by.Op == Op.Load && by.In.Length == 1 && by.Type.Bytes() is > 0 and <= 16)
+                accesses.Add((by, by.Type.Bytes(), true, false));
+            else if (by.Op == Op.Store && by.In.Length == 2 && by.In[1].Type.Bytes() is > 0 and <= 16)
+                accesses.Add((by, by.In[1].Type.Bytes(), false, true));
+            else return null;
+        }
+        return accesses;
+    }
+
     /// <summary>When set, told what was decided for each object (for debugging).</summary>
     public static Action<string>? Trace;
     public static bool Detail = Environment.GetEnvironmentVariable("REWIND_SPLIT_DETAIL") != null;
@@ -243,6 +262,16 @@ public static class StackSplitting
                         IsStackAddress(phi.In[way], out int at);
                         foreach (var (call, input, extent) in handed)
                             all.Add(new Access(phi, way, at, at + extent, !(writesOnly?.Invoke(call, input) ?? false), !(readsOnly?.Invoke(call, input) ?? false)) { At = call });
+                    }
+                    continue;
+                }
+                if (every && MergedMemory(phi, fn, ref uses) is { } memory)
+                {
+                    for (int way = 0; way < phi.In.Length; way++)
+                    {
+                        IsStackAddress(phi.In[way], out int at);
+                        foreach (var (user, extent, reads, writes) in memory)
+                            all.Add(new Access(phi, way, at, at + extent, reads, writes) { At = user });
                     }
                     continue;
                 }

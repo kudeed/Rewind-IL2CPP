@@ -395,6 +395,10 @@ public sealed class DefaultsTable
                                                constant[ins.Rn] is ulong got && image.IsReadOnlyAfterLoad(got + (ulong)ins.Imm):
                         constant[ins.Rd] = image.U64(got + (ulong)ins.Imm);
                         continue;
+                    case Arm64.A64Op.Orr when ins.Is64 && !ins.SetFlags && ins.Rn == 31 &&
+                                                 ins.Rd < 31 && ins.Rm < 31 && ins.Shift == Arm64.A64Shift.Lsl && ins.Amount == 0:
+                        constant[ins.Rd] = constant[ins.Rm];
+                        continue;
                     case Arm64.A64Op.Bl or Arm64.A64Op.Blr:
                     {
                         string? ns = constant[1] is ulong n ? ReadIdentifier(image, n) : null;
@@ -422,7 +426,43 @@ public sealed class DefaultsTable
                     if (constant[r] != null && Arm64.A64Cfg.Writes(ins, r)) constant[r] = null;
             }
         }
+        CompleteV39PrimitiveSlots(model, table);
         return table;
+    }
+
+    // Unity 6000.3/v39 Il2CppDefaults begins with two image pointers and the
+    // following class-pointer fields. Locate the base from at least three
+    // independent native Class::FromName stores, then validate every known
+    // slot before completing this exact prefix. No address is guessed.
+    private static void CompleteV39PrimitiveSlots(Il2CppModel model, DefaultsTable table)
+    {
+        if (model.Version != Rewind.Metadata.MetaVersion.V39 || model.Image.PointerSize != 8 ||
+            model.UnityVersion is not { Major: 6000, Minor: 3 }) return;
+        string[] names = ["System.Object", "System.Byte", "System.Void", "System.Boolean", "System.SByte",
+            "System.Int16", "System.UInt16", "System.Int32", "System.UInt32", "System.IntPtr", "System.UIntPtr",
+            "System.Int64", "System.UInt64", "System.Single", "System.Double", "System.Char", "System.String",
+            "System.Enum", "System.Array", "System.Delegate", "System.MulticastDelegate"];
+        var anchors = new Dictionary<ulong, HashSet<int>>();
+        foreach (var (address, type) in table.Slots)
+        {
+            int index = Array.IndexOf(names, type.FullName);
+            if (index < 0 || address < (ulong)((index + 2) * 8)) continue;
+            ulong candidate = address - (ulong)((index + 2) * 8);
+            if (!anchors.TryGetValue(candidate, out var matched)) anchors[candidate] = matched = [];
+            matched.Add(index);
+        }
+        var bases = anchors.Where(a => a.Value.Count >= 3).Select(a => a.Key).ToArray();
+        if (bases.Length != 1) return;
+        ulong start = bases[0];
+        for (int index = 0; index < names.Length; index++)
+        {
+            ulong address = start + (ulong)((index + 2) * 8);
+            if ((address & 7) != 0 || model.Image.SectionAt(address) is not { IsWritable: true, IsExecutable: false } ||
+                !model.Image.IsMapped(address, 8) ||
+                table.Slots.TryGetValue(address, out TypeDef? existing) && existing.FullName != names[index]) return;
+        }
+        for (int index = 0; index < names.Length; index++)
+            if (model.FindType(names[index]) is { } type) table.Slots.TryAdd(start + (ulong)((index + 2) * 8), type);
     }
 
     private static string? ReadIdentifier(NativeImage image, ulong va)

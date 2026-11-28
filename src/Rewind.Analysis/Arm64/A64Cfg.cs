@@ -324,6 +324,14 @@ public sealed class A64Cfg
                 bound = (int)c.Imm + 1;
                 break;
             }
+            // clang copies wI to a scratch index register after the checked bound.
+            // A plain 32-bit MOV also proves the high half used for addressing is zero.
+            if (Writes(c, indexReg) && c.Op == A64Op.Orr && !c.Is64 && !c.SetFlags &&
+                c.Rn == A64Instruction.Zr && c.Rm < 31 && c.Shift == A64Shift.Lsl && c.Amount == 0)
+            {
+                indexReg = c.Rm;
+                continue;
+            }
             if (Writes(c, indexReg)) break;
         }
         if (bound <= 0 || bound > 4096) return null;

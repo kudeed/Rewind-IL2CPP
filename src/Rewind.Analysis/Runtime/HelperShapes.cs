@@ -96,16 +96,19 @@ public static class HelperShapes
         foreach (ulong start in context.FunctionStarts)
         {
             if (context.IsManaged(start) || helpers.At(start) != null) continue;
-            if (Arm64ExceptionStub(model, start) is not { } info) continue;
+            HelperInfo? info = Arm64ExceptionStub(model, context, start) ?? Arm64TypedExceptionStub(model, context, helpers, start);
+            if (info == null) continue;
             helpers.Add(start, info);
             added++;
         }
         return added;
     }
 
-    private static HelperInfo? Arm64ExceptionStub(Il2CppModel model, ulong start)
+    private static HelperInfo? Arm64ExceptionStub(Il2CppModel model, ModelCodeContext context, ulong start)
     {
         ReadOnlySpan<byte> bytes = model.Image.SpanToSectionEnd(start);
+        ulong next = context.NextFunctionStart(start);
+        if (next > start && next - start < (ulong)bytes.Length) bytes = bytes[..(int)(next - start)];
         if (bytes.Length < 20) return null;
         ulong page = 0, text = 0;
         bool call = false, tail = false;
@@ -127,6 +130,41 @@ public static class HelperShapes
         else return null;
         // (The overflow helper is otherwise the one that makes the exception; this one raises it.)
         return new HelperInfo(kind, 0, true, false, "exception thrower (by its code)");
+    }
+
+    private static HelperInfo? Arm64TypedExceptionStub(Il2CppModel model, ModelCodeContext context, RuntimeHelpers helpers, ulong start)
+    {
+        var image = model.Image;
+        ulong end = context.NextFunctionStart(start);
+        if (end != start + 8 || !image.TrySpan(start, 8, out _) || image.U32(start) != 0xf81f0ffeu) return null;
+        A64Instruction forward = A64Decoder.Decode(image.U32(start + 4), start + 4);
+        if (forward.Op != A64Op.Bl || context.IsManaged(forward.Target)) return null;
+        ulong wrapper = forward.Target, wrapperEnd = context.NextFunctionStart(wrapper);
+        if (wrapperEnd != wrapper + 16 || !image.TrySpan(wrapper, 16, out _) ||
+            image.U32(wrapper) != 0xf81f0ffeu || image.U32(wrapper + 8) != 0xaa1f03e1u) return null;
+        A64Instruction make = A64Decoder.Decode(image.U32(wrapper + 4), wrapper + 4);
+        A64Instruction raise = A64Decoder.Decode(image.U32(wrapper + 12), wrapper + 12);
+        if (make.Op != A64Op.Bl || raise.Op != A64Op.Bl || context.IsManaged(make.Target)) return null;
+        // The final runtime raiser must be the identified Throw helper itself, or
+        // the sole terminal call of its bounded, nonreturning native wrapper.
+        bool raiserKnown = helpers.KindAt(raise.Target) == HelperKind.Throw;
+        foreach (ulong known in helpers.AddressesOf(HelperKind.Throw))
+        {
+            ulong limit = context.NextFunctionStart(known);
+            if (limit <= known || limit - known > 64 || !image.TrySpan(known, (int)(limit - known), out _)) continue;
+            A64Instruction terminal = A64Decoder.Decode(image.U32(limit - 4), limit - 4);
+            if (terminal.Op is A64Op.Bl or A64Op.B && terminal.Target == raise.Target) raiserKnown = true;
+        }
+        if (!raiserKnown) return null;
+        FunctionCode? factory = new CodeIndex(context).Get(make.Target);
+        if (factory == null || factory.Instructions > 40 || !factory.Names.Contains("System")) return null;
+        HelperKind kind;
+        if (factory.Names.Contains("IndexOutOfRangeException")) kind = HelperKind.ThrowIndexOutOfRange;
+        else if (factory.Names.Contains("NullReferenceException")) kind = HelperKind.ThrowNullReference;
+        else if (factory.Names.Contains("DivideByZeroException")) kind = HelperKind.ThrowDivideByZero;
+        else if (factory.Names.Contains("InvalidCastException")) kind = HelperKind.ThrowInvalidCast;
+        else return null;
+        return new HelperInfo(kind, 0, true, false, "bounded exception factory and identified raiser");
     }
 
     private enum Arm64StubKind { Branch, FlagBranch, CallBarrierReturn }

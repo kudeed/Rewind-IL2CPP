@@ -479,6 +479,13 @@ public sealed class BodyEmitter
                     return;
                 }
                 case HElement el:
+                    if (el.Array.Type is ArraySig rectangular)
+                    {
+                        RectangularIndices(el, rectangular);
+                        ValueAs(value, el.Type);
+                        _il.Emit(OpCodes.Call, RectangularMember(rectangular, "Set"));
+                        return;
+                    }
                     Value(el.Array);
                     Index(el.Index);
                     ValueAs(value, el.Type);
@@ -622,6 +629,73 @@ public sealed class BodyEmitter
             if (Own(e.Type) is { } open) _il.Emit(OpCodes.Box, Ref(open));
         }
 
+        private MethodReference RectangularMember(ArraySig array, string name)
+        {
+            if (array.Rank is < 1 or > 32) throw new CannotEmit("invalid rectangular array rank " + array.Rank);
+            TypeSig result = name switch
+            {
+                "Get" => array.ElementType,
+                "Address" => _model.Sigs.ByRef(array.ElementType),
+                ".ctor" or "Set" => _model.Sigs.Primitive(Il2CppTypeEnum.Void),
+                _ => throw new CannotEmit("unknown rectangular array member " + name),
+            };
+            var member = new MethodReference(name, Ref(result), Ref(array)) { HasThis = true };
+            for (int dimension = 0; dimension < array.Rank; dimension++) member.Parameters.Add(new ParameterDefinition(Ref(_model.Sigs.Primitive(Il2CppTypeEnum.I4))));
+            if (name == "Set") member.Parameters.Add(new ParameterDefinition(Ref(array.ElementType)));
+            return member;
+        }
+
+        // HElement.Index denotes the native row-major linear offset. Convert
+        // physical coordinates to the CLR array's actual lower bounds. Evaluate
+        // the original array and index once, in their original order.
+        private void RectangularIndices(HElement element, ArraySig array)
+        {
+            var arrayLocal = new VariableDefinition(Ref(array));
+            var linearLocal = new VariableDefinition(Ref(_model.Sigs.Primitive(Il2CppTypeEnum.I8)));
+            _body.Variables.Add(arrayLocal); _body.Variables.Add(linearLocal);
+            Value(element.Array); _il.Emit(OpCodes.Stloc, arrayLocal);
+            Value(element.Index); _il.Emit(OpCodes.Conv_I8); _il.Emit(OpCodes.Stloc, linearLocal);
+            // Reject invalid physical offsets before dividing by dimension
+            // lengths, including every access to an empty array. Null still
+            // raises at ldlen; an empty dimension must not introduce a new
+            // DivideByZeroException in place of the original bounds failure.
+            MethodDef boundsConstructor = _model.FindType("System.IndexOutOfRangeException")?.Methods.SingleOrDefault(m =>
+                !m.IsStatic && m.Name == ".ctor" && m.Parameters.Length == 0) ??
+                throw new CannotEmit("missing System.IndexOutOfRangeException.ctor()");
+            Instruction inRange = _il.Create(OpCodes.Nop);
+            _il.Emit(OpCodes.Ldloc, linearLocal);
+            _il.Emit(OpCodes.Ldloc, arrayLocal); _il.Emit(OpCodes.Ldlen); _il.Emit(OpCodes.Conv_U8);
+            _il.Emit(OpCodes.Blt_Un, inRange);
+            _il.Emit(OpCodes.Newobj, _e.ImportMethod(_module, boundsConstructor)); _il.Emit(OpCodes.Throw);
+            _il.Append(inRange);
+            MethodDef Accessor(string name) => _model.FindType("System.Array")?.Methods.SingleOrDefault(m => !m.IsStatic &&
+                m.Name == name && m.Parameters is [{ Type: PrimitiveSig { Element: Il2CppTypeEnum.I4 } }] &&
+                m.ReturnType is PrimitiveSig { Element: Il2CppTypeEnum.I4 }) ?? throw new CannotEmit("missing System.Array." + name + "(Int32)");
+            MethodReference length = _e.ImportMethod(_module, Accessor("GetLength"));
+            MethodReference lower = _e.ImportMethod(_module, Accessor("GetLowerBound"));
+            var coordinates = new VariableDefinition[array.Rank];
+            for (int dimension = array.Rank - 1; dimension >= 0; dimension--)
+            {
+                var size = new VariableDefinition(Ref(_model.Sigs.Primitive(Il2CppTypeEnum.I8)));
+                _body.Variables.Add(size);
+                _il.Emit(OpCodes.Ldloc, arrayLocal); _il.Emit(OpCodes.Ldc_I4, dimension); _il.Emit(OpCodes.Call, length);
+                _il.Emit(OpCodes.Conv_I8); _il.Emit(OpCodes.Stloc, size);
+                coordinates[dimension] = new VariableDefinition(Ref(_model.Sigs.Primitive(Il2CppTypeEnum.I4)));
+                _body.Variables.Add(coordinates[dimension]);
+                _il.Emit(OpCodes.Ldloc, linearLocal);
+                if (dimension != 0) { _il.Emit(OpCodes.Ldloc, size); _il.Emit(OpCodes.Rem_Un); }
+                _il.Emit(OpCodes.Conv_I4);
+                _il.Emit(OpCodes.Ldloc, arrayLocal); _il.Emit(OpCodes.Ldc_I4, dimension); _il.Emit(OpCodes.Call, lower);
+                _il.Emit(OpCodes.Add); _il.Emit(OpCodes.Stloc, coordinates[dimension]);
+                if (dimension != 0)
+                {
+                    _il.Emit(OpCodes.Ldloc, linearLocal); _il.Emit(OpCodes.Ldloc, size); _il.Emit(OpCodes.Div_Un); _il.Emit(OpCodes.Stloc, linearLocal);
+                }
+            }
+            _il.Emit(OpCodes.Ldloc, arrayLocal);
+            foreach (var coordinate in coordinates) _il.Emit(OpCodes.Ldloc, coordinate);
+        }
+
         private static bool IsAddressable(HExpr e) => e is HLocal or HArg or HField or HElement or HDeref;
 
         /// <summary>Pushes the address of a location.</summary>
@@ -652,6 +726,12 @@ public sealed class BodyEmitter
                     return;
                 }
                 case HElement el:
+                    if (el.Array.Type is ArraySig rectangular)
+                    {
+                        RectangularIndices(el, rectangular);
+                        _il.Emit(OpCodes.Call, RectangularMember(rectangular, "Address"));
+                        return;
+                    }
                     Value(el.Array);
                     Index(el.Index);
                     _il.Emit(OpCodes.Ldelema, Ref(el.Type));
@@ -765,6 +845,12 @@ public sealed class BodyEmitter
                     return;
                 }
                 case HElement el:
+                    if (el.Array.Type is ArraySig rectangular)
+                    {
+                        RectangularIndices(el, rectangular);
+                        _il.Emit(OpCodes.Call, RectangularMember(rectangular, "Get"));
+                        return;
+                    }
                     Value(el.Array);
                     Index(el.Index);
                     _il.Emit(OpCodes.Ldelem_Any, Ref(el.Type));
@@ -829,7 +915,10 @@ public sealed class BodyEmitter
                     return;
                 case HNewObject n:
                 {
-                    MethodReference ctor = _e.ImportMethod(_module, n.Constructor, n.DeclaringType);
+                    MethodReference ctor = n.DeclaringType is ArraySig allocatedArray && n.Constructor.Index == -1 &&
+                        n.Constructor.Name == ".ctor" && n.Arguments.Length == allocatedArray.Rank
+                        ? RectangularMember(allocatedArray, ".ctor")
+                        : _e.ImportMethod(_module, n.Constructor, n.DeclaringType);
                     Arguments(n.Constructor, n.DeclaringType, n.Arguments);
                     _il.Emit(OpCodes.Newobj, ctor);
                     return;

@@ -104,15 +104,9 @@ public sealed partial class HirBuilder
 
     private bool IsFrameAddress(Node n, out int offset)
     {
-        offset = 0;
-        if (!_fn.Params.TryGetValue(_fn.Regs.StackPointer, out Node? sp0)) return false;
-        if (ReferenceEquals(n, sp0)) return true;
-        if (n.Op == Op.Add && ReferenceEquals(n.In[0], sp0) && n.In[1].IsConst)
-        {
-            offset = (int)IrBuilder.SImm(n.In[1]);
-            return true;
-        }
-        return false;
+        int? known = StackOffsetOf(n, 0);
+        offset = known ?? 0;
+        return known != null;
     }
 
     private static readonly bool NoWiderPointees = Environment.GetEnvironmentVariable("REWIND_NO_WIDER_POINTEES") != null;
@@ -247,6 +241,9 @@ public sealed partial class HirBuilder
                             // modf writes one scalar through its integer-register pointer argument. A stack
                             // slot previously used for a struct must enter the existing lifetime splitter.
                             else if (helper.Kind == HelperKind.Modf && position == IntArgPosition(0, 1)) type = helper.IsDouble ? _double : _float;
+                            else if (helper.Kind == HelperKind.SinCos &&
+                                (position == IntArgPosition(0, 1) || position == IntArgPosition(1, 1)))
+                                type = helper.IsDouble ? _double : _float;
                         }
                         else
                         {
@@ -279,6 +276,10 @@ public sealed partial class HirBuilder
                                     if (pointees.Count < wanted && Reachable(inst.Method.DeclaringType.Assembly) && PointeeOf(_p.Abi.For(inst), position) is { } t)
                                         Add(t);
                                 if (pointees.Count != 0 && (pointees.Count <= SharedPointeeLimit || !differ)) type = pointees[0];
+                                // An object-shared instantiation is a native code identity,
+                                // not proof that the actual stack local contains object.
+                                if (type is GenericInstSig && NamesObject(type)) type = null;
+                                if (DescriptorPointee(call, target, position) is { } namedPointee) type = namedPointee;
                                 // Methods of several structs share the code: the one whose struct was put there
                                 // is the one that is called.
                                 if (differ && parked != null && parked.TryGetValue(offset, out TypeSig? held) && held != null &&
@@ -312,7 +313,25 @@ public sealed partial class HirBuilder
             }
         }
         SpreadFrameTypes();
+        InferMergedMemoryPointees();
         DropCoveredFrameTypes();
+    }
+
+    private TypeSig? DescriptorPointee(Node call, CallTarget target, int position)
+    {
+        if (call.Aux is not CallInfo info) return null;
+        foreach (Node candidate in call.In)
+        {
+            if (candidate.Op != Op.SlotValue || Eval(candidate) is not SMethod { Inst: { } instance } named ||
+                instance.ClassArguments.Any(Open) || instance.MethodArguments.Any(Open) ||
+                !target.Methods.Any(m => ReferenceEquals(m, named.Method)) &&
+                !target.Insts.Any(i => ReferenceEquals(i.Method, named.Method))) continue;
+            MethodAbi exact = _p.Abi.For(named.Method, instance.ClassArguments, instance.MethodArguments);
+            if (!exact.Params.Any(p => p.Role == ParamRole.MethodInfo && ReferenceEquals(IntAt(call, p.Position), candidate))) continue;
+            TypeSig? type = PointeeOf(exact, position);
+            if (type != null && !Open(type) && Nameable(type)) return type;
+        }
+        return null;
     }
 
     private static readonly bool NoMergedAddresses = Environment.GetEnvironmentVariable("REWIND_NO_MERGED_ADDRESSES") != null;
@@ -352,6 +371,51 @@ public sealed partial class HirBuilder
             if (IsFrameAddress(input, out int at) && !offsets.Contains(at))
                 offsets.Add(at);
         return offsets.Count != 0 ? offsets : null;
+    }
+
+    // An address phi need not be handed to a call: generated code also merges
+    // pointers to struct locals before copying their fields, or four scalar
+    // destinations before one shared store. Infer only from exact recorded
+    // frame locations, or from uniform direct floating-point memory accesses.
+    private void InferMergedMemoryPointees()
+    {
+        foreach (Block block in _fn.Blocks)
+            foreach (Node phi in block.Phis)
+            {
+                if (phi.Dead || phi.Type != VT.I64 || _addressPhis.ContainsKey(phi) || phi.In.Length is < 2 or > 32) continue;
+                var offsets = new List<int>();
+                foreach (Node input in phi.In)
+                    if (IsFrameAddress(input, out int at)) offsets.Add(at); else break;
+                if (offsets.Count != phi.In.Length) continue;
+                TypeSig? proven = null;
+                bool same = true;
+                foreach (int at in offsets)
+                {
+                    if (FrameObjectAt(at) == null || FramePlace(at, -1) is not PLocation location || Open(location.Type)) { same = false; break; }
+                    if (proven != null && proven.Key != location.Type.Key) { same = false; break; }
+                    proven = location.Type;
+                }
+                if (same && proven != null) { _addressPhis[phi] = proven; continue; }
+                if (!_uses.TryGetValue(phi, out List<Node>? uses) || uses.Count == 0) continue;
+                VT scalar = VT.None;
+                bool uniform = true;
+                foreach (Node use in uses)
+                {
+                    if (use.Op is not (Op.Load or Op.Store) || use.In.Length == 0 || !ReferenceEquals(use.In[0], phi)) { uniform = false; break; }
+                    VT actual = use.Op == Op.Load ? use.Type : use.In[1].Type;
+                    if (actual is not (VT.F32 or VT.F64) || scalar != VT.None && scalar != actual) { uniform = false; break; }
+                    scalar = actual;
+                }
+                if (!uniform || scalar == VT.None) continue;
+                TypeSig wanted = scalar == VT.F32 ? _float : _double;
+                int width = scalar.Bytes();
+                // Reject an address that would reinterpret any known struct or
+                // scalar storage. The normal lifetime splitter retains conflicts.
+                if (offsets.Any(at => FrameObjectAt(at) != null &&
+                    (FramePlace(at, width) is not PLocation location || location.Type.Key != wanted.Key))) continue;
+                foreach (int at in offsets) _frameTypes.TryAdd(at, wanted);
+                _addressPhis[phi] = wanted;
+            }
     }
 
     /// <summary>The type a merged stack address points to, when every object it may be the address of is known as that.</summary>
@@ -1714,6 +1778,9 @@ public sealed partial class HirBuilder
                 SNewObject o => o.Type,
                 SVal v => v.Type,
                 SRef r => r.Type,
+                // Frame types may come from a speculative shared instantiation. They cannot
+                // override an explicit descriptor; the established SVal/SRef priority stays intact.
+                SFrame frame when !classTold && FramePlace(frame.Offset, -1) is PLocation location && !NamesObject(location.Type) => location.Type,
                 _ => null,
             };
             if (receiverNode != null && receiverType != null && DeclaringArguments(receiverType, method.DeclaringType) == null &&
@@ -1776,7 +1843,7 @@ public sealed partial class HirBuilder
                     }
                     else if (Environment.GetEnvironmentVariable("REWIND_NO_GUARDED_ARGUMENT_RECEIVER") == null &&
                              (node.IsConstValue(0) ||
-                              Eval(node) is SVal { Expr: { } staleArg } &&
+                              Peek(node) is SVal { Expr: { } staleArg } &&
                               (staleArg.Type ?? (staleArg as HLocal)?.Variable.Type) is PrimitiveSig { Element: Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4 }) &&
                              method.ReturnType.IsVoid && method.Parameters.Length>0 &&
                              method.Parameters[0].Type is TypeDefSig { Definition: { IsValueType: false } } &&
@@ -1812,9 +1879,9 @@ public sealed partial class HirBuilder
                     }
                     else if (Environment.GetEnvironmentVariable("REWIND_NO_SCALAR_UNUSED_RECEIVER") == null &&
                              node.Op == Op.Phi &&
-                             Eval(node) is SVal { Expr: { } scalar } &&
+                             Peek(node) is SVal { Expr: { } scalar } &&
                              (scalar.Type ?? (scalar as HLocal)?.Variable.Type) is PrimitiveSig { Element: Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8 } &&
-                             CanRestoreUnusedReceiver(call, method, classArgs, methodArgs, isVirtual, alternatives, receiverOverride, shift))
+                             CanRestoreUnusedReceiver(call, method, classArgs, methodArgs, isVirtual, alternatives, receiverOverride, shift, allowArglessThrow: true))
                     {
                         // A merged stale scalar return register is not a
                         // managed receiver. The same-class direct callee
@@ -1827,7 +1894,7 @@ public sealed partial class HirBuilder
                              tail && call.Op == Op.TailCall && method.ReturnType.IsVoid &&
                              method.Parameters.Length == 1 &&
                              method.Parameters[0].Type is TypeDefSig { Definition: { IsValueType: false } } &&
-                             Eval(node) is SVal { Expr: { } tailScalar } &&
+                             Peek(node) is SVal { Expr: { } tailScalar } &&
                              (tailScalar.Type ?? (tailScalar as HLocal)?.Variable.Type) is PrimitiveSig { Element: Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8 } &&
                              Rewind.Analysis.Arm64.Arm64ReceiverProof.DirectRestoredTail(_p.Model.Image,call.Addr,method.Address) &&
                              CanRestoreUnusedReceiver(call,method,classArgs,methodArgs,isVirtual,alternatives,receiverOverride,shift))
@@ -1839,8 +1906,32 @@ public sealed partial class HirBuilder
                         restoredUnusedReceiver=true;
                         _h.Notes.Add($"receiver-independent restored scalar tail at 0x{call.Addr:X} to 0x{method.Address:X}");
                     }
+                    else if (Peek(node) is SVal { Expr: { } heldScalar } &&
+                             (heldScalar.Type ?? (heldScalar as HLocal)?.Variable.Type) is { } heldScalarType &&
+                             !IsAssignable(heldScalarType, p.Type) &&
+                             CanRestoreUnusedReceiver(call, method, classArgs, methodArgs, isVirtual, alternatives, receiverOverride, shift, allowArglessThrow: true))
+                    {
+                        thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                        restoredUnusedReceiver = true;
+                        // A nonmaterialized expression can be a preceding SetPass call.
+                        // Execute that expression once even though this callee ignores its result.
+                        if (!IsPure(heldScalar)) Emit(new HEval(Value(node)), call.Addr);
+                        _h.Notes.Add($"receiver-independent typed value at 0x{call.Addr:X} to 0x{method.Address:X}");
+                    }
+                    else if (Peek(node) is SVal { Expr: HLocal heldReferenceLocal } &&
+                             (heldReferenceLocal.Type ?? heldReferenceLocal.Variable.Type) is { } heldReferenceType &&
+                             IsReference(heldReferenceType) && !IsAssignable(heldReferenceType, p.Type) &&
+                             CanRestoreUnusedReceiver(call, method, classArgs, methodArgs, isVirtual, alternatives, receiverOverride, shift, allowArglessThrow: true))
+                    {
+                        // Inspect the already materialized type before Value marks an unrelated
+                        // phi as read. The direct native callee independently kills incoming x0.
+                        // Its earlier evaluation and every actual argument remain unchanged.
+                        thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                        restoredUnusedReceiver = true;
+                        _h.Notes.Add($"receiver-independent materialized reference at 0x{call.Addr:X} to 0x{method.Address:X}");
+                    }
                     else if (Environment.GetEnvironmentVariable("REWIND_NO_I64_UNUSED_RECEIVER") == null &&
-                             Eval(node) is SVal { Expr: HLocal capturedInteger } &&
+                             Peek(node) is SVal { Expr: HLocal capturedInteger } &&
                              (capturedInteger.Type ?? capturedInteger.Variable.Type) is PrimitiveSig { Element: Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8 } &&
                              CanRestoreUnusedReceiver(call, method, classArgs, methodArgs, isVirtual, alternatives, receiverOverride, shift))
                     {
@@ -1851,7 +1942,7 @@ public sealed partial class HirBuilder
                         _h.Notes.Add($"receiver-independent materialized int64 scalar at 0x{call.Addr:X} to 0x{method.Address:X}");
                     }
                     else if (Environment.GetEnvironmentVariable("REWIND_NO_I32_UNUSED_RECEIVER") == null &&
-                             Eval(node) is SVal { Expr: { } stale } &&
+                             Peek(node) is SVal { Expr: { } stale } &&
                              (stale.Type ?? (stale as HLocal)?.Variable.Type) is PrimitiveSig { Element: Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4 } &&
                              CanRestoreUnusedReceiver(call, method, classArgs, methodArgs, isVirtual, alternatives, receiverOverride, shift))
                     {
@@ -1862,7 +1953,7 @@ public sealed partial class HirBuilder
                         _h.Notes.Add($"receiver-independent int32 scalar at 0x{call.Addr:X} to 0x{method.Address:X}");
                     }
                     else if (Environment.GetEnvironmentVariable("REWIND_NO_BOOL_UNUSED_RECEIVER") == null&&
-                             Eval(node) is SVal {Expr:HLocal heldBool}&&
+                             Peek(node) is SVal {Expr:HLocal heldBool}&&
                              (heldBool.Type??heldBool.Variable.Type) is PrimitiveSig {Element:Il2CppTypeEnum.Boolean}&&
                              CanRestoreUnusedReceiver(call,method,classArgs,methodArgs,isVirtual,alternatives,receiverOverride,shift,allowArglessThrow:true))
                     {
@@ -1871,7 +1962,7 @@ public sealed partial class HirBuilder
                         _h.Notes.Add($"receiver-independent materialized boolean at 0x{call.Addr:X} to 0x{method.Address:X}");
                     }
                     else if (Environment.GetEnvironmentVariable("REWIND_NO_BOOL_UNUSED_RECEIVER") == null &&
-                             Eval(node) is SVal { Expr: { } staleBool } &&
+                             Peek(node) is SVal { Expr: { } staleBool } &&
                              (staleBool.Type ?? (staleBool as HLocal)?.Variable.Type) is PrimitiveSig { Element: Il2CppTypeEnum.Boolean } &&
                              method.Parameters.Length==0 && method.ReturnType is PrimitiveSig { Element: Il2CppTypeEnum.Boolean } &&
                              Rewind.Analysis.Arm64.Arm64ReceiverProof.RepeatedBooleanCall(_p.Model.Image,call.Addr,method.Address) &&
@@ -1900,7 +1991,7 @@ public sealed partial class HirBuilder
                         }
                         // A struct wrapping the object (see IsReferenceWrapper): the receiver is the object.
                         if (thisExpr.Type is { } held && IsReferenceWrapper(held)) thisExpr = Coerce(thisExpr, p.Type);
-                        if (Eval(node) is SNewObject) { }
+                        if (Peek(node) is SNewObject) { }
                         else if (CheckedClassHere(node) is { } checkedAs && !IsAssignable(thisExpr.Type, p.Type))
                             thisExpr = new HTypeExpr(HTypeOp.CastClass, checkedAs, thisExpr) { Type = checkedAs };
                     }
@@ -2692,6 +2783,29 @@ public sealed partial class HirBuilder
                 TypeSig? type = a0 != null ? EvalKlass(a0) : null;
                 if (type is not SzArraySig array || a1 == null) break;
                 FinishCall(call, new HNewArray(array.ElementType, IntValue(a1)) { Type = type }, ReturnKind.Integer, type, tail);
+                return;
+            }
+            case HelperKind.GenArrayNew:
+            {
+                if (a0 == null || a1 == null || EvalKlass(a0) is not ArraySig array || array.Rank is < 1 or > 32 ||
+                    StackOffsetOf(a1, 0) is not int dimensionsAt || _m.FindType("System.Array") is not { } arrayClass) break;
+                var lengths = new HExpr[array.Rank];
+                bool complete = true;
+                for (int dimension = 0; dimension < array.Rank; dimension++)
+                {
+                    // il2cpp_array_size_t is pointer-sized. The original compiler
+                    // stores every dimension in this fixed stack buffer before allocation.
+                    int offset = checked(dimensionsAt + dimension * _ptr);
+                    Place place = FramePlace(offset, _ptr);
+                    if (place is not PLocation location) { complete = false; break; }
+                    lengths[dimension] = Coerce(location.Location, _int);
+                }
+                if (!complete) break;
+                var ctor = new MethodDef { Index = -1, Name = ".ctor", DeclaringType = arrayClass,
+                    ReturnType = _m.Sigs.Primitive(Il2CppTypeEnum.Void),
+                    Parameters = lengths.Select((_, dimension) => new ParamDef { Position = dimension, Name = "length" + dimension, Type = _int }).ToArray() };
+                FinishCall(call, new HNewObject { Constructor = ctor, DeclaringType = array, Arguments = lengths, Type = array },
+                    ReturnKind.Integer, array, tail);
                 return;
             }
             case HelperKind.Box:

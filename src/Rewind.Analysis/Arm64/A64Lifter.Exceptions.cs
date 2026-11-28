@@ -366,6 +366,39 @@ public sealed partial class A64Lifter
         for (int t = 0; t < count; t++)
             protectedCalls[t] = callRegions.Where(kv => kv.Value.Contains(t)).Select(kv => kv.Key).ToList();
 
+        // A surrounding try can have no ordinary calls before its nested try.
+        // Its first visible calls are in the nested catch protocol or after
+        // that catch. Those native LSDA edges require the whole nested try to
+        // lie inside the surrounding region, rather than starting the outer
+        // region halfway through its handler. Keep genuinely mixed or cyclic
+        // handler protection unsupported and explicit.
+        var surrounds = new Dictionary<int, int>();
+        foreach (var group in handlerCalls.GroupBy(link => link.Handler))
+        {
+            int[] targets = group.Select(link => link.Region).Distinct().ToArray();
+            if (targets.Length != 1 || targets[0] == group.Key || protectedCalls[targets[0]].Count == 0)
+                continue;
+            surrounds[group.Key] = targets[0];
+        }
+        foreach (int nested in surrounds.Keys)
+        {
+            var seen = new HashSet<int> { nested };
+            for (int region = nested; surrounds.TryGetValue(region, out int outer); region = outer)
+                if (!seen.Add(outer)) return Fail("cyclic protection of catch handlers");
+        }
+        var requiredCalls = protectedCalls.Select(blocks => new HashSet<Block>(blocks)).ToArray();
+        for (int round = 0; round < count; round++)
+        {
+            bool grew = false;
+            foreach (var (nested, outer) in surrounds)
+            {
+                int before = requiredCalls[outer].Count;
+                requiredCalls[outer].UnionWith(requiredCalls[nested]);
+                grew |= requiredCalls[outer].Count != before;
+            }
+            if (!grew) break;
+        }
+
         // Control flow of the function's own code, with the exceptional edges from protected calls to where
         // their handler continues.
         var own = parentBlocks.Where(b => !handlerOf.ContainsKey(b)).ToList();
@@ -396,7 +429,7 @@ public sealed partial class A64Lifter
         var found = new List<(int Region, Block Entry, HashSet<Block> Body)>();
         for (int t = 0; t < count; t++)
         {
-            List<Block> must = protectedCalls[t];
+            List<Block> must = requiredCalls[t].OrderBy(b => b.Start).ToList();
             if (must.Count == 0 || must.Any(b => !idom.ContainsKey(b))) continue; // nothing in it can raise an exception
             Block entry = must[0];
             foreach (Block b in must.Skip(1))
@@ -441,9 +474,23 @@ public sealed partial class A64Lifter
             found.Add((t, entry, body));
         }
 
+        foreach (var (nested, outer) in surrounds)
+        {
+            var child = found.FirstOrDefault(region => region.Region == nested).Body;
+            var parentBody = found.FirstOrDefault(region => region.Region == outer).Body;
+            if (child == null || parentBody == null || !child.IsSubsetOf(parentBody))
+                return Fail("native catch protection does not form nested try regions");
+        }
+
         // Outermost first: a region's code is carved out of the scope its try statement is in.
         var made = new List<(int Region, Block Entry, List<Block> Outside, HashSet<Block> Body)>();
-        foreach (var (t, entry, body) in found.OrderByDescending(f => f.Body.Count))
+        int ProtectionDepth(int region)
+        {
+            int depth = 0;
+            while (surrounds.TryGetValue(region, out int outer)) { region = outer; depth++; }
+            return depth;
+        }
+        foreach (var (t, entry, body) in found.OrderByDescending(f => f.Body.Count).ThenBy(f => ProtectionDepth(f.Region)))
         {
             int outer = entry.Scope;
             if (body.Any(b => b.Scope != outer)) return Fail("try regions overlap");
@@ -479,7 +526,7 @@ public sealed partial class A64Lifter
         foreach (var (handler, region) in handlerCalls)
             if (!Encloses(region, _fn.TryRegions[handler].Outer)) return Fail("try inside a catch clause");
 
-        foreach (var (t, entry, outside, body) in made)
+        foreach (var (t, entry, _, body) in made)
         {
             // Callee-saved registers the protected code writes: the unwinder gives the handler their values as
             // they were at the call that raised the exception, which one path into the handler cannot say.
@@ -501,14 +548,18 @@ public sealed partial class A64Lifter
             _fn.Blocks.Add(gate);
             var landing = new Block { Id = _fn.Blocks.Count, Start = pads[primary[t]], End = pads[primary[t]], Scope = 2 * t + 1 };
             _fn.Blocks.Add(landing);
-            foreach (Block p in outside)
+            // An outer gate installed earlier may now be the predecessor of
+            // a shared entry. Re-read the actual edges so the inner gate is
+            // inserted after it and both exception scopes are entered.
+            var incoming = entry.Preds.Where(p => !body.Contains(p)).ToList();
+            foreach (Block p in incoming)
                 for (int i = 0; i < p.Succs.Count; i++)
                     if (ReferenceEquals(p.Succs[i], entry))
                     {
                         p.Succs[i] = gate;
                         gate.Preds.Add(p);
                     }
-            entry.Preds.RemoveAll(outside.Contains);
+            entry.Preds.RemoveAll(incoming.Contains);
             gate.Succs.Add(landing);
             landing.Preds.Add(gate);
             gate.Succs.Add(entry);
@@ -565,7 +616,6 @@ public sealed partial class A64Lifter
     {
         _b.CurrentAddr = block.Start;
         Clobber();
-        SetVar(1, C(VT.I64, landing.Selector));
         foreach (int variable in landing.Lost)
         {
             Node lost = _b.Raw(Op.Idiom, VarTypes[variable]);
@@ -573,6 +623,10 @@ public sealed partial class A64Lifter
             lost.Aux = variable;
             SetVar(variable, lost);
         }
+        // The exception table proves the clause selector at this canonical entry.
+        // A discarded alternate prefix may write x1 while restoring a saved selector;
+        // such a write cannot erase the unwinder's known selector for this entry.
+        SetVar(1, C(VT.I64, landing.Selector));
         _b.Raw(Op.Jump, VT.None);
     }
 
