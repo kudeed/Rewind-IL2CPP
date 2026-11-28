@@ -607,7 +607,12 @@ public sealed partial class HirBuilder
                     Emit(new HEval(expr), call.Addr);
                     break;
                 }
-                if (_materialize.Contains(result) || expr is HOpaque)
+                // A subsequently proven unused x0 receiver may remove
+                // the projection's sole value use. Materialize the original
+                // effectful producer at its own instruction before that
+                // can happen; never lose the native call itself.
+                if (_materialize.Contains(result) || expr is HOpaque ||
+                    IsReceiverScalar(returnType) && !IsPure(expr) && HasProvenReceiverOnlyUse(result))
                 {
                     HVar t = Temp(returnType, result.Type);
                     Emit(new HAssign(new HLocal(t) { Type = t.Type }, expr), call.Addr);
@@ -1884,6 +1889,7 @@ public sealed partial class HirBuilder
                     }
                     else if (Eval(node) is SVal { Expr: { } invalidScalar } &&
                              IsReceiverScalar(invalidScalar.Type ?? (invalidScalar as HLocal)?.Variable.Type) &&
+                             Plain(invalidScalar) && IsPure(invalidScalar) &&
                              CanRestoreProvenStaleReceiver(call,method,classArgs,methodArgs,isVirtual,
                                  alternatives,receiverOverride,shift))
                     {
@@ -2424,6 +2430,32 @@ public sealed partial class HirBuilder
             _receiverProofs[(method.Address,allowArglessThrow,allowVoidReturn,allowIndirectStructReturn)] = proved;
         }
         return proved;
+    }
+
+    private bool HasProvenReceiverOnlyUse(Node result)
+    {
+        // Follow a unique scalar width alias, not arbitrary arithmetic,
+        // merges, memory effects, or multiple users.
+        Node n=result;
+        for(int hops=0;hops<4;hops++)
+        {
+            if(!_uses.TryGetValue(n,out var uses)||uses.Count!=1)return false;
+            Node user=uses[0];
+            if(user.Op is Op.ZExt or Op.SExt or Op.Trunc)
+            {n=user;continue;}
+            if(user.Op is not (Op.Call or Op.TailCall)||
+               user.Aux is not CallInfo {Indirect:false,Intrinsic:null} ci||
+               !ReferenceEquals(Input(user,ArgSlotKind.IntReg,0),n)||
+               !_p.Model.MethodsByAddress.TryGetValue(ci.Target,out var targets)||targets.Count!=1)
+                return false;
+            // The result must only be x0, not an actual parameter.
+            int slots=0;
+            for(int i=0;i<ci.Slots.Count&&i<user.In.Length;i++)
+                if(ReferenceEquals(user.In[i],n))slots++;
+            if(slots!=1)return false;
+            return CanRestoreProvenStaleReceiver(user,targets[0],[],[],false,null,null,0);
+        }
+        return false;
     }
 
     // Same-class only. The recovered receiver is already non-reference
