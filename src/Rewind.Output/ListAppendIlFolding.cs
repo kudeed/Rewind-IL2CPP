@@ -45,6 +45,29 @@ internal static class ListAppendIlFolding
 
     private static bool Constant(Instruction i, int n) => i.OpCode.Code == Code.Ldc_I4 && i.Operand is int k && k == n;
 
+    // Preserve the native array-indexed item read at its original position.
+    // It may throw on a null/short source array, so it is not moved across the
+    // List receiver null-check or the original version increment.
+    private static bool SafeArrayAppendSchedule(Instruction[] code, object list,
+        VariableDefinition array, VariableDefinition size, object value, TypeReference element)
+    {
+        if (code.Length != 8 || code[0].OpCode.Code != Code.Ldloc ||
+            code[0].Operand is not VariableDefinition source ||
+            source.VariableType is not ArrayType { IsVector: true } sourceArray ||
+            !Same(sourceArray.ElementType, element) ||
+            code[1].OpCode.Code != Code.Ldloc || code[1].Operand is not VariableDefinition index ||
+            index.VariableType.MetadataType != MetadataType.Int64 ||
+            code[2].OpCode.Code != Code.Ldc_I4 ||
+            code[3].OpCode.Code != Code.Conv_I8 || code[4].OpCode.Code != Code.Add ||
+            code[5].OpCode.Code != Code.Conv_I4 || code[6].OpCode.Code != Code.Ldelem_Any ||
+            code[6].Operand is not TypeReference readType || !Same(readType, element) ||
+            code[7].OpCode.Code != Code.Stloc || code[7].Operand != value ||
+            value is not VariableDefinition destination || !Same(destination.VariableType, element) ||
+            new object[] { list, array, size, value }.Contains(source) ||
+            new object[] { list, array, size, value }.Contains(index)) return false;
+        return true;
+    }
+
     private static bool Candidate(Instruction i) => i.OpCode.Code == Code.Ldfld &&
         i.Operand is FieldReference f && f.Name == "_items" && List(f.DeclaringType);
 
@@ -100,6 +123,16 @@ internal static class ListAppendIlFolding
             Load(a[k+3]) &&
             (a[k+4].OpCode.Code == Code.Ldfld || extended && a[k+4].OpCode.Code == Code.Callvirt) &&
             a[k+5].OpCode.Code == Code.Stloc ? 3 : 0;
+        if (scheduled == 0 && extended && k + 17 < a.Length &&
+            a[k+3].OpCode.Code == Code.Ldloc && a[k+4].OpCode.Code == Code.Ldloc &&
+            a[k+5].OpCode.Code == Code.Ldc_I4 &&
+            a[k+6].OpCode.Code == Code.Conv_I8 && a[k+7].OpCode.Code == Code.Add &&
+            a[k+8].OpCode.Code == Code.Conv_I4 && a[k+9].OpCode.Code == Code.Ldelem_Any &&
+            a[k+10].OpCode.Code == Code.Stloc && SameLoad(a[k],a[k+11]) && SameLoad(a[k],a[k+12]) &&
+            a[k+13].OpCode.Code == Code.Ldfld && a[k+13].Operand is FieldReference versionField && versionField.Name == "_version" &&
+            Constant(a[k+14],1) && a[k+15].OpCode.Code == Code.Add &&
+            a[k+16].OpCode.Code == Code.Stfld && a[k+16].Operand is FieldReference versionStore && versionStore.Name == "_version")
+            scheduled = 8;
         int post = k+12+scheduled;
         // One proven nonthrowing, stack-balanced FP calculation. No calls,
         // field access, integer division, overflow checks, or address writes.
@@ -169,7 +202,7 @@ internal static class ListAppendIlFolding
             get.ReturnType.MetadataType != MetadataType.Int32 ||
             Resolve(get) is not { IsPublic: true, IsStatic: false } countMethod || countMethod.DeclaringType != def) return false;
 
-        if (scheduled != 0)
+        if (scheduled == 3)
         {
             if (LoadType(moved[0]) is not TypeReference sourceType || moved[2].Operand is not VariableDefinition destination ||
                 (!extended && moved[2].Operand != value) || new[]{list,(object)array,size}.Contains(destination) ||
@@ -196,6 +229,10 @@ internal static class ListAppendIlFolding
                 AssemblyIdentity(sourceCount.DeclaringType)==AssemblyIdentity(sourceType))
             { /* Non-mutating exact List.Count; preserve its original exception order. */ }
             else return false;
+        }
+        else if (scheduled == 8)
+        {
+            if (!extended || arithmetic != 0 || !SafeArrayAppendSchedule(moved,list,array,size,value,gt.GenericArguments[0])) return false;
         }
         if (computed.Any(i=>i.Operand==list || i.Operand==array || i.Operand==size)) return false;
         var fb = a.Skip(f).Take(4).ToArray();
