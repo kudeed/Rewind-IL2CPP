@@ -1038,7 +1038,7 @@ public sealed partial class A64Lifter : IMachineLifter
                         A64Op.Csneg => _b.Neg(b),
                         _ => b,
                     };
-                    r = InfinityConversion(cond, a, other) ?? _b.Select(cond, a, other);
+                    r = _b.Select(cond, a, other);
                 }
                 SetR(i.Rd, i.Is64, r);
                 return;
@@ -1264,14 +1264,21 @@ public sealed partial class A64Lifter : IMachineLifter
             }
             case A64Op.Scvtf or A64Op.Ucvtf:
             {
-                if (i.FpSize == 2) Unknown(i, i.Op + " (half)");
+                if (i.FpSize == 2) { Unknown(i, i.Op + " (half)"); return; }
+                // The existing unsigned HIR view goes through RUn/R8 before R4. Until that view can
+                // guarantee direct uint64-to-F32 rounding, do not claim the new fixed-point form.
+                if (i.Op == A64Op.Ucvtf && i.Is64 && i.FpSize == 4 && i.Imm != 0)
+                {
+                    Unknown(i, "UCVTF fixed uint64 to F32 (direct rounding not proved)");
+                    return;
+                }
                 Node a = R(i.Rn, i.Is64);
-                SetFp(i.Rd, _b.Raw(i.Op == A64Op.Scvtf ? Op.SIntToF : Op.UIntToF, FpType(i.FpSize), a));
+                SetFp(i.Rd, FixedToFloat(a, FpType(i.FpSize), i.Op == A64Op.Ucvtf, (int)i.Imm));
                 return;
             }
             case A64Op.FCvtToInt:
             {
-                if (i.FpSize == 2) Unknown(i, "FCvtToInt (half)");
+                if (i.FpSize == 2) { Unknown(i, "FCvtToInt (half)"); return; }
                 Node a = Fp(i.Rn, i.FpSize);
                 // Converting with a rounding of its own: rounding to an integral value first, then the conversion.
                 if ((A64Rounding)i.Imm != A64Rounding.Zero)
@@ -1279,7 +1286,7 @@ public sealed partial class A64Lifter : IMachineLifter
                     if (RoundingName((A64Rounding)i.Imm) is not { } rounding) Unknown(i, "FCvtToInt (" + (A64Rounding)i.Imm + ")");
                     else a = Intrinsic("math." + rounding, a.Type, a);
                 }
-                SetR(i.Rd, i.Is64, _b.Raw(i.Signed ? Op.FToSInt : Op.FToUInt, t, a));
+                SetR(i.Rd, i.Is64, SaturatingFloatToInt(a, t, i.Signed));
                 return;
             }
             case A64Op.FRint:
@@ -1395,36 +1402,6 @@ public sealed partial class A64Lifter : IMachineLifter
             }
         }
         Unknown(i);
-    }
-
-    /// <summary>
-    /// "value == +infinity ? MIN : (int)value": how IL2CPP compiles a conversion from floating point to a signed
-    /// integer for ARM (il2cpp_codegen_cast_double_to_int), so that +infinity gives what it gives on x86. The
-    /// program's own operation is the plain conversion.
-    /// </summary>
-    private Node? InfinityConversion(Node cond, Node whenTrue, Node whenFalse)
-    {
-        // (The same with the condition turned round: "value != +infinity ? (int)value : MIN".)
-        if (cond.Op == Op.Xor && cond.In[1].IsConstValue(1) && cond.In[0].Op == Op.FCmpEq) (cond, whenTrue, whenFalse) = (cond.In[0], whenFalse, whenTrue);
-        if (cond.Op != Op.FCmpEq || whenFalse.Op != Op.FToSInt || !whenTrue.IsConst) return null;
-        Node value = whenFalse.In[0];
-        Node? other = SameValue(cond.In[0], value) ? cond.In[1] : SameValue(cond.In[1], value) ? cond.In[0] : null;
-        if (other is not { IsConst: true }) return null;
-        bool infinity = other.Type == VT.F32 ? (uint)other.Imm == 0x7F800000u : other.Type == VT.F64 && (ulong)other.Imm == 0x7FF0000000000000UL;
-        ulong min = whenFalse.Type == VT.I64 ? 0x8000000000000000UL : 0x80000000UL;
-        return infinity && whenTrue.UImm == min ? whenFalse : null;
-    }
-
-    /// <summary>Two nodes computing the same thing from the same inputs (register reads made twice: the bits of a float, a pair of lanes).</summary>
-    private static bool SameValue(Node a, Node b, int depth = 0)
-    {
-        if (ReferenceEquals(a, b)) return true;
-        if (depth > 4 || a.Op != b.Op || a.Type != b.Type || a.Imm != b.Imm || a.In.Length != b.In.Length) return false;
-        if (a.Op == Op.Const) return a.Imm == b.Imm;
-        if (a.Op is not (Op.BitsToF or Op.FToBits or Op.Concat or Op.Trunc or Op.ZExt or Op.SExt)) return false;
-        for (int k = 0; k < a.In.Length; k++)
-            if (!SameValue(a.In[k], b.In[k], depth + 1)) return false;
-        return true;
     }
 
     /// <summary>

@@ -30,6 +30,8 @@ public enum VecKind : byte
     /// <summary>Scalar pairwise: element 0 + element 1 (FADDP, ADDP).</summary>
     FAddPair, AddPair,
     AddV, SMaxV, SMinV, UMaxV, UMinV, FMaxV, FMinV, FMaxNmV, FMinNmV,
+    // floating-point comparison with zero; appended to preserve existing kind values
+    FCmLtZero,
 }
 
 public static partial class A64Decoder
@@ -116,6 +118,7 @@ public static partial class A64Decoder
                 case 0b01000: kind = u ? VecKind.CmGeZero : VecKind.CmGtZero; break;
                 case 0b01010 when !u: kind = VecKind.CmLtZero; break;
                 case 0b10010 when !u && !scalar && size != 3: kind = VecKind.Xtn; break;
+                case 0b01110 when a && !u: kind = VecKind.FCmLtZero; i.ElemSize = (byte)(sz ? 8 : 4); break;
                 case 0b01111 when a: kind = u ? VecKind.FNeg : VecKind.FAbs; i.ElemSize = (byte)(sz ? 8 : 4); break;
                 case 0b11111 when a && u: kind = VecKind.FSqrt; i.ElemSize = (byte)(sz ? 8 : 4); break;
                 case 0b11101 when !a: kind = u ? VecKind.Ucvtf : VecKind.Scvtf; i.ElemSize = (byte)(sz ? 8 : 4); break;

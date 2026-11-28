@@ -48,6 +48,7 @@ public enum A64Op : byte
     FMAdd, FMSub, FNMAdd, FNMSub,
     /// <summary>Compare Rn with Rm, or with zero when Imm is 1.</summary>
     FCmp, FCmpe, FCcmp, FCcmpe, FCsel,
+    /// <summary>Integer to float; Imm is the number of fractional source bits (zero for the integer form).</summary>
     Scvtf, Ucvtf,
     /// <summary>Float to integer: Imm is the rounding (see <see cref="A64Rounding"/>), Signed the result's signedness.</summary>
     FCvtToInt,

@@ -582,6 +582,23 @@ public static partial class A64Decoder
     private static bool ScalarFp(uint w, ref A64Instruction i)
     {
         uint ptype = Bits(w, 23, 22);
+        if (!Bit(w, 21) && Bits(w, 20, 19) == 0 && Bits(w, 18, 16) is 2 or 3)
+        {
+            // SCVTF/UCVTF from a general register containing a fixed-point number.
+            // scale encodes 64-fbits, even for a 32-bit source; its top bit must then be set.
+            i.Is64 = Bit(w, 31);
+            i.FpSize = FpSizeOf(ptype);
+            uint scale = Bits(w, 15, 10);
+            if (i.FpSize == 0 || (!i.Is64 && (scale & 32) == 0))
+            {
+                i.Op = A64Op.Invalid;
+                return true;
+            }
+            i.Signed = Bits(w, 18, 16) == 2;
+            i.Op = i.Signed ? A64Op.Scvtf : A64Op.Ucvtf;
+            i.Imm = 64 - scale;
+            return true;
+        }
         if (Bit(w, 21) && Bits(w, 15, 10) == 0 && Bits(w, 30, 29) == 0)
         {
             // conversion between floating point and integer

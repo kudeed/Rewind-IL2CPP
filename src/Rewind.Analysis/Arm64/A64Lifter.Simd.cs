@@ -173,13 +173,17 @@ public sealed partial class A64Lifter
                     result[k] = Bits(_b.Raw(op, ft, F(A(k))));
                 }
                 break;
+            case VecKind.FCmLtZero:
+                for (int k = 0; k < count; k++)
+                    result[k] = AllOnes(_b.Raw(Op.FCmpLt, VT.I1, F(A(k)), FZero(ft)), t);
+                break;
             case VecKind.Scvtf or VecKind.Ucvtf:
                 for (int k = 0; k < count; k++)
                     result[k] = Bits(_b.Raw(kind == VecKind.Scvtf ? Op.SIntToF : Op.UIntToF, ft, A(k)));
                 break;
             case VecKind.FCvtzs or VecKind.FCvtzu:
                 for (int k = 0; k < count; k++)
-                    result[k] = _b.Raw(kind == VecKind.FCvtzs ? Op.FToSInt : Op.FToUInt, t, F(A(k)));
+                    result[k] = SaturatingFloatToInt(F(A(k)), t, kind == VecKind.FCvtzs);
                 break;
 
             // ---- by element
