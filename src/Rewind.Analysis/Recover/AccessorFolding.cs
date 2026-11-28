@@ -240,10 +240,16 @@ public static class AccessorFolding
             !ReferenceEquals(current.DeclaringType, accessor.DeclaringType) && Derives(current.DeclaringType, accessor.DeclaringType) &&
             Overridden(accessor, current.DeclaringType);
 
-        HCall? Getter(HField f)
+        HExpr? Getter(HField f)
         {
             if (index.GetterOf(f.Field) is not { } getter || ReferenceEquals(getter, current)) return null;
-            return new HCall { Method = getter, DeclaringType = f.DeclaringType is GenericInstSig ? f.DeclaringType : null, This = f.Object, Arguments = [], Virtual = getter.IsVirtual && !ViaBase(getter, f.Object), Type = f.Type };
+            var call = new HCall { Method = getter, DeclaringType = f.DeclaringType is GenericInstSig ? f.DeclaringType : null, This = f.Object, Arguments = [], Virtual = getter.IsVirtual && !ViaBase(getter, f.Object), Type = f.Type };
+            if (WiderGetterResult.TryRestore(f,call,program) is { } typed)
+            {
+                method.Notes.Add("restored exact wider getter field return: "+getter.FullName);
+                return typed;
+            }
+            return call;
         }
 
         // What a field is reached through, when the field is written or its address is taken: a struct that
