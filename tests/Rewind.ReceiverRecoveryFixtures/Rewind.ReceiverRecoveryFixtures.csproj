@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseSharedCompilation>false</UseSharedCompilation>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <RewindBinaryDir Condition="'$(RewindBinaryDir)' == ''">../../src/Rewind.Cli/bin/Release/net10.0</RewindBinaryDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Rewind.Analysis"><HintPath>$(RewindBinaryDir)/Rewind.Analysis.dll</HintPath></Reference>
+    <Reference Include="Rewind.Core"><HintPath>$(RewindBinaryDir)/Rewind.Core.dll</HintPath></Reference>
+    <Reference Include="Rewind.Output"><HintPath>$(RewindBinaryDir)/Rewind.Output.dll</HintPath></Reference>
+    <Reference Include="Mono.Cecil"><HintPath>$(RewindBinaryDir)/Mono.Cecil.dll</HintPath></Reference>
+    <Reference Include="Mono.Cecil.Rocks"><HintPath>$(RewindBinaryDir)/Mono.Cecil.Rocks.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>

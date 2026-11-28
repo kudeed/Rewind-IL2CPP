@@ -33,6 +33,15 @@ public sealed class ProgramAnalysis
 
     private readonly Dictionary<ulong, CallShape?> _shapes = [];
 
+    private readonly Dictionary<ulong, OutlinedCleanup?> _outlinedCleanups = [];
+
+    /// <summary>A proved native cleanup body; the caller's frame and exception edge are checked by OutlinedCleanups.</summary>
+    public OutlinedCleanup? OutlinedCleanupAt(ulong address)
+    {
+        if (_outlinedCleanups.TryGetValue(address, out OutlinedCleanup? known)) return known;
+        return _outlinedCleanups[address] = OutlinedCleanup.Recognize(this, address);
+    }
+
     private static readonly bool NoSlotInvokers = Environment.GetEnvironmentVariable("REWIND_NO_SLOT_INVOKERS") != null;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, SlotInvoker?> _slotInvokers = new();
 
@@ -765,6 +774,16 @@ public sealed class ProgramAnalysis
             {
                 Count = n, IsFloat = new bool[Math.Max(4, n)], IsDouble = new bool[Math.Max(4, n)],
                 Returns = helper.ReturnsValue ? CallReturn.Integer : CallReturn.Void,
+            };
+        }
+        else if (OutlinedCleanupAt(address) != null)
+        {
+            // Its only input is the cleanup frame. Keep possible result projections until the caller proof
+            // rejects their use; no unproved call site loses a captured result merely from body recognition.
+            shape = new CallShape
+            {
+                Count = 1, IsFloat = new bool[4], IsDouble = new bool[4], Returns = CallReturn.Unknown,
+                Slots = [new ArgSlot(ArgSlotKind.IntReg, 0)],
             };
         }
         else

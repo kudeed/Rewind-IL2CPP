@@ -557,7 +557,8 @@ internal static partial class ConstructorFolding
                 var copy = new HCall
                 {
                     Method = call.Method, DeclaringType = call.DeclaringType, MethodArguments = call.MethodArguments, This = self,
-                    Arguments = arguments, Virtual = call.Virtual, Constrained = call.Constrained, Type = call.Type,
+                    Arguments = arguments, Virtual = call.Virtual, UnusedReceiverTarget = call.UnusedReceiverTarget,
+                    Constrained = call.Constrained, Type = call.Type,
                 };
                 copy.Alternatives.AddRange(call.Alternatives);
                 return copy;
@@ -1058,7 +1059,7 @@ internal static partial class ConstructorFolding
                            (ReferenceEquals(call.Method, sc4.Method) ||
                             (call.Method.Parameters.Length == sc4.Method.Parameters.Length && call.Method.IsStatic == sc4.Method.IsStatic &&
                              (call.Alternatives.Contains(sc4.Method) || sc4.Alternatives.Contains(call.Method)))) &&
-                           call.Virtual == sc4.Virtual &&
+                           call.Virtual == sc4.Virtual && ReferenceEquals(call.UnusedReceiverTarget, sc4.UnusedReceiverTarget) &&
                            SameTypes(call.MethodArguments, sc4.MethodArguments) && Expression(call.This, sc4.This) && All(call.Arguments, sc4.Arguments);
                 case HNewObject n:
                     return site is HNewObject sn && ReferenceEquals(n.Constructor, sn.Constructor) && All(n.Arguments, sn.Arguments);

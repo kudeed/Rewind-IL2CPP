@@ -960,6 +960,15 @@ public sealed class BodyEmitter
         private void Call(HCall call)
         {
             MethodDef m = call.Method;
+            // This narrow marker carries a native proof, not a general change to instance-call lowering.
+            // Reject it if a later transformation changed the closed class/target/context it proved.
+            if (call.ReceiverUnused && (!ReferenceEquals(call.UnusedReceiverTarget, m) || m.IsStatic || m.IsVirtual || m.Name == ".ctor" ||
+                m.DeclaringType.IsValueType || m.DeclaringType.IsInterface ||
+                m.GenericParameters.Length != 0 || m.DeclaringType.GenericParameters.Length != 0 ||
+                m.ReturnType.ContainsGenericParameter || m.Parameters.Any(p => p.Type.ContainsGenericParameter) ||
+                call.Virtual || call.Constrained != null || call.DeclaringType != null || call.MethodArguments.Length != 0 ||
+                !ReferenceEquals(call.This?.Type, m.DeclaringType.Sig)))
+                throw new CannotEmit("unused native receiver proof no longer matches its direct closed target");
             MethodReference target = Instantiate(_e.ImportMethod(_module, m, call.DeclaringType), call.MethodArguments);
             if (call.Constrained != null)
             {
@@ -993,7 +1002,7 @@ public sealed class BodyEmitter
 
             // Calls on objects check the receiver for null, as "callvirt" does; a direct "call" is for struct
             // methods, constructors, and "base.Method()".
-            bool direct = m.IsStatic || structReceiver || m.Name == ".ctor" || (m.IsVirtual && !call.Virtual);
+            bool direct = call.ReceiverUnused || m.IsStatic || structReceiver || m.Name == ".ctor" || (m.IsVirtual && !call.Virtual);
             _il.Emit(direct ? OpCodes.Call : OpCodes.Callvirt, target);
         }
 

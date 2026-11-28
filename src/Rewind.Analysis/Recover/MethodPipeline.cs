@@ -59,7 +59,7 @@ public sealed class MethodPipeline
         {
             switch (e)
             {
-                case HCall call: used.Add("call " + call.Method.FullName + "/" + call.Method.Parameters.Length); break;
+                case HCall call: used.Add((call.ReceiverUnused ? "direct-unused-receiver " : "call ") + call.Method.FullName + "/" + call.Method.Parameters.Length); break;
                 case HNewObject made: used.Add("new " + made.Constructor.DeclaringType.FullName + "/" + made.Constructor.Parameters.Length); break;
                 case HNewArray array: used.Add("array of " + array.ElementType.Key); break;
                 case HField field: used.Add("field " + field.Field.DeclaringType.FullName + "::" + field.Field.Name); break;
@@ -335,6 +335,8 @@ public sealed class MethodPipeline
         if (!fn.Regs.SharedPositions && Environment.GetEnvironmentVariable("REWIND_NO_TRY_PROLOGUES") == null) TryPrologues.Run(fn);
         MathCalls.Run(fn, _program.Helpers);
         TrimReturns(fn, abi);
+        OutlinedCleanups.Run(fn, _program);
+        CheckShape(fn, "outlined cleanups");
         NormalizeResult normalization = _normalizer.Run(fn);
         CheckShape(fn, "normalizing");
         if (Environment.GetEnvironmentVariable("REWIND_NO_CONSTANT_DIVISIONS") == null && ConstantDivisions.Run(fn)) DeadCode.Run(fn);

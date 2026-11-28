@@ -1698,6 +1698,7 @@ public sealed partial class HirBuilder
         ChosenCalls[call] = (method, abi, shift);
 
         HExpr? thisExpr = null;
+        bool receiverUnused = false;
         var args = new HExpr[method.Parameters.Length];
         MethodDef? stringConstructor = null;
         HExpr? returnLocation = null;
@@ -1719,6 +1720,10 @@ public sealed partial class HirBuilder
                 }
                 case ParamRole.This:
                 {
+                    if (receiverOverride == null && shift == 0 && !isVirtual && !skipFirst &&
+                        !bufferFirst && fixedArguments == null && (alternatives == null || alternatives.Count == 0) &&
+                        RecoverUnusedReceiver(call, method, abi, classArgs, methodArgs, out thisExpr, out receiverUnused))
+                        break;
                     Node? node = receiverOverride ??
                         (shift == 0 && !isVirtual ? CheckedReceiverFor(call, position, p.Type!) : null) ??
                         IntAt(call, position);
@@ -1901,6 +1906,7 @@ public sealed partial class HirBuilder
             This = thisExpr,
             Arguments = args,
             Virtual = virtualCall,
+            UnusedReceiverTarget = receiverUnused ? method : null,
             Type = abi.ReturnType,
         };
         if (alternatives != null) expr.Alternatives.AddRange(alternatives);

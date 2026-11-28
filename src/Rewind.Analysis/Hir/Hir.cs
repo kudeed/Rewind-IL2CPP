@@ -137,6 +137,14 @@ public sealed class HCall : HExpr
     public HExpr[] Arguments = [];
     public bool Virtual;
     /// <summary>
+    /// An exact direct native target was proved, before any cleanup, never to read or forward its incoming
+    /// instance register. The recovered, closed reference-type receiver is only an ABI placeholder. Emit
+    /// a direct call: checking that replacement for null would add behavior absent from the native call.
+    /// This is independent of Virtual and is never inferred merely because Virtual is false.
+    /// </summary>
+    public MethodDef? UnusedReceiverTarget;
+    public bool ReceiverUnused => UnusedReceiverTarget != null;
+    /// <summary>
     /// Set for an interface method called on a struct where it is ("constrained."): the struct's type, by which
     /// the implementation is found. Method is then the interface's method and This the struct's location.
     /// </summary>
@@ -516,7 +524,8 @@ public static class HirPrinter
                 if (call.This is HArg { Index: -1 } && !call.Virtual && call.Method.IsVirtual && !call.Method.DeclaringType.IsValueType) target = "base";
                 string generic = call.MethodArguments.Length == 0 ? "" : "<" + string.Join(", ", call.MethodArguments.Select(a => a.ShortName)) + ">";
                 string alt = call.Alternatives.Count == 0 ? "" : $" /*or {call.Alternatives.Count} more*/";
-                return $"{target}.{call.Method.Name}{generic}({string.Join(", ", call.Arguments.Select(a => Print(a, m)))}){alt}";
+                string direct = call.ReceiverUnused ? " /*direct-unused-this*/" : "";
+                return $"{target}.{call.Method.Name}{generic}({string.Join(", ", call.Arguments.Select(a => Print(a, m)))}){alt}{direct}";
             }
             case HNewObject n:
                 return $"new {(n.DeclaringType ?? n.Constructor.DeclaringType.Sig).ShortName}({string.Join(", ", n.Arguments.Select(a => Print(a, m)))})";
