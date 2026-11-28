@@ -7,6 +7,8 @@
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
   <ItemGroup>
+    <Reference Include="Microsoft.CodeAnalysis"><HintPath>$(MSBuildToolsPath)/Roslyn/bincore/Microsoft.CodeAnalysis.dll</HintPath></Reference>
+    <Reference Include="Microsoft.CodeAnalysis.CSharp"><HintPath>$(MSBuildToolsPath)/Roslyn/bincore/Microsoft.CodeAnalysis.CSharp.dll</HintPath></Reference>
     <Compile Include="../../src/Rewind.Output/SanitizeIdentifiers.cs" Link="SanitizeIdentifiers.cs" />
     <Compile Include="../../src/Rewind.Output/SourceTextProtection.cs" Link="SourceTextProtection.cs" />
     <Compile Include="Program.cs" />

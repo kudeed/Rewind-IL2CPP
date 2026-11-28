@@ -13,7 +13,11 @@ public static partial class Decompiler
     private static void SanitizeIdentifiers(ref string text)
     {
         // Metadata identifiers are code. Text, comments, and recovery evidence are not.
-        var protectedText = SourceTextProtection.Mask(text);
+        var protectedText = SourceTextProtection.Mask(text, static expression =>
+        {
+            SanitizeIdentifiers(ref expression);
+            return expression;
+        });
         text = protectedText.Text;
         text = protectedText.RewriteIdentifiers(text, @"(?<![\w@])<([^<>]+)>d__(\d+)", m => IdentName(m.Groups[1].Value) + "_d__" + m.Groups[2].Value);
         text = protectedText.RewriteIdentifiers(text, @"(?<![\w@])<([^<>]+)>(\d+)__(\d+)", m => IdentName(m.Groups[1].Value) + "_" + m.Groups[2].Value + "__" + m.Groups[3].Value);

@@ -5,8 +5,8 @@ namespace Rewind.Output;
 
 /// <summary>
 /// Temporarily protects C# literals and comments during identifier-only text rewrites.
-/// Interpolated strings are retained as a whole: rewriting their expressions requires
-/// an expression tree, and must never change their literal text as a side effect.
+/// Interpolated strings remain opaque to the outer rewrite. Their expression spans
+/// can be rewritten recursively, while literal text and format components stay exact.
 /// </summary>
 internal sealed class SourceTextProtection
 {
@@ -14,7 +14,7 @@ internal sealed class SourceTextProtection
     private string markerPrefix = "";
     public string Text { get; private set; } = "";
 
-    public static SourceTextProtection Mask(string source)
+    public static SourceTextProtection Mask(string source, Func<string, string>? rewriteExpression = null)
     {
         var result = new SourceTextProtection();
         string prefix = "__RewindProtected";
@@ -31,7 +31,10 @@ internal sealed class SourceTextProtection
             bool comment = source[at] == '/' && at + 1 < source.Length
                 && source[at + 1] is '/' or '*';
             string placeholder = comment ? "/*" + id + "*/" : "\"" + id + "\"";
-            result.tokens.Add((placeholder, source[at..end]));
+            string original = source[at..end];
+            if (rewriteExpression is not null)
+                original = RewriteInterpolationExpressions(original, rewriteExpression);
+            result.tokens.Add((placeholder, original));
             output.Append(placeholder);
             copied = at = end;
         }
@@ -57,6 +60,50 @@ internal sealed class SourceTextProtection
     public string RewriteIdentifiers(string source, string pattern, MatchEvaluator rewrite) =>
         Regex.Replace(source, pattern, match => match.Value.Contains(markerPrefix, StringComparison.Ordinal)
             ? match.Value : rewrite(match));
+
+    private static string RewriteInterpolationExpressions(string token, Func<string, string> rewrite)
+    {
+        int quote = 0, dollars = 0;
+        bool verbatim = false;
+        while (quote < token.Length && token[quote] is '$' or '@')
+        {
+            if (token[quote] == '$') dollars++;
+            else verbatim = true;
+            quote++;
+        }
+        if (dollars == 0 || quote >= token.Length || token[quote] != '"') return token;
+        int quotes = Run(token, quote, '"');
+        bool raw = quotes >= 3 && !verbatim;
+        int closingBraces = raw ? dollars : 1;
+        var output = new StringBuilder(token.Length);
+        int copied = 0;
+        for (int p = quote + (raw ? quotes : 1); p < token.Length;)
+        {
+            char c = token[p];
+            if (!raw && !verbatim && c == '\\') { p = Math.Min(p + 2, token.Length); continue; }
+            if (c == '"')
+            {
+                if (raw && Run(token, p, '"') < quotes) { p++; continue; }
+                if (!raw && verbatim && p + 1 < token.Length && token[p + 1] == '"') { p += 2; continue; }
+                break;
+            }
+            if (c != '{') { p++; continue; }
+            int braces = Run(token, p, '{');
+            if (!raw && braces >= 2) { p += 2; continue; }
+            if (raw && braces < closingBraces) { p += braces; continue; }
+            // In a raw string, a run longer than the delimiter has literal
+            // leading braces. Expressions begin after the complete opening run.
+            int start = p + (raw ? braces : 1);
+            var bounds = InterpolationBounds(token, start, closingBraces);
+            if (!bounds.Closed) return token; // Keep malformed input intact for diagnostics.
+            output.Append(token, copied, start - copied);
+            output.Append(rewrite(token[start..bounds.ExpressionEnd]));
+            copied = bounds.ExpressionEnd;
+            p = bounds.End;
+        }
+        output.Append(token, copied, token.Length - copied);
+        return output.ToString();
+    }
 
     private static int ProtectedEnd(string source, int at)
     {
@@ -99,7 +146,7 @@ internal sealed class SourceTextProtection
                 if (source[p] == '"' && Run(source, p, '"') >= quotes) return p + quotes;
                 if (dollars > 0 && source[p] == '{' && Run(source, p, '{') >= dollars)
                 {
-                    p = InterpolationEnd(source, p + dollars, dollars);
+                    p = InterpolationEnd(source, p + Run(source, p, '{'), dollars);
                     continue;
                 }
                 p++;
@@ -127,6 +174,9 @@ internal sealed class SourceTextProtection
     }
 
     private static int InterpolationEnd(string source, int at, int closingBraces)
+        => InterpolationBounds(source, at, closingBraces).End;
+
+    private static (int ExpressionEnd, int End, bool Closed) InterpolationBounds(string source, int at, int closingBraces)
     {
         int depth = 0, parentheses = 0, brackets = 0;
         for (int p = at; p < source.Length;)
@@ -137,10 +187,11 @@ internal sealed class SourceTextProtection
                 && (p == 0 || source[p - 1] != ':')
                 && (p + 1 >= source.Length || source[p + 1] != ':'))
             {
+                int expressionEnd = p;
                 for (p++; p < source.Length; p++)
                     if (source[p] == '}' && Run(source, p, '}') >= closingBraces)
-                        return p + closingBraces;
-                return source.Length;
+                        return (expressionEnd, p + closingBraces, true);
+                return (expressionEnd, source.Length, false);
             }
             int tokenEnd = ProtectedEnd(source, p);
             if (tokenEnd > p) { p = tokenEnd; continue; }
@@ -152,11 +203,11 @@ internal sealed class SourceTextProtection
             else if (source[p] == '}')
             {
                 if (depth > 0) depth--;
-                else if (Run(source, p, '}') >= closingBraces) return p + closingBraces;
+                else if (Run(source, p, '}') >= closingBraces) return (p, p + closingBraces, true);
             }
             p++;
         }
-        return source.Length;
+        return (source.Length, source.Length, false);
     }
 
     private static int Run(string source, int at, char character)

@@ -1,4 +1,7 @@
 using Rewind.Output;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using System.Reflection;
 
 int cases = 0;
 void Check(string input, string expected)
@@ -37,6 +40,37 @@ Check("string s = $\"{global::X.F(\"}\"):0//0}\"; int <X>k__BackingField;",
       "string s = $\"{global::X.F(\"}\"):0//0}\"; int _rewind_cg_X_k__BackingField;");
 Check("string s = $$\"\"\"{{1:0//0}}\"\"\"; int <X>k__BackingField;",
       "string s = $$\"\"\"{{1:0//0}}\"\"\"; int _rewind_cg_X_k__BackingField;");
+// Actual C#9 export failures: only the expression identifier changes. The
+// diagnostic prose, format string, and any literal compiler-shaped names stay exact.
+Check("PaperLogger.LogError($\"[AutoRun] Perf report finalization failed: {<e>5__5}\", LogCategory.AutoRun);",
+      "PaperLogger.LogError($\"[AutoRun] Perf report finalization failed: {e_5__5}\", LogCategory.AutoRun);");
+Check("Debug.LogError($\"Error reconnecting: {<>7__wrap2}\");",
+      "Debug.LogError($\"Error reconnecting: {_7__wrap2}\");");
+Check("var s = $\"[Vfx] Starting test for: {<instance>5__4}\";",
+      "var s = $\"[Vfx] Starting test for: {instance_5__4}\";");
+Check("var s = $\"Spawn bot: area={num41:F6}, id={<skinModel>5__3.Id}\";",
+      "var s = $\"Spawn bot: area={num41:F6}, id={skinModel_5__3.Id}\";");
+Check("var s = $\"{{<literal>d__3}} {<value>5__2,10:F2}\";",
+      "var s = $\"{{<literal>d__3}} {value_5__2,10:F2}\";");
+Check("var s = $@\"\"\"<literal>d__3\"\" {<value>5__2}\";",
+      "var s = $@\"\"\"<literal>d__3\"\" {value_5__2}\";");
+Check("var s = @$\"{<value>5__2} <literal>d__3\";",
+      "var s = @$\"{value_5__2} <literal>d__3\";");
+Check("var s = $\"{F($\"{<e>5__5} <literal>d__3\")}\";",
+      "var s = $\"{F($\"{e_5__5} <literal>d__3\")}\";");
+Check("var s = $\"{<value>5__2 /* <literal>d__3 } */ :0//<format>d__3}\";",
+      "var s = $\"{value_5__2 /* <literal>d__3 } */ :0//<format>d__3}\";");
+Check("var s = $\"{(flag ? <left>5__1 : <right>5__2):0/*<format>d__3}\";",
+      "var s = $\"{(flag ? left_5__1 : right_5__2):0/*<format>d__3}\";");
+Check("var s = $\"{global::F(<value>5__2, \"<literal>d__3 }\")}:<format>d__3\";",
+      "var s = $\"{global::F(value_5__2, \"<literal>d__3 }\")}:<format>d__3\";");
+Check("var s = $$\"\"\"{<literal>d__3} {{<value>5__2}}\"\"\";",
+      "var s = $$\"\"\"{<literal>d__3} {{value_5__2}}\"\"\";");
+Check("var s = $$\"\"\"{{{<value>5__2}}} <literal>d__3\"\"\";",
+      "var s = $$\"\"\"{{{value_5__2}}} <literal>d__3\"\"\";");
+Check("var s = $\"{F(new[] { <left>5__1, <right>5__2 })}\";",
+      "var s = $\"{F(new[] { left_5__1, right_5__2 })}\";");
+Check("var s = $\"{<unclosed>5__1", "var s = $\"{<unclosed>5__1");
 Check("var __RewindProtected0__ = \"<Work>d__3\"; int <X>k__BackingField;",
       "var __RewindProtected0__ = \"<Work>d__3\"; int _rewind_cg_X_k__BackingField;");
 Check("List<T>P; List<T>d;", "List<T>P; List<T>d;");
@@ -56,7 +90,44 @@ try { protectedFixture.Restore("string s = \"lost\";"); }
 catch (InvalidOperationException) { rejected = true; }
 if (!rejected) throw new Exception("Lost protected token was not rejected.");
 cases++;
-Console.WriteLine($"PASS {cases} source-sanitization cases (including literal preservation and idempotence)");
+// Compile and execute the rewritten expressions with C#9. A counter detects
+// duplication or loss of expression evaluation; literal metadata-shaped text
+// must remain byte-for-byte visible in the resulting string.
+string fixture = """
+using System;
+using System.Globalization;
+public static class Fixture
+{
+    static int Calls;
+    static string Next() { Calls++; return "ok"; }
+    public static string Run()
+    {
+        CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
+        var <e>5__5 = Next();
+        var <>7__wrap2 = Next();
+        var <value>5__2 = 2.5;
+        string result = $"{{<literal>d__3}} {<e>5__5} {<>7__wrap2} {<value>5__2:F2} {Next()}";
+        result += $@" | ""<literal>d__3"" {<e>5__5}";
+        result += $" | {$"{<e>5__5} <literal>d__3"}";
+        return result + " | " + Calls;
+    }
+}
+""";
+string sanitizedFixture = Decompiler.SanitizeForTest(fixture);
+var references = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator)
+    .Select(path => MetadataReference.CreateFromFile(path));
+var compilation = CSharpCompilation.Create("SanitizationFixture", [CSharpSyntaxTree.ParseText(sanitizedFixture,
+    new CSharpParseOptions(LanguageVersion.CSharp9))], references,
+    new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+using var bytes = new MemoryStream();
+var emitted = compilation.Emit(bytes);
+if (!emitted.Success) throw new Exception(string.Join("\n", emitted.Diagnostics));
+var assembly = Assembly.Load(bytes.ToArray());
+var output = (string)assembly.GetType("Fixture")!.GetMethod("Run")!.Invoke(null, null)!;
+const string expectedOutput = "{<literal>d__3} ok ok 2.50 ok | \"<literal>d__3\" ok | ok <literal>d__3 | 3";
+if (output != expectedOutput) throw new Exception("Interpolation runtime behavior: " + output);
+cases++;
+Console.WriteLine($"PASS {cases} source-sanitization cases (literal preservation, idempotence, C#9 compilation and evaluation count)");
 
 namespace Rewind.Output
 {
