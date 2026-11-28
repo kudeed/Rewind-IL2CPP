@@ -540,7 +540,7 @@ public sealed class BodyEmitter
             // "null" given to a T is T's nothing: null only where T is a class.
             if (Own(target) != null && e is HConst { Value: null })
             {
-                Default(target);
+                Default(target!);
                 return;
             }
             Value(e);
@@ -966,7 +966,7 @@ public sealed class BodyEmitter
                 // An interface method called on a struct where it is: the struct's address, and its type for the
                 // runtime to find the implementation by.
                 if (call.This == null) throw new CannotEmit("constrained call without a receiver");
-                Address(call.This);
+                Address(call.This!);
                 Arguments(m, call.DeclaringType, call.Arguments);
                 _il.Emit(OpCodes.Constrained, Ref(call.Constrained));
                 _il.Emit(OpCodes.Callvirt, target);
@@ -976,7 +976,7 @@ public sealed class BodyEmitter
             // (right for a class and for a struct alike).
             if (!m.IsStatic && m.Name != ".ctor" && Own(call.This?.Type) is { } receiver)
             {
-                Address(call.This);
+                Address(call.This!);
                 Arguments(m, call.DeclaringType, call.Arguments);
                 _il.Emit(OpCodes.Constrained, Ref(receiver));
                 _il.Emit(OpCodes.Callvirt, target);
@@ -986,7 +986,7 @@ public sealed class BodyEmitter
             if (!m.IsStatic)
             {
                 if (call.This == null) throw new CannotEmit("instance call without a receiver");
-                if (structReceiver) Address(call.This);
+                if (structReceiver) Address(call.This!);
                 else Value(call.This);
             }
             Arguments(m, call.DeclaringType, call.Arguments);

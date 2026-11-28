@@ -1,0 +1,86 @@
+{
+  "input": "/data/home/game/pap_unity_rewrite/RecoveredEvidence/Rewind/kudeed-d870553-Assembly-CSharp/assemblies/Assembly-CSharp.dll",
+  "input_sha256": "c483fc0344d3444439094addf3ac52e411664f2eba093e39aeb7db8603c3da96",
+  "rewind_output_sha256": "0e5fc3523b9228bdbf2642da1361fb5e8f36314c9577fb43ea54921b822135a6",
+  "types": [
+    {
+      "type": "Paper2.Economy.Controller.EconomyController",
+      "machines": false,
+      "closures": false,
+      "raw_sha256": "3fe1cb31b7fbe077ac7848aa486efb5c5f3fea9d73c2fbcf2e89438677ac02d6",
+      "sanitized_sha256": "46a3570d871771b83a7317126798a0e5c982874374357334993ea35e4bfa3966",
+      "cleaned_sha256": "327756767b0d0facd967b8f8d9d86081faee55de0722566150c2b16bc1b5d307",
+      "recovered_il_sha256": "84390787fe6753fc88e8dcaaa435ce82944810cdee32b28583a5d21e2a44f79d",
+      "scope": "existing recovered IL; no native lift or execution"
+    },
+    {
+      "type": "Paper2.LevelEnd.View.LevelEndScreenView",
+      "machines": false,
+      "closures": false,
+      "raw_sha256": "cdf0519e5a92474ef8b5fb8864bc3200381d0e234d8dd6abe010c2d6064a7281",
+      "sanitized_sha256": "d49e77343dc78261a1f88c6aaa5b7ab1de913e8c3238b7073d715ebe34c40f92",
+      "cleaned_sha256": "c1474c42d294bf8e13dac8bbb12d13cf5b159890df410b362aa7fa997fbb4a7e",
+      "recovered_il_sha256": "993bbd28f85745a081867af7b9f10bd7f93de52489a6b02cb4aee66f59800028",
+      "scope": "existing recovered IL; no native lift or execution"
+    },
+    {
+      "type": "Paper2.ServiceLocator.Controller.AbstractChildServiceController",
+      "machines": false,
+      "closures": false,
+      "raw_sha256": "6a9e88602b8bffa7a8a97eecaab9ae3c16711c972a0ede9390c8ca9a5228f5a1",
+      "sanitized_sha256": "6a9e88602b8bffa7a8a97eecaab9ae3c16711c972a0ede9390c8ca9a5228f5a1",
+      "cleaned_sha256": "639efd25a03023e7942f783a28a7fbf29836ae0cd23198d6101b8a1555bc148b",
+      "recovered_il_sha256": "03d787ec5b9c70a3329d33c7a3825a709e840ce3cf6357e0426de8003a62f3ee",
+      "scope": "existing recovered IL; no native lift or execution"
+    }
+  ],
+  "capture_job": "xrqnrg6d7z",
+  "capture_exit_code": 0,
+  "capture_directory": "/data/home/game/pap_autonomous/20261128-v8-batch/resume-20261128-0212/catch-raw-capture",
+  "observed_expressions": 6,
+  "root_cause": {
+    "raw": "ex = (Exception)(object)(enumerator._list = (List<string>)(object)list);",
+    "old_cleanup": "ex = (Exception)(object)(null)(object)list);",
+    "reason": "Non-balanced [^;)]+ consumes only through the first cast parenthesis and emits null), leaving the rest of the expression.",
+    "corrective_action": "Preserve the complete balanced embedded assignment, including its side effect and value; remove the two truncating substitutions and the hard-coded list2 patch."
+  },
+  "recovered_il_cases": [
+    {
+      "method": "EconomyController/<>c__DisplayClass25_0::<DrawDebuggerMenu>b__0()",
+      "token": "06008CDC",
+      "handler_offset": 207,
+      "exception_local": "V_6",
+      "enumerator_local": "V_5",
+      "field_store_offset": 214,
+      "field_type": "List<string>"
+    },
+    {
+      "method": "EconomyController/<>c__DisplayClass25_0::<DrawDebuggerMenu>b__0()",
+      "token": "06008CDC",
+      "handler_offset": 408,
+      "exception_local": "V_10",
+      "enumerator_local": "V_5",
+      "field_store_offset": 415,
+      "field_type": "List<string>"
+    },
+    {
+      "method": "LevelEndScreenView/<SkipToOverfill>d__118::MoveNext()",
+      "token": "06006B70",
+      "handler_offset": 1881,
+      "exception_local": "V_53",
+      "enumerator_local": "V_23",
+      "field_store_offset": 1888,
+      "field_type": "List<object>"
+    },
+    {
+      "method": "AbstractChildServiceController::InstallServices()",
+      "token": "06006050",
+      "handler_offset": 492,
+      "exception_local": "V_22",
+      "enumerator_local": "V_13",
+      "field_store_offset": 499,
+      "field_type": "List<ServicesInstaller>"
+    }
+  ],
+  "limitations": "The dump is Rewind-recovered IL, not original managed IL. It contains Exception-to-List-field stores and therefore an unresolved type/slot-lifetime recovery defect. The syntax repair does not certify native exception behavior or remove those stores."
+}

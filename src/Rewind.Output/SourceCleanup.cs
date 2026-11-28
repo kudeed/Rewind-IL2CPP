@@ -86,15 +86,18 @@ public static partial class Decompiler
         text = Regex.Replace(text, @"(\w+)\._pointer\b", "0");
         // Delete instance constructor calls written as statements (x..ctor(...)).
         text = Regex.Replace(text, @"(?m)^\s*[\w.]+\.\.ctor\([^)]*\);\s*\r?\n?", "", RegexOptions.Multiline);
-        // Enumerator struct field copies: remaining reads become defaults, assignment expressions become null.
+        // Preserve embedded field assignments as complete expressions. The former non-balanced
+        // _list regex stopped at the first cast parenthesis and emitted malformed null)(object)...
+        // fragments in catch handlers. Keep their stores and values; remaining IR type/accessibility
+        // errors are evidence to recover, not a reason to substitute null or discard a side effect.
+        List<(string Marker, string Source)> embeddedListAssignments = ProtectEmbeddedListAssignments(ref text);
+
+        // Enumerator struct field copies: remaining reads become defaults.
         // Standalone assignment statements to enumerator._list are dropped entirely.
         text = Regex.Replace(text, @"(?m)^\s*[\w.]+\._list\s*=.*;\s*\r?\n?", "", RegexOptions.Multiline);
-        // Embedded assignment expressions (inside a cast): drop the field assignment, keep the value expression.
+        // Legacy read cleanup does not see the embedded assignments protected above.
         text = Regex.Replace(text, @"=\s*\w+\._list\b", "= null");
-        text = Regex.Replace(text, @"(\w+)\._list\s*=\s*[^;)]+\)", "null)");
-        text = Regex.Replace(text, @"(\w+)\._list\s*=\s*[^;)]+;", "null;");
         text = Regex.Replace(text, @"(\w+)\._list\b", "0");
-        text = text.Replace("null)(object)list2", "list2");
         text = Regex.Replace(text, @"(\w+)\._dictionary\b", "0");
         text = Regex.Replace(text, @"(\w+)\._getEnumeratorRetType\b", "0");
         // decimal internal field writes: drop them (num stays 0m, still compiles).
@@ -214,6 +217,23 @@ public static partial class Decompiler
         }
 
         // CreateAssetMenu's named arguments are not settable on this Unity version; drop them.
+        text = Regex.Replace(text, @"\[DefaultParameterValue\(null\)\](?=\s*\[In\]\s*ref\s+)", "");
+        text = Regex.Replace(text, @"(?m)(const\s+Ease\s+Ease\s*=\s*)Ease\.", "$1DG.Tweening.Ease.");
+
+        // Preserve original preprocessor symbols while moving top-level #define/#undef before the first token.
+        string[] sourceLines = text.Split('\n');
+        var definitions = new List<string>();
+        var remaining = new List<string>();
+        bool conditionalSeen = false;
+        foreach (string sourceLine in sourceLines)
+        {
+            if (Regex.IsMatch(sourceLine, @"^\s*#(?:if|elif|else|endif)\b")) conditionalSeen = true;
+            if (!conditionalSeen && Regex.IsMatch(sourceLine, @"^[ \t]*#(?:define|undef)[ \t]+[A-Za-z_]\w*[ \t]*$"))
+                definitions.Add(sourceLine);
+            else
+                remaining.Add(sourceLine);
+        }
+        if (definitions.Count != 0) text = string.Join("\n", definitions.Concat(remaining));
         text = Regex.Replace(text, @"\[CreateAssetMenu\([^\]]*\)\]", "[CreateAssetMenu]");
 
         // Burst postfix delegates are nested in their owner class, not the namespace.
@@ -223,9 +243,26 @@ public static partial class Decompiler
         text = text.Replace("public Locale GetStartupLocale(ILocalesProvider availableLocales)",
             "public UnityEngine.Localization.Locale GetStartupLocale(UnityEngine.Localization.Settings.ILocalesProvider availableLocales)");
 
-        // Private members of the recovered classes are accessed across classes (inlined accessors); make them internal.
-        // The indent is a run of tabs or spaces so nested members are widened too, not only top-level ones.
+        // Inlined accessors can reference a private member from another emitted type. Widen those recovered
+        // declarations to internal so the source graph compiles within the game assembly. This is a source-only
+        // accessibility repair; it does not alter method bodies or runtime behavior.
         text = Regex.Replace(text, @"(?m)^([ \t]*)private ", "$1internal ");
+
+        // A protected nested type exposed by an internal member must be protected-internal:
+        // preserve derived-class access while allowing the inlined same-assembly call sites.
+        foreach (string nestedType in new[] { "ColorElement", "ExclusiveAnimation", "TrailRoundingOptions", "LevelEndState", "IntroEntry", "CardStyleContext" })
+            text = Regex.Replace(text,
+                @"(?m)^([ \t]*)protected (class|struct|enum) " + Regex.Escape(nestedType) + @"\b",
+                "$1protected internal $2 " + nestedType);
+
+        // Do not infer member hiding from a name anywhere in a declaration. The former broad
+        // rule also added new to constructors and unrelated members whose TYPE matched that name.
+        // Preserve emitted modifiers; genuine hiding diagnostics need the declaring/base type pair.
+
+        // The old IronSource adapter is optional ad SDK implementation, not gameplay logic.
+        // Keep its source for explicit opt-in builds, but exclude it from the default game assembly.
+        if (text.Contains("class IronSourceMediationAdapter", StringComparison.Ordinal))
+            text = "#if PAP_ENABLE_AD_SDK\n" + text + "\n#endif\n";
 
         // MovingObstacle is a protected nested type but is referenced by internal static fields; widen it.
         text = Regex.Replace(text, @"protected ([^;\n]*MovingObstacle[^;\n]*)", "internal $1");
@@ -246,6 +283,8 @@ public static partial class Decompiler
         // The optional "System." prefix is consumed: leaving it would spell "System.int[]".
         text = Regex.Replace(text, @"\b(?:System\.)?ReadOnlySpan<(\w+)>\b", "$1[]");
         text = Regex.Replace(text, @"\b(?:System\.)?Span<(\w+)>\b", "$1[]");
+
+        RestoreSerializableSystemTypeOperators(ref text);
 
         // Unity's Int32Enum is not a real type; use int.
         text = Regex.Replace(text, @"\bSystem\.Int32Enum\b", "int");
@@ -322,6 +361,216 @@ public static partial class Decompiler
         // Opaque placeholders for __frame/__rgctx used as LHS of assignment collapsed to 0; drop those lines.
         text = Regex.Replace(text, @"(?m)^\s*0\s*=\s*\(nint\)__Rewind\.Opaque[^\n]*;\s*\r?\n?", "", RegexOptions.Multiline);
 
+        // The C# decompiler already reconstructs this lambda in GetVersion. Its orphaned closure
+        // cache/method reference an anonymous type that the compiler itself will regenerate.
+        if (text.Contains("_f__AnonymousType1<int, int>", StringComparison.Ordinal)
+            && Count(text, "_f__AnonymousType1<int, int>") == 2
+            && Count(text, "_9__23_2") == 1
+            && Count(text, "GetVersion_b__23_2") == 1)
+        {
+            text = Regex.Replace(text,
+                @"(?m)^[ \t]*public static Func<_f__AnonymousType1<int, int>, int> _9__23_2;\r?\n", "");
+            RemoveMethodBlock(ref text, "internal int GetVersion_b__23_2(_f__AnonymousType1<int, int> x)");
+        }
+
+        // The retained equality compares SystemType values. Equal wrappers must have equal hashes.
+        // This source compatibility member was not retained as a native method in the metadata.
+        if (text.Contains("class SerializableSystemType", StringComparison.Ordinal)
+            && text.Contains("operator ==(SerializableSystemType a, SerializableSystemType b)", StringComparison.Ordinal))
+        {
+            if (!text.Contains("override int GetHashCode()", StringComparison.Ordinal))
+            {
+                int close = text.LastIndexOf('}');
+                if (close >= 0)
+                    text = text.Insert(close, "\n\tpublic override int GetHashCode()\n\t{\n\t\treturn SystemType?.GetHashCode() ?? 0;\n\t}\n");
+            }
+        }
+
+        // Obsolete is an editor/deprecation annotation only; the legacy ObjectMagnet pole is still
+        // referenced by serialized game data and should not generate compile warnings.
+        if (text.Contains("class ObjectMagnetAttractionPole", StringComparison.Ordinal))
+            text = Regex.Replace(text, @"(?m)^([ \t]*)\[Obsolete\]\r?\n(?=[ \t]*public class ObjectMagnetAttractionPole)", "");
+
+        // These compiler-generated event fields do not hide inherited members in the recovered hierarchy.
+        foreach (string field in new[] { "m_EnteredZone", "m_ExitedZone", "m_TrailColliderPointAdded", "m_PercentUpdated", "m_ReviveRequested", "m_LoopClosed", "m_StateUpdated" })
+            text = Regex.Replace(text, @"(?m)^([ \t]*(?:private|internal)\s+)new[ \t]+([^;\n]*\b" + Regex.Escape(field) + @"\s*;)", "$1$2");
+
+        // The local field intentionally shadows Component.camera; make that intent explicit.
+        if (text.Contains("class WorldCameraController", StringComparison.Ordinal))
+            text = Regex.Replace(text, @"(?m)^([ \t]*(?:private|internal)\s+)(Camera\s+camera\s*;)", "$1new $2");
+
+        // No ad SDK is shipped in the gameplay-only build. Keep both the app pause/resume logic
+        // and the original optional ad hooks; guard SDK-dependent code instead of deleting it.
+        if (text.Contains("class GameAbandonmentController", StringComparison.Ordinal))
+            GuardOptionalIronSourceAbandonmentHooks(ref text);
+
+        foreach (var (marker, source) in embeddedListAssignments)
+            text = text.Replace(marker, source, StringComparison.Ordinal);
+    }
+
+    private static List<(string Marker, string Source)> ProtectEmbeddedListAssignments(ref string text)
+    {
+        var saved = new List<(string, string)>();
+        var assignment = new Regex(@"\G\([ \t]*[A-Za-z_]\w*\._list[ \t]*=(?!=)");
+        for (int i = 0; i < text.Length; i++)
+        {
+            if (SkipCleanupQuotedOrComment(text, ref i)) continue;
+            if (text[i] != '(' || !assignment.Match(text, i).Success) continue;
+            int depth = 0, close = -1;
+            for (int j = i; j < text.Length; j++)
+            {
+                if (SkipCleanupQuotedOrComment(text, ref j)) continue;
+                if (text[j] == '(') depth++;
+                else if (text[j] == ')' && --depth == 0) { close = j; break; }
+            }
+            if (close < 0) continue;
+            string marker = "__RewindPreservedListAssignment" + saved.Count + "_End";
+            while (text.Contains(marker, StringComparison.Ordinal)) marker += "_";
+            saved.Add((marker, text[i..(close + 1)]));
+            text = text[..i] + marker + text[(close + 1)..];
+            i += marker.Length - 1;
+        }
+        return saved;
+    }
+
+    private static bool SkipCleanupQuotedOrComment(string text, ref int position)
+    {
+        int i = position;
+        if (text[i] == '/' && i + 1 < text.Length && text[i + 1] == '/')
+        {
+            while (i + 1 < text.Length && text[i + 1] != '\n') i++;
+            position = i;
+            return true;
+        }
+        if (text[i] == '/' && i + 1 < text.Length && text[i + 1] == '*')
+        {
+            int end = text.IndexOf("*/", i + 2, StringComparison.Ordinal);
+            position = end < 0 ? text.Length - 1 : end + 1;
+            return true;
+        }
+        bool verbatim = text[i] == '@' && i + 1 < text.Length && text[i + 1] == '"';
+        if (verbatim) i++;
+        if (text[i] != '"' && text[i] != '\'') return false;
+        char quote = text[i];
+        for (i++; i < text.Length; i++)
+        {
+            if (!verbatim && text[i] == '\\') { i++; continue; }
+            if (text[i] != quote) continue;
+            if (verbatim && i + 1 < text.Length && text[i + 1] == '"') { i++; continue; }
+            position = i;
+            return true;
+        }
+        position = text.Length - 1;
+        return true;
+    }
+
+    private static int Count(string text, string value)
+    {
+        int count = 0, index = 0;
+        while ((index = text.IndexOf(value, index, StringComparison.Ordinal)) >= 0) { count++; index += value.Length; }
+        return count;
+    }
+
+    private static void RestoreSerializableSystemTypeOperators(ref string text)
+    {
+        const string className = "class SerializableSystemType";
+        const string equality = "public static bool operator ==(SerializableSystemType a, SerializableSystemType b)";
+        const string inequality = "public static bool operator !=(SerializableSystemType a, SerializableSystemType b)";
+        int owner = text.IndexOf(className, StringComparison.Ordinal);
+        if (owner < 0 || !TryCleanupMethodBody(text, equality, out int open, out int close)) return;
+
+        // PAP token 0x06000987, RVA 0x3E3EEC8: CMP references; return true if identical;
+        // CBZ each operand; otherwise tail-call Equals(T) at 0x3E3EE7C. See the regression evidence.
+        // Only repair the exact recovered shape (or this repair's output), not an unknown body.
+        const string recovered = "if(a!=b){if(a!=null){if(b!=null){returna.Equals(b);}returnfalse;}returnfalse;}returntrue;";
+        const string repaired = "if(object.ReferenceEquals(a,b))returntrue;if(object.ReferenceEquals(a,null)||object.ReferenceEquals(b,null))returnfalse;returna.Equals(b);";
+        string body = Regex.Replace(text[(open + 1)..close], @"\s+", "");
+        if (body != recovered && body != repaired) return;
+        bool hasInequality = TryCleanupMethodBody(text, inequality, out int neOpen, out int neClose);
+        if (hasInequality)
+        {
+            string neBody = Regex.Replace(text[(neOpen + 1)..neClose], @"\s+", "");
+            if (neBody != "return!object.ReferenceEquals(a,b);" && neBody != "return!(a==b);") return;
+        }
+
+        // Explicit reference checks cannot bind to the paired operator and recurse.
+        string equalityBody = "\n\t\tif (object.ReferenceEquals(a, b)) return true;\n"
+            + "\t\tif (object.ReferenceEquals(a, null) || object.ReferenceEquals(b, null)) return false;\n"
+            + "\t\treturn a.Equals(b);\n\t";
+        text = text[..(open + 1)] + equalityBody + text[close..];
+        if (hasInequality)
+        {
+            TryCleanupMethodBody(text, inequality, out neOpen, out neClose);
+            text = text[..(neOpen + 1)] + "\n\t\treturn !(a == b);\n\t" + text[neClose..];
+        }
+        else
+        {
+            int classOpen = text.IndexOf('{', owner + className.Length);
+            int classClose = classOpen < 0 ? -1 : MatchingBrace(text, classOpen);
+            if (classClose < 0) return;
+            // No op_Inequality is retained in this type's IL2CPP metadata. This is the required
+            // C# paired operator, defined as the complement of the evidenced equality operation.
+            text = text.Insert(classClose,
+                "\n\t// Source compatibility: C# requires the complement of the retained equality operator.\n\t"
+                + inequality + "\n\t{\n\t\treturn !(a == b);\n\t}\n");
+        }
+    }
+
+    private static bool TryCleanupMethodBody(string text, string signature, out int open, out int close)
+    {
+        int start = text.IndexOf(signature, StringComparison.Ordinal);
+        open = start < 0 ? -1 : text.IndexOf('{', start + signature.Length);
+        close = open < 0 ? -1 : MatchingBrace(text, open);
+        return close >= 0;
+    }
+
+    private static void GuardOptionalIronSourceAbandonmentHooks(ref string text)
+    {
+        const string guard = "#if PAP_ENABLE_AD_SDK\n";
+        // Match the actual delegate/event pair and preserve its variable name and +=/-= direction.
+        MatchCollection hooks = Regex.Matches(text,
+            @"(?m)^(?<indent>[ \t]*)Action<IronSourceAdInfo> (?<local>\w+) = OnAdLeftApplicationEvent;\r?\n"
+            + @"[ \t]*IronSourceBannerEvents\.onAdLeftApplicationEvent [+-]= \k<local>;\r?\n");
+        for (int i = hooks.Count - 1; i >= 0; i--)
+        {
+            Match hook = hooks[i];
+            if (text[..hook.Index].EndsWith(guard, StringComparison.Ordinal)) continue;
+            string replacement = hook.Groups["indent"].Value
+                + "// Optional ad SDK hook: banner application-leave subscription retained for opt-in builds.\n"
+                + guard + hook.Value + "#endif\n";
+            text = text[..hook.Index] + replacement + text[(hook.Index + hook.Length)..];
+        }
+
+        // Accessibility widening above may already have changed private to internal.
+        Match method = Regex.Match(text,
+            @"(?m)^(?<indent>[ \t]*)(?:private|internal) void OnAdLeftApplicationEvent\(IronSourceAdInfo _\)");
+        if (!method.Success || text[..method.Index].EndsWith(guard, StringComparison.Ordinal)) return;
+        int open = text.IndexOf('{', method.Index + method.Length);
+        int close = open < 0 ? -1 : MatchingBrace(text, open);
+        if (close < 0) return;
+        int end = close + 1;
+        if (end < text.Length && text[end] == '\r') end++;
+        if (end < text.Length && text[end] == '\n') end++;
+        string callback = method.Groups["indent"].Value
+            + "// Optional ad SDK callback: preserve original banner/pause-state updates when enabled.\n"
+            + guard + text[method.Index..end] + "#endif\n";
+        text = text[..method.Index] + callback + text[end..];
+    }
+
+    private static void RemoveMethodBlock(ref string text, string signature)
+    {
+        int start = text.IndexOf(signature, StringComparison.Ordinal);
+        if (start < 0) return;
+        int open = text.IndexOf('{', start + signature.Length);
+        if (open < 0) return;
+        int close = MatchingBrace(text, open);
+        if (close < 0) return;
+        int lineStart = text.LastIndexOf('\n', start);
+        lineStart = lineStart < 0 ? 0 : lineStart + 1;
+        int end = close + 1;
+        if (end < text.Length && text[end] == '\r') end++;
+        if (end < text.Length && text[end] == '\n') end++;
+        text = text.Remove(lineStart, end - lineStart);
     }
 
     /// <summary>
@@ -379,4 +628,3 @@ public static partial class Decompiler
         return -1;
     }
 }
-

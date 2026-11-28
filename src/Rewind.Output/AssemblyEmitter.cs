@@ -1,4 +1,5 @@
 // Modified by xob0t (2026): one AssemblyRef per assembly.
+using System.Buffers.Binary;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 using Rewind.Model;
@@ -120,7 +121,19 @@ public sealed class AssemblyEmitter
             {
                 if (reference == asm) continue;
                 AssemblyNameDefinition rebuilt = _assemblies[reference].Name;
-                module.AssemblyReferences.Add(new AssemblyNameReference(rebuilt.Name, rebuilt.Version) { Culture = rebuilt.Culture });
+                var assemblyReference = new AssemblyNameReference(rebuilt.Name, rebuilt.Version) { Culture = rebuilt.Culture };
+                // IL2CPP metadata retains the original public-key token even though the rebuilt assembly itself
+                // is unsigned. Preserve that identity for strong-named framework/SDK dependencies: consumers
+                // compile against the real Unity/framework reference assemblies, not our metadata-only rebuilds.
+                // The resolver above intentionally resolves by simple name while emitting IL, so internal source
+                // reconstruction still finds the rebuilt type graph.
+                if (reference.PublicKeyToken != 0)
+                {
+                    byte[] token = new byte[sizeof(ulong)];
+                    BinaryPrimitives.WriteUInt64LittleEndian(token, reference.PublicKeyToken);
+                    assemblyReference.PublicKeyToken = token;
+                }
+                module.AssemblyReferences.Add(assemblyReference);
             }
         }
     }

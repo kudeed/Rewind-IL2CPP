@@ -1,0 +1,83 @@
+{
+  "format": 1,
+  "target": "PAP Assembly-CSharp / SerializableSystemType",
+  "type_token": "0x02000128",
+  "equality_method_token": "0x06000987",
+  "rva": "0x3E3EEC8",
+  "file_offset": "0x3E3AEC8",
+  "size": 40,
+  "native_slice_hex": "1f0001ebe0000054e80300aae0031f2aa80000b4810000b4e00308aae6ffff1720008052c0035fd6",
+  "native_slice_sha256": "e419cb009048f44142282190456e398b9c56cca4dde5602fe2800dc2ae38d0c2",
+  "elf_path": "/data/home/game/pap_analysis/inputs/split_config.arm64_v8a/lib/arm64-v8a/libil2cpp.so",
+  "elf_sha256_from_existing_index": "cf0fe59687988793400852978382bef8626a29326f53d2ccedb16b4db79a2bec",
+  "full_elf_hash_recheck": "not completed in this pass; 30-second read-only command timed out",
+  "metadata_index": "/data/home/game/pap_autonomous/20261128-v8-batch/native_methods.json.gz",
+  "dump_sha256_from_index": "a21e6cbbb88b435667a97a0c0b24e086ac6e11f980a800b7368774157307142c",
+  "decoder": "Manual ARM64 decoding of the exact 10 words, cross-checked immediate target arithmetic",
+  "instructions": [
+    {
+      "address": "0x3e3eec8",
+      "word_le": "eb01001f",
+      "decoded": "cmp x0, x1",
+      "meaning": null
+    },
+    {
+      "address": "0x3e3eecc",
+      "word_le": "540000e0",
+      "decoded": "b.eq 0x3e3eee8",
+      "meaning": "same reference -> true"
+    },
+    {
+      "address": "0x3e3eed0",
+      "word_le": "aa0003e8",
+      "decoded": "mov x8, x0",
+      "meaning": null
+    },
+    {
+      "address": "0x3e3eed4",
+      "word_le": "2a1f03e0",
+      "decoded": "mov w0, wzr",
+      "meaning": "default return false"
+    },
+    {
+      "address": "0x3e3eed8",
+      "word_le": "b40000a8",
+      "decoded": "cbz x8, 0x3e3eeec",
+      "meaning": "a null -> return false"
+    },
+    {
+      "address": "0x3e3eedc",
+      "word_le": "b4000081",
+      "decoded": "cbz x1, 0x3e3eeec",
+      "meaning": "b null -> return false"
+    },
+    {
+      "address": "0x3e3eee0",
+      "word_le": "aa0803e0",
+      "decoded": "mov x0, x8",
+      "meaning": null
+    },
+    {
+      "address": "0x3e3eee4",
+      "word_le": "17ffffe6",
+      "decoded": "b 0x3e3ee7c",
+      "meaning": "tail-call Equals(SerializableSystemType)"
+    },
+    {
+      "address": "0x3e3eee8",
+      "word_le": "52800020",
+      "decoded": "mov w0, #1",
+      "meaning": "return true"
+    },
+    {
+      "address": "0x3e3eeec",
+      "word_le": "d65f03c0",
+      "decoded": "ret",
+      "meaning": null
+    }
+  ],
+  "op_inequality_in_retained_type_metadata": false,
+  "gethashcode_in_retained_type_metadata": false,
+  "scope": "Static equality branch and tail-call evidence; does not claim native execution or recovery of absent operators",
+  "compatibility_decision": "Spell native reference checks with object.ReferenceEquals; supply C# required != as complement of evidenced ==; leave unknown equality bodies unchanged."
+}

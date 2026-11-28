@@ -1,0 +1,54 @@
+using System;
+
+// Original C#9 recovered class, with only Unity imports/SerializeField omitted for the compiler fixture.
+public class SerializableSystemType
+{
+	internal Type m_SystemType;
+	internal string m_AssemblyQualifiedName;
+	public Type SystemType
+	{
+		get
+		{
+			if (m_SystemType == null) SetSystemType();
+			return m_SystemType;
+		}
+	}
+	internal void SetSystemType()
+	{
+		if (!string.IsNullOrEmpty(m_AssemblyQualifiedName))
+			m_SystemType = Type.GetType(m_AssemblyQualifiedName);
+	}
+	public SerializableSystemType(Type _SystemType)
+	{
+		m_SystemType = _SystemType;
+		m_AssemblyQualifiedName = _SystemType.AssemblyQualifiedName;
+	}
+	public override bool Equals(object obj)
+	{
+		if (obj == null || !(obj is SerializableSystemType) || !(obj is SerializableSystemType))
+			return false;
+		return Equals((SerializableSystemType)obj);
+	}
+	public bool Equals(SerializableSystemType _Object)
+	{
+		Type systemType = _Object.SystemType;
+		Type systemType2 = SystemType;
+		return systemType.Equals(systemType2);
+	}
+	public static bool operator ==(SerializableSystemType a, SerializableSystemType b)
+	{
+		if (a != b)
+		{
+			if (a != null)
+			{
+				if (b != null)
+				{
+					return a.Equals(b);
+				}
+				return false;
+			}
+			return false;
+		}
+		return true;
+	}
+}
