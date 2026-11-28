@@ -170,6 +170,13 @@ public sealed partial class HirBuilder
         // Ordinary typed receivers, wrapper objects and independently checked casts keep the existing policy.
         if (actual != null && (IsAssignable(actual, expected) || IsReferenceWrapper(actual))) return false;
         if (old != null && CheckedClassHere(old) is { } checkedType && IsAssignable(checkedType, expected)) return false;
+        // A successful type-test fact is distinct from a throwing cast guard. Keep the real object
+        // when that fact dominates this exact call, even if its stored expression is still base-typed.
+        if (old != null && ReferenceEquals(_node, call) && _block != null && ReferenceEquals(call.Block, _block) &&
+            _position.TryGetValue(call, out int at) && (uint)at < (uint)_block.Nodes.Count &&
+            ReferenceEquals(_block.Nodes[at], call) &&
+            TestedType(old) is { Definition: { IsInterface: false, IsValueType: false } } tested &&
+            UnusedReceiverProof.ClosedSignature(tested) && IsAssignable(tested, expected)) return false;
         if (actual == null && old is not null && old.Op != Op.Undef && !old.IsConstValue(0)) return false;
 
         bool unused = NativeReceiverUnused(method, abi);

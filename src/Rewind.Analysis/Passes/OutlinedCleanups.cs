@@ -320,7 +320,7 @@ public static class OutlinedCleanups
                         return false;
                     }
                 }
-                else if (frameValue && n.Op is not (Op.Add or Op.Load))
+                else if (frameValue && n.Op is not (Op.Add or Op.Load) && !ProvedBooleanResult(n, program, sp, frame))
                 {
                     reason = $"cleanup frame address has an unsupported use at 0x{n.Addr:X}";
                     return false;
@@ -332,6 +332,20 @@ public static class OutlinedCleanups
         }
         reason = null;
         return true;
+    }
+
+    private static bool ProvedBooleanResult(Node projection, ProgramAnalysis program, Node sp, int frame)
+    {
+        // A projection's input is the call handle, whose arguments can contain a disjoint stack receiver.
+        // That does not make a known Boolean result an address. Keep this exception narrower than the
+        // machine Integer return class, which also includes references, pointers and native integers.
+        // The A64 lifter represents the ordinary x0 result as I64 even when the managed value is one byte.
+        if (projection.Op != Op.Proj || projection.Type != VT.I64 || projection.Imm != CallResult.IntReturn ||
+            projection.In.Length != 1 || projection.In[0] is not { Op: Op.Call } call ||
+            call.Aux is not CallInfo { NoReturn: false } || !CallDisjointFromFrame(call, program, sp, frame)) return false;
+        MethodAbi? abi = BoundAbi(program, call);
+        return abi is { Known: true, Return: ReturnKind.Integer, ReturnSize: 1, ReturnCount: 1, ReturnIsDouble: false } &&
+            abi.ReturnType is PrimitiveSig { Element: Il2CppTypeEnum.Boolean } && abi.ReturnBuffer == null;
     }
 
     private static bool CarriesStackAddress(Node value, Node sp, HashSet<Node> seen)

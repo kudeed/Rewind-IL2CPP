@@ -31,7 +31,7 @@ internal static class Program
             if (key == "--group") selected.UnionWith(value.Split(',', StringSplitOptions.RemoveEmptyEntries));
             else if (key == "--report") report = value;
             else if (key == "--journal") journal = value;
-            else throw new ArgumentException("--group shape,identity,frame,eh,order --report file --journal jsonl");
+            else throw new ArgumentException("--group shape,identity,frame,eh,order,boolean-projection-delta --report file --journal jsonl");
         }
         journal ??= report == null ? null : report + ".groups.jsonl";
         string analysisHash = Hash(typeof(OutlinedCleanup).Assembly.Location), coreHash = Hash(typeof(Il2CppModel).Assembly.Location);
@@ -49,7 +49,8 @@ internal static class Program
             }
         var groups = new (string Id, Action Run)[]
         {
-            ("shape", Shape), ("identity", Identity), ("frame", Frame), ("eh", Exceptions), ("order", Order)
+            ("shape", Shape), ("identity", Identity), ("frame", Frame), ("eh", Exceptions), ("order", Order),
+            ("boolean-projection-delta", BooleanProjectionDelta)
         };
         if (selected.Except(groups.Select(g => g.Id)).Any()) throw new ArgumentException("Unknown group");
         var results = new List<object>();
@@ -389,6 +390,55 @@ internal static class Program
             Node result = f.Add(f.Join, Op.Proj, VT.I64, f.CleanupCall); result.Imm = CallResult.IntReturn;
             f.Join.Nodes.Remove(result); f.Join.Nodes.Insert(1, result); f.Join.Nodes[^1].In = [result];
         }, "A live native result is never silently deleted");
+    }
+
+    private static void BooleanProjectionDelta()
+    {
+        // Unlike the original fixtures, this consumes MoveNext's real x0 projection in a loop branch.
+        // The old guard recursed through the call handle into its disjoint stack receiver and rejected it.
+        static (Node Call, Node Projection, Node Branch) Consume(Fixture f, int slot = CallResult.IntReturn, VT width = VT.I64)
+        {
+            Node call = f.Body.Nodes.Single(n => n.Op == Op.Call);
+            f.Body.Nodes.RemoveAll(n => n.IsTerminator);
+            Node result = f.Add(f.Body, Op.Proj, width, call); result.Imm = slot; result.Addr = call.Addr;
+            Node narrow = width == VT.I64 ? f.Add(f.Body, Op.Trunc, VT.I32, result) : result;
+            Node bit = f.Add(f.Body, Op.And, VT.I32, narrow, f.Const(1, VT.I32));
+            Node finished = f.Add(f.Body, Op.CmpEq, VT.I1, bit, f.Const(0, VT.I32));
+            Node branch = f.Add(f.Body, Op.Branch, VT.None, finished); branch.Addr = Fixture.Caller + 0x54;
+            var repeat = new Block { Id = f.Fn.Blocks.Count, Start = Fixture.Caller + 0x58, End = Fixture.Caller + 0x5C, Scope = 0 };
+            f.Fn.Blocks.Add(repeat); Fixture.Edge(f.Body, repeat); Fixture.Edge(repeat, f.Body); f.Add(repeat, Op.Jump, VT.None);
+            return (call, result, branch);
+        }
+
+        var positive = new Fixture();
+        var used = Consume(positive);
+        Check(positive.Run() && !positive.OriginalCall, "A live Boolean projection of the proved disjoint receiver call permits cleanup expansion");
+        Check(!used.Projection.Dead && ReferenceEquals(used.Branch.In[0].In[0].In[0].In[0], used.Projection) &&
+            used.Branch.Op == Op.Branch && used.Branch.Block!.Succs.Count == 2,
+            "The projection remains consumed by Trunc, bit test and the original two-way loop branch");
+        Check(used.Call.Aux is CallInfo { Target: Fixture.MoveTarget } && used.Projection.Imm == CallResult.IntReturn &&
+            ReferenceEquals(used.Projection.In.Single(), used.Call), "The original managed call and ordinary return projection are retained");
+
+        void Reject(Action<Fixture, Node, Node> alter, string why, int slot = CallResult.IntReturn, VT width = VT.I64)
+        {
+            var f = new Fixture(); var item = Consume(f, slot, width); alter(f, item.Call, item.Projection);
+            Check(!f.Run() && f.OriginalCall && f.Fn.Problems.Any(p => p.Contains("left native") && p.Contains("0x3050")), why);
+        }
+        Reject((f, _, _) => f.MoveNext.ReturnType = f.Sigs.Pointer(f.Sigs.Primitive(Il2CppTypeEnum.I4)),
+            "A pointer return remains an unproved address even with the same disjoint receiver");
+        Reject((f, _, _) => f.MoveNext.ReturnType = f.Sigs.ByRef(f.Sigs.Primitive(Il2CppTypeEnum.I4)),
+            "A byref return is not treated as a Boolean projection");
+        Reject((f, _, _) => f.MoveNext.ReturnType = f.Sigs.Primitive(Il2CppTypeEnum.I),
+            "A native integer return is not assumed to be an address-free scalar");
+        Reject((_, call, _) => ((CallInfo)call.Aux!).Target = 0x2500,
+            "An unknown callee cannot acquire the Boolean exception from its consumed projection");
+        Reject((_, _, _) => { }, "A second integer return slot is not the declared Boolean return", slot: CallResult.IntReturn2);
+        Reject((_, _, _) => { }, "An I32 projection is not the A64 ordinary x0 result representation", width: VT.I32);
+        Reject((f, call, _) =>
+        {
+            Node overlapping = f.Address(f.Body, Fixture.FrameOffset - 8);
+            f.Body.Nodes.Remove(overlapping); f.Body.Nodes.Insert(f.Body.Nodes.IndexOf(call), overlapping); call.In[0] = overlapping;
+        }, "A receiver starting outside the frame but extending into it still blocks the Boolean projection");
     }
 
     private static void Exceptions()
