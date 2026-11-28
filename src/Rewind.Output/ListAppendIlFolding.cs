@@ -50,8 +50,9 @@ internal static class ListAppendIlFolding
 
     internal static int Run(MethodBody body)
     {
-        // A conservative subset. In particular no motion across EH regions.
-        if (body.HasExceptionHandlers || !body.Instructions.Any(Candidate)) return 0;
+        // Complete diamonds inside a protected region are permitted only
+        // after proving every instruction and continuation share its scope.
+        if (!body.Instructions.Any(Candidate)) return 0;
         var original = body.Instructions.Select(i => (i, i.OpCode, i.Operand)).ToArray();
         body.SimplifyMacros();
         int count = 0;
@@ -153,7 +154,23 @@ internal static class ListAppendIlFolding
             resize.ReturnType.MetadataType != MetadataType.Void || resize.Parameters.Count != 1 ||
             !ElementParameter(resize.Parameters[0].ParameterType, gt) ||
             Resolve(resize) is not { IsPrivate: true, IsStatic: false } slowMethod ||
-            slowMethod.DeclaringType != def || a[f + 4] != join) return false;
+            slowMethod.DeclaringType != def) return false;
+
+        // The emitter can lay out the slow arm as a fall-through or as
+        // a separate basic block ending in a branch to the SAME join.
+        // Do not consume arbitrary trailing computations or a leave.
+        var slowTail = new System.Collections.Generic.List<Instruction>();
+        if (a[f + 4] != join)
+        {
+            int end = f + 4;
+            if (a[end].OpCode.Code == Code.Nop)
+            {
+                slowTail.Add(a[end++]);
+                if (end >= a.Length) return false;
+            }
+            if (a[end].OpCode.Code != Code.Br || a[end].Operand != join) return false;
+            slowTail.Add(a[end]);
+        }
         var add = def.Methods.Where(m => m.Name == "Add" && m.IsPublic && !m.IsStatic &&
             !m.HasGenericParameters && m.ReturnType.MetadataType == MetadataType.Void &&
             m.Parameters.Count == 1 && ElementParameter(m.Parameters[0].ParameterType, gt)).ToArray();
@@ -163,8 +180,24 @@ internal static class ListAppendIlFolding
         addRef.Parameters.Add(new ParameterDefinition(resize.Parameters[0].ParameterType));
         if (Resolve(addRef) != add[0]) return false;
 
-        var region = physical.Concat(fb).ToHashSet();
-        if (region.Count != Shape.Length + scheduled + 4 || region.Contains(join) || !ix.ContainsKey(join) || region.Contains(a[0]) && a[0] != b[0]) return false;
+        var region = physical.Concat(fb).Concat(slowTail).ToHashSet();
+        if (region.Count != Shape.Length + scheduled + 4 + slowTail.Count || region.Contains(join) || !ix.ContainsKey(join) || region.Contains(a[0]) && a[0] != b[0]) return false;
+        // No exception-region boundary may be moved or erased. Compare
+        // each region's complete try/handler/filter membership against
+        // the original entry, including the common continuation.
+        foreach (var h in body.ExceptionHandlers)
+        {
+            var boundaries = new[] { h.TryStart,h.TryEnd,h.HandlerStart,h.HandlerEnd,h.FilterStart };
+            if (boundaries.Any(t=>t!=null&&region.Contains(t))) return false;
+            bool Inside(Instruction i, Instruction? start, Instruction? end) =>
+                start != null && ix[i]>=ix[start] && (end==null || ix[i]<ix[end]);
+            int Scope(Instruction i) =>
+                (Inside(i,h.TryStart,h.TryEnd)?1:0) |
+                (Inside(i,h.HandlerStart,h.HandlerEnd)?2:0) |
+                (Inside(i,h.FilterStart,h.HandlerStart)?4:0);
+            int expected = Scope(b[0]);
+            if ((expected & 4)!=0 || region.Any(i=>Scope(i)!=expected) || Scope(join)!=expected) return false;
+        }
         // Do not admit implicit entry to the slow arm by fall-through
         // from an unrelated instruction, or an outside jump into either arm.
         if (f == 0 || (a[f - 1].OpCode.FlowControl is not (FlowControl.Branch or FlowControl.Return or FlowControl.Throw))) return false;
