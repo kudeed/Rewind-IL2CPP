@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): virtual calls through merged class pointers, gaps always marked, small structs as numbers, floating-point negation, bits read as float/double, merged struct returns, long stack slots that held a reference and a number, struct addresses typed as their target, merged statics pointers, objects copied into a merge before their constructor runs.
 using Rewind.Analysis.Abi;
 using Rewind.Analysis.Hir;
 using Rewind.Analysis.Ir;
@@ -388,6 +389,9 @@ public sealed partial class HirBuilder
         var spans = new List<(int Start, int End, HVar Variable)>();
         foreach (var ((offset, _), variable) in _frameVars)
         {
+            // Planning can inspect a raw slice that is later replaced by a
+            // whole-field copy. Only surviving locals describe emitted memory.
+            if (!_h.Locals.Contains(variable)) continue;
             int size = Math.Max(1, _p.Layouts.SizeOf(variable.Type).Size);
             spans.Add((offset, offset + size, variable));
         }
@@ -880,6 +884,7 @@ public sealed partial class HirBuilder
     public HMethod Build()
     {
         foreach (string p in _fn.Problems) Problem("lift: " + p);
+        _h.Notes.AddRange(_l.Normalization.ReceiverNotes);
         // Code that only runs when an exception is caught is not part of the function's ordinary flow; unless the
         // lifter rebuilt the try regions (or said why not), what was recovered is the no-exception path only.
         if (_p.ExceptionInfo(_fn.Address) is { TryBlocks.Count: > 0 } regions && _fn.TryRegions.Count == 0 &&
@@ -922,6 +927,7 @@ public sealed partial class HirBuilder
         PlanAddressSpills();
         PlanSameAddressPhis();
         PlanCaughtSlots();
+        FindForwardedCopies();
         FindPieceCopies();
         FindPieceFills();
         foreach (Block b in cfg.ReversePostOrder) DeclarePhis(b);
@@ -936,10 +942,10 @@ public sealed partial class HirBuilder
         RefineFrameTypes();
         foreach (PendingCopy copy in _pendingCopies) Problem($"only part of a {copy.Type.ShortName} was copied");
         DeclareStackBuffers();
-        CheckFrameVariables();
         CheckStructAssignments();
         foreach (var (offset, type) in _frameTypes) _h.FrameTypes[offset] = type;
         HirCleanup.Run(_h);
+        CheckFrameVariables();
         if (HirCleanup.CheckTryRegions(_h) is { } broken) Problem("exception handling not reconstructed: " + broken);
         return _h;
     }
@@ -1090,7 +1096,7 @@ public sealed partial class HirBuilder
                         HExpr structArg = ((SVal)sem).Expr;
                         if (FieldPlace(structArg, p.Type!, part, size) is PLocation field) _sem[slot] = new SVal(field.Location);
                         else if (size == 8 && part % 8 == 0 && StructLeaves(structArg, p.Type!, part, Math.Min(8, structSize - part)) is { } leaves)
-                            _sem[slot] = new SParts(leaves, 8);
+                            _sem[slot] = StructWord(leaves, 8);
                         else _sem[slot] = SJunk.Instance;
                         continue;
                     }
@@ -1299,9 +1305,6 @@ public sealed partial class HirBuilder
         HConv c => c.Kind < HConvKind.OvfI1 && IsPure(c.Operand),
         HSelect s => IsPure(s.Condition) && IsPure(s.WhenTrue) && IsPure(s.WhenFalse),
         HTypeExpr t => t.Op is HTypeOp.IsInst or HTypeOp.Default or HTypeOp.SizeOf or HTypeOp.TypeToken && (t.Operand == null || IsPure(t.Operand)),
-        // A marker that stands for a value it could not express (a reference or a struct computed with as a number,
-        // a struct made from one) does nothing itself: where that value is never used, the marker and its problem
-        // (a site problem) go, as the arithmetic itself would have.
         HOpaque o => o.Text is "undefined" or "frame" or "reference_arithmetic" or "struct_bits" or "struct_from_value" && o.Operands.All(IsPure),
         // The same bits read as another type (BitsOfValue, ValueFromBits): a way of writing a value, not an action.
         HCall { This: null, Method: { Name: "SingleToInt32Bits" or "Int32BitsToSingle" or "DoubleToInt64Bits" or "Int64BitsToDouble", DeclaringType: { Name: "BitConverter", Namespace: "System" } } } c =>
@@ -1799,7 +1802,8 @@ public sealed partial class HirBuilder
                     // A piece of a struct copy: the copy stands where its last piece is stored.
                     if (_pieceMembers.Contains(n))
                     {
-                        if (_pieceCopies.TryGetValue(n, out PieceCopy? copy)) EmitPieceCopy(copy);
+                        if (_forwardedCopies.TryGetValue(n, out TypedForwardCopy? forwarded)) EmitForwardedCopy(forwarded);
+                        else if (_pieceCopies.TryGetValue(n, out PieceCopy? copy)) EmitPieceCopy(copy);
                         break;
                     }
                     // A piece of a struct being cleared: the fill stands where its first piece is stored.

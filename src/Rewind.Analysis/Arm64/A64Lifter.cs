@@ -68,6 +68,7 @@ public sealed partial class A64Lifter : IMachineLifter
     /// <summary>Lifts one function; with an exception table, null when its try regions have a shape this does not handle.</summary>
     private Function? LiftCore(ulong start, ItaniumExceptionTable? table)
     {
+        _inlineReturns.Clear();
         _gates.Clear();
         _landings.Clear();
         _decided.Clear();
@@ -105,6 +106,7 @@ public sealed partial class A64Lifter : IMachineLifter
                 }
         }
         if (table != null && !PlanRegions(table, pads, rawOf, blockAt)) return null;
+        InlineCalls(rawOf);
 
         // A function whose first instruction is also a jump target needs a separate entry block.
         if (_fn.Blocks[0].Preds.Count != 0)
@@ -596,7 +598,7 @@ public sealed partial class A64Lifter : IMachineLifter
     /// <summary>Loads from memory, folding reads of read-only image data into constants.</summary>
     private Node LoadAt(Node address, VT type)
     {
-        if (type == VT.I64 && address.Op == Op.Add && address.In[0] is { Op: Op.Param, Imm: VarTpidr } && address.In[1].IsConstValue(0x28))
+        if (type == VT.I64 && IsStackGuardAddress(address))
             return C(VT.I64, StackGuard);
         if (address.IsConst)
         {
@@ -714,7 +716,9 @@ public sealed partial class A64Lifter : IMachineLifter
             return p;
         }
         bool any = returns == CallReturn.Unknown;
-        int ints = shape?.IntResults ?? 1, floats = shape?.FloatResults ?? 1;
+        // An unresolved call may return an HFA in up to four FP registers.
+        // Keep those projections until its actual return type is resolved.
+        int ints = shape?.IntResults ?? 1, floats = any ? 4 : shape?.FloatResults ?? 1;
         SetVar(0, any || returns == CallReturn.Integer ? Proj(CallResult.IntReturn, VT.I64) : _b.Undef(VT.I64));
         SetVar(1, ints >= 2 && returns == CallReturn.Integer ? Proj(CallResult.IntReturn2, VT.I64) : _b.Undef(VT.I64));
         for (int r = 2; r <= 18; r++) SetVar(r, _b.Undef(VT.I64));
@@ -842,6 +846,13 @@ public sealed partial class A64Lifter : IMachineLifter
                 sw.Aux = new List<Block>(block.Succs);
                 return true;
             }
+            case BlockEnd.InlinedCall:
+                SetVar(30, C(VT.I64, unchecked((long)ins.NextAddress)));
+                _b.Raw(Op.Jump, VT.None);
+                return true;
+            case BlockEnd.Return when _inlineReturns.Contains(block):
+                _b.Raw(Op.Jump, VT.None);
+                return true;
             case BlockEnd.Return:
                 _b.Raw(Op.Return, VT.None, ReturnValues());
                 return true;
@@ -1048,6 +1059,22 @@ public sealed partial class A64Lifter : IMachineLifter
                 Op op = i.Op switch { A64Op.Lslv => Op.Shl, A64Op.Lsrv => Op.ShrU, A64Op.Asrv => Op.ShrS, _ => Op.Ror };
                 Node count = _b.And(_b.Trunc(X(i.Rm), VT.I8), C(VT.I8, bits - 1));
                 SetR(i.Rd, i.Is64, _b.Shift(op, R(i.Rn, i.Is64), count));
+                return;
+            }
+            case A64Op.Rev16 or A64Op.Rev32:
+            {
+                Node a = R(i.Rn, i.Is64);
+                long mask = unchecked((long)0x00FF00FF00FF00FFUL);
+                Node v = _b.Or(
+                    _b.Shift(Op.Shl, _b.And(a, C(t, mask)), C(VT.I8, 8)),
+                    _b.And(_b.Shift(Op.ShrU, a, C(VT.I8, 8)), C(t, mask)));
+                if (i.Op == A64Op.Rev32)
+                {
+                    long halves = unchecked((long)0x0000FFFF0000FFFFUL);
+                    v = _b.Or(_b.Shift(Op.Shl, _b.And(v, C(t, halves)), C(VT.I8, 16)),
+                        _b.And(_b.Shift(Op.ShrU, v, C(VT.I8, 16)), C(t, halves)));
+                }
+                SetR(i.Rd, i.Is64, v);
                 return;
             }
             case A64Op.Rev:
@@ -1263,7 +1290,15 @@ public sealed partial class A64Lifter : IMachineLifter
             {
                 if (i.FpSize == 2) Unknown(i, i.Op + " (half)");
                 Node a = R(i.Rn, i.Is64);
-                SetFp(i.Rd, _b.Raw(i.Op == A64Op.Scvtf ? Op.SIntToF : Op.UIntToF, FpType(i.FpSize), a));
+                VT ft = FpType(i.FpSize);
+                Node converted = _b.Raw(i.Op == A64Op.Scvtf ? Op.SIntToF : Op.UIntToF, ft, a);
+                if (i.Amount != 0)
+                {
+                    double factor = Math.ScaleB(1.0, -i.Amount);
+                    long raw = ft == VT.F64 ? BitConverter.DoubleToInt64Bits(factor) : BitConverter.SingleToInt32Bits((float)factor);
+                    converted = _b.Raw(Op.FMul, ft, converted, C(ft, raw));
+                }
+                SetFp(i.Rd, converted);
                 return;
             }
             case A64Op.FCvtToInt:
@@ -1304,6 +1339,17 @@ public sealed partial class A64Lifter : IMachineLifter
                 bool q = (i.Imm2 & 1) != 0;
                 SetQword(i.Rd, 0, C(VT.I64, (long)pattern));
                 SetQword(i.Rd, 1, C(VT.I64, q ? (long)pattern : 0));
+                return;
+            }
+            case A64Op.VOrImm or A64Op.VBicImm:
+            {
+                bool q = (i.Imm2 & 1) != 0;
+                Node mask = C(VT.I64, unchecked((long)i.Target));
+                Node lo = Qword(i.Rd, 0), hi = q ? Qword(i.Rd, 1) : C(VT.I64, 0);
+                bool or = i.Op == A64Op.VOrImm;
+                Node Apply(Node value) => or ? _b.Or(value, mask) : _b.And(value, _b.Not(mask));
+                SetQword(i.Rd, 0, Apply(lo));
+                SetQword(i.Rd, 1, q ? Apply(hi) : hi);
                 return;
             }
             case A64Op.VMov:

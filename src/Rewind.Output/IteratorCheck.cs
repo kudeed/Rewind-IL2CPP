@@ -81,6 +81,57 @@ internal static class IteratorCheck
                 break;
             }
         }
+        // Some recovered MoveNext bodies dispatch with ifs rather than a switch. When
+        // ILSpy drops the state writes, the surviving outer int defaults to zero and
+        // is copied into each loop iteration. Keep the original compiler state class
+        // for this bounded pattern: an immutable outer int, 0/1 equality dispatch,
+        // and an unconditional while containing yields. Single configuration tests,
+        // mutable locals, calls/fields and comparisons outside such a loop do not qualify.
+        var dispatch = new Dictionary<(string Name, WhileStatement Loop), HashSet<int>>();
+        foreach (IfElseStatement branch in body.Descendants.OfType<IfElseStatement>())
+        {
+            if (Unwrap(branch.Condition) is not BinaryOperatorExpression comparison ||
+                comparison.Operator is not (BinaryOperatorType.Equality or BinaryOperatorType.InEquality) ||
+                comparison.Left is not Expression leftOperand || comparison.Right is not Expression rightOperand) continue;
+            Expression left = Unwrap(leftOperand), right = Unwrap(rightOperand);
+            if (left is PrimitiveExpression) (left, right) = (right, left);
+            if (right is not PrimitiveExpression { Value: int value } || value < 0) continue;
+            string? root = null;
+            Expression current = left;
+            for (int depth = 0; depth < 8; depth++)
+            {
+                current = Unwrap(current);
+                if (current is not IdentifierExpression id || assigned.Contains(id.Identifier) ||
+                    !starts.TryGetValue(id.Identifier, out Expression? initial) || initial == null) break;
+                initial = Unwrap(initial);
+                if (initial is IdentifierExpression) { current = initial; continue; }
+                if (initial is DefaultValueExpression or PrimitiveExpression { Value: int }) root = id.Identifier;
+                break;
+            }
+            if (root == null) continue;
+            var declaration = body.Statements.OfType<VariableDeclarationStatement>()
+                .SingleOrDefault(d => d.Type.ToString() == "int" && d.Variables.Any(v => v.Name == root));
+            if (declaration == null) continue;
+            WhileStatement? loop = null;
+            for (AstNode? parent = branch.Parent; parent != null && parent != body; parent = parent.Parent)
+                if (parent is WhileStatement found) { loop = found; break; }
+            if (loop == null || Unwrap(loop.Condition) is not PrimitiveExpression { Value: true } ||
+                !loop.Descendants.Any(n => n is YieldReturnStatement)) continue;
+            var key = (root, loop);
+            if (!dispatch.TryGetValue(key, out HashSet<int>? states)) dispatch.Add(key, states = new());
+            states.Add(value);
+            if (states.Contains(0) && states.Contains(1)) return true;
+        }
         return false;
+    }
+
+    private static Expression Unwrap(Expression expression)
+    {
+        while (true)
+        {
+            if (expression is CastExpression cast) expression = cast.Expression;
+            else if (expression is ParenthesizedExpression parentheses) expression = parentheses.Expression;
+            else return expression;
+        }
     }
 }

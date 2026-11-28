@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): gaps always marked, inlined constructor folding, bits read as float/double.
 using System.Globalization;
 using System.Text;
 using Rewind.Model;
@@ -135,6 +136,8 @@ public sealed class HCall : HExpr
     public HExpr? This;
     public HExpr[] Arguments = [];
     public bool Virtual;
+    /// <summary>Exact native proof allows a direct call on incoming this without an added managed null check.</summary>
+    public bool ReceiverIndependent;
     /// <summary>
     /// Set for an interface method called on a struct where it is ("constrained."): the struct's type, by which
     /// the implementation is found. Method is then the interface's method and This the struct's location.
@@ -304,6 +307,8 @@ public sealed class HTryRegion
     public bool Finally;
 }
 
+public readonly record struct NativeCallObservation(ulong InstructionAddress, ulong TargetAddress, bool IsTail, bool NoReturn);
+
 public sealed class HMethod
 {
     public MethodDef Method = null!;
@@ -311,6 +316,8 @@ public sealed class HMethod
     public List<HBlock> Blocks = [];
     /// <summary>Things the recovery could not express faithfully; an empty list means a clean translation.</summary>
     public List<string> Problems = [];
+    /// <summary>Unidentified direct calls observed during HIR construction, before dead-code elimination.</summary>
+    public List<NativeCallObservation> UnidentifiedNativeCalls = [];
     /// <summary>
     /// Problems that are each reported together with the marker (HOpaque.Problem) standing in for what was not
     /// recovered. When no such marker is left in the finished method, the code that had the problem is no part

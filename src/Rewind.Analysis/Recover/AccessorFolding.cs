@@ -303,6 +303,12 @@ public static class AccessorFolding
             switch (e)
             {
                 case HField f:
+                    if (Arm64ChainedGetter.TryFold(f,current,program) is { } chain)
+                    {
+                        method.Notes.Add($"chained getter restored {chain.Method.FullName}");
+                        chain.This=Read(chain.This!);
+                        return chain;
+                    }
                     if (f.Object != null) f.Object = Read(f.Object);
                     if (Nameable(f.Field)) return f;
                     if (Getter(f) is { } get) return get;
@@ -320,6 +326,12 @@ public static class AccessorFolding
                 case HCompare c: c.Left = Read(c.Left); c.Right = Read(c.Right); return c;
                 case HConv c: c.Operand = Read(c.Operand); return c;
                 case HCall call:
+                    if (Arm64ChainedGetter.TryFold(call,current,program) is { } chained)
+                    {
+                        method.Notes.Add($"chained getter restored {chained.Method.FullName}");
+                        chained.This=Read(chained.This!);
+                        return chained;
+                    }
                     if (call.This != null)
                     {
                         // A struct receiver is a location (its address is taken), not a value to read through a

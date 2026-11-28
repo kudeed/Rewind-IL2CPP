@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): metadata initializer by use.
 using Iced.Intel;
 using Rewind.Model;
 using Decoder = Iced.Intel.Decoder;

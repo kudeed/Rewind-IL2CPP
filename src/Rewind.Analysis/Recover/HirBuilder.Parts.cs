@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): wide stores over inherited fields, gaps always marked, bits read as float/double.
 using Rewind.Analysis.Hir;
 using Rewind.Analysis.Ir;
 using Rewind.Model;
@@ -461,6 +462,10 @@ public sealed partial class HirBuilder
     {
         SPair p => [new Part(0, 4, p.Low), new Part(4, 4, p.High)],
         SParts ps => ps.Parts,
+        // A complete pointer word also has one exact field when forwarded into
+        // another struct. Preserve it instead of reinterpreting it as an integer.
+        SVal { Expr: var value } when IsReference(value.Type) || value.Type is PointerSig or ByRefSig =>
+            [new Part(0, 8, value)],
         _ => null,
     };
 

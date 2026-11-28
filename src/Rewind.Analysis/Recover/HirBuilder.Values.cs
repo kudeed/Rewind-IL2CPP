@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): virtual calls through merged class pointers, string indexer, gaps always marked, inlined object hash, small structs as numbers, floating-point negation, merged struct returns, low halves of 64-bit fields, casts of stored objects, unboxed reads after a type test, a class entry's address merged from several paths.
 using Rewind.Analysis.Hir;
 using Rewind.Analysis.Ir;
 using Rewind.Analysis.X64;
@@ -26,15 +27,19 @@ public sealed partial class HirBuilder
     {
         ulong va = (ulong)n.Imm;
         if (_p.Defaults.Slots.TryGetValue(va, out TypeDef? def)) return new SKlass(def.Sig);
-        MetadataUsage? usage = _m.ResolveUsageSlot(va);
-        if (usage == null) return SJunk.Instance;
+        return _m.ResolveUsageSlot(va) is { } usage ? UsageSem(usage) : SJunk.Instance;
+    }
+
+    /// <summary>The managed value a metadata usage stands for.</summary>
+    private Sem UsageSem(MetadataUsage usage)
+    {
         switch (usage.Kind)
         {
             case UsageKind.TypeInfo: return new SKlass(usage.Type!);
             case UsageKind.Il2CppType: return new SType(usage.Type!);
             case UsageKind.MethodDef: return new SMethod(usage.Method!, null);
             case UsageKind.MethodRef: return new SMethod(usage.Method!, usage.MethodInst);
-            case UsageKind.FieldInfo or UsageKind.FieldRva: return new SFieldInfo(usage.Field!);
+            case UsageKind.FieldInfo or UsageKind.FieldRva: return new SFieldInfo(usage.Field!, usage.Type);
             case UsageKind.StringLiteral: return new SVal(new HConst(usage.String ?? "", _string));
             default: return SJunk.Instance;
         }
@@ -363,6 +368,14 @@ public sealed partial class HirBuilder
             return new SVal(field);
         }
 
+        // AArch64 passes small Nullable<float> values in integer registers.
+        // For a complete low-byte test, recover the public HasValue accessor
+        // only when its closed native body proves that exact field read.
+        if (n.Op == Op.And && n.Type == VT.I64 && n.In[1].IsConstValue(255) &&
+            Eval(n.In[0]) is SVal { Expr: { } optional } &&
+            NullableFlagValue(optional) is { } flag)
+            return new SVal(new HConv(HConvKind.U8, flag) { Type = _ulong });
+
         bool isShift = n.Op is Op.Shl or Op.ShrU or Op.ShrS;
         HExpr left = IntValue(n.In[0]), right = isShift ? ShiftCount(n.In[1], n.Type.Bits()) : IntValue(n.In[1]);
         // A shift takes its width from the value shifted: a 64-bit shift of what the program holds as a 32-bit
@@ -423,6 +436,39 @@ public sealed partial class HirBuilder
         return new SVal(new HBinary(op, left, right) { Type = type });
     }
 
+    private HCall? NullableFlagValue(HExpr value)
+    {
+        if (Environment.GetEnvironmentVariable("REWIND_NO_NULLABLE_FLAG_VALUE")!=null ||
+            _m.Image.Arch!=Rewind.Binary.CpuArch.Arm64 ||
+            value.Type is not GenericInstSig g ||
+            g.Definition.Assembly.Name!="mscorlib" ||
+            g.Definition.ReflectionName!="System.Nullable`1" ||
+            g.Arguments is not [PrimitiveSig {Element:Il2CppTypeEnum.R4}] ||
+            _p.Layouts.Of(g) is not {Known:true,Size:8} layout ||
+            layout.Fields.Length!=2 ||
+            !layout.Fields.Any(f=>f.Offset==0&&f.Size==1&&f.Field.Name=="hasValue"&&
+                f.Type is PrimitiveSig {Element:Il2CppTypeEnum.Boolean}) ||
+            !layout.Fields.Any(f=>f.Offset==4&&f.Size==4&&f.Field.Name=="value"&&
+                f.Type is PrimitiveSig {Element:Il2CppTypeEnum.R4})) return null;
+        var getters=g.Definition.Properties.Where(p=>p.Name=="HasValue"&&p.Getter!=null).Select(p=>p.Getter!).ToArray();
+        if(getters.Length!=1)return null;
+        var getter=getters[0];
+        if(getter.IsStatic||getter.IsVirtual||getter.Parameters.Length!=0||getter.GenericParameters.Length!=0||
+            (getter.Flags&MethodDef.AccessMask)!=6||getter.ReturnType is not PrimitiveSig{Element:Il2CppTypeEnum.Boolean})return null;
+        var insts=_p.InstsOf(getter).Where(i=>i.Address!=0&&i.MethodArguments.Length==0&&
+            i.ClassArguments.Length==1&&i.ClassArguments[0].Key==g.Arguments[0].Key).ToArray();
+        if(insts.Length==0||insts.Any(i=>!NullableFlagGetterCode(_m.Image,i.Address)))return null;
+        return new HCall{Method=getter,DeclaringType=g,This=value,Arguments=[],Type=_bool};
+    }
+
+    internal static bool NullableFlagGetterCode(Rewind.Binary.NativeImage image,ulong address)
+    {
+        // ldrb w0, [x0]; ret (no extra effects).
+        return address!=0&&image.Arch==Rewind.Binary.CpuArch.Arm64&&
+            image.SectionAt(address) is {IsExecutable:true} s&&address+8<=s.End&&
+            image.IsMapped(address,8)&&image.U32(address)==0x39400000&&image.U32(address+4)==0xd65f03c0;
+    }
+
     private static readonly bool NoWholeStructTruncation = Environment.GetEnvironmentVariable("REWIND_NO_WHOLE_STRUCT_TRUNCATION") != null;
     private static readonly bool NoStructNumbers = Environment.GetEnvironmentVariable("REWIND_NO_STRUCT_NUMBERS") != null;
 
@@ -433,9 +479,63 @@ public sealed partial class HirBuilder
     private HExpr StructAsNumber(HExpr e, TypeSig type)
     {
         if (NoStructNumbers) return e;
+        if (PackedStructNumber(e, type) is { } packed) return packed;
         string problem = $"{e.Type!.DisplayName} used as a number";
         Problem(problem);
         return Site(new HOpaque("struct_bits", e) { Type = type }, problem);
+    }
+
+    /// <summary>
+    /// Reinterpret a captured scalar-only value using its recorded IL2CPP layout. Every byte must be
+    /// covered exactly once by public fields. Never invent padding or duplicate evaluation of a call,
+    /// property, pointer, or field expression. Private numeric union aliases are not read.
+    /// </summary>
+    private HExpr? PackedStructNumber(HExpr value, TypeSig target)
+    {
+        // ElfImage rejects big-endian input; other formats/architectures are outside this proof.
+        if (_m.Image.Format != Rewind.Binary.ImageFormat.Elf || _m.Image.Arch != Rewind.Binary.CpuArch.Arm64 ||
+            value is not HLocal local || value.Type is not TypeDefSig source ||
+            !ReferenceEquals(local.Variable.Type, source) || !source.Definition.IsValueType ||
+            source.Definition.IsEnum || source.Definition.GenericParameters.Length != 0 ||
+            source.Definition.Sizes.InstanceSize == 0) return null;
+        HConvKind conversion;
+        switch (target)
+        {
+            case PrimitiveSig { Element: Il2CppTypeEnum.I1 }: conversion = HConvKind.I1; break;
+            case PrimitiveSig { Element: Il2CppTypeEnum.U1 }: conversion = HConvKind.U1; break;
+            case PrimitiveSig { Element: Il2CppTypeEnum.I2 }: conversion = HConvKind.I2; break;
+            case PrimitiveSig { Element: Il2CppTypeEnum.U2 or Il2CppTypeEnum.Char }: conversion = HConvKind.U2; break;
+            case PrimitiveSig { Element: Il2CppTypeEnum.I4 }: conversion = HConvKind.I4; break;
+            case PrimitiveSig { Element: Il2CppTypeEnum.U4 }: conversion = HConvKind.U4; break;
+            case PrimitiveSig { Element: Il2CppTypeEnum.I8 }: conversion = HConvKind.I8; break;
+            case PrimitiveSig { Element: Il2CppTypeEnum.U8 }: conversion = HConvKind.U8; break;
+            default: return null;
+        }
+        TypeLayout layout = _p.Layouts.Of(source);
+        if (!layout.Known || layout.Size is not (1 or 2 or 4 or 8) ||
+            BitsOf(target) > layout.Size * 8 || layout.Fields.Length == 0 ||
+            source.Definition.Sizes.InstanceSize != layout.Size + _header) return null;
+        var parts = new List<Part>();
+        int covered = 0;
+        foreach (FieldSlot field in layout.Fields.OrderBy(f => f.Offset))
+        {
+            if (field.Type is not PrimitiveSig primitive || primitive.Element is not
+                (Il2CppTypeEnum.I1 or Il2CppTypeEnum.U1 or Il2CppTypeEnum.I2 or Il2CppTypeEnum.U2 or
+                 Il2CppTypeEnum.Char or Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4 or Il2CppTypeEnum.I8 or
+                 Il2CppTypeEnum.U8 or Il2CppTypeEnum.R4 or Il2CppTypeEnum.R8) ||
+                field.Size != BitsOf(field.Type) / 8 || field.Offset < 0 ||
+                field.Offset + field.Size > layout.Size) return null;
+            if ((field.Field.Attrs & FieldDef.AccessMask) != 6) continue;
+            if (field.Offset != covered) return null;
+            var read = new HField { Object = value, Field = field.Field, DeclaringType = source, Type = field.Type };
+            // Require exact library bit conversions before constructing an accepted expression.
+            if (primitive.Element == Il2CppTypeEnum.R4 && SingleBits(read) == null ||
+                primitive.Element == Il2CppTypeEnum.R8 && BitConverterMethod("DoubleToInt64Bits", _double) == null) return null;
+            parts.Add(new Part(field.Offset, field.Size, read));
+            covered += field.Size;
+        }
+        if (parts.Count == 0 || covered != layout.Size) return null;
+        return new HConv(conversion, CombineParts(parts, layout.Size)) { Type = target };
     }
 
     private HExpr NumberAsStruct(HExpr e, TypeSig structType)
@@ -552,6 +652,10 @@ public sealed partial class HirBuilder
     {
         int bits = n.Type.Bits();
         HExpr e = ScalarOf(Value(n), bits);
+        // Integer IR comparisons consume the raw register bits even when FToBits
+        // retained a floating HIR value. Reinterpret only an exact-width value;
+        // numerical conversion would change NaNs, infinities and signed zero.
+        if (IsFloat(e.Type) && BitsOf(e.Type) == bits) e = FloatBits(e);
         if (bits is not (8 or 16)) return e;
         // A constant, as a number of the kind the other side is compared as: the byte 0xFF is 255 next to an
         // unsigned value and -1 next to a signed one. ("(byte)x != -1" is always true.)
@@ -799,6 +903,14 @@ public sealed partial class HirBuilder
             if (s is SPair or SParts) s = new SVal(Value(inner));
             if (s is not SVal v) return s;
             HExpr e = v.Expr;
+            // A merge local's storage can be 64-bit even when the
+            // expression view has no annotation. The native Trunc node is
+            // explicit proof that the low 32 bits, not the full local, are used.
+            if (Environment.GetEnvironmentVariable("REWIND_NO_TYPED_TRUNC_LOCAL")==null &&
+                to==32 && inner.Type==VT.I64 && e is HLocal l &&
+                l.Variable.Type is PrimitiveSig {Element:Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8} &&
+                (e.Type==null || e.Type is PrimitiveSig {Element:Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4 or Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8}))
+                return new SVal(new HConv(HConvKind.I4,e){Type=_int});
             int known = BitsOf(e.Type);
             // Already no wider than the target: the truncation only drops undefined upper register bits.
             if (known != 0 && known <= to) return v;
@@ -1416,8 +1528,36 @@ public sealed partial class HirBuilder
     /// of it: "a[i * 6 + k]" of an int array, the 6 folded into the scale (24). A smaller scale: the index was
     /// multiplied already ("i * 12", or "i &lt;&lt; 4"), by enough to make whole elements. Null otherwise.
     /// </summary>
+    // ARM64 combines signed 32-bit index arithmetic with element scaling:
+    // asr((uint64(x) << 32) + (c << 32), 32-log2(size)).
+    // Recover the exact modulo-2^32 addition before the sign extension,
+    // rather than dividing a raw address or treating it as a reference.
+    internal static bool TryPackedSignedIndex(Node n,long scale,long size,out Node value,out int delta)
+    {
+        value=null!;delta=0;
+        if(scale!=1||size is not(2 or 4 or 8 or 16)||
+           n is not{Op:Op.ShrS,Type:VT.I64,In.Length:2}||!n.In[1].IsConstValue(32-System.Numerics.BitOperations.Log2((uint)size))||
+           n.In[0] is not{Op:Op.Add,Type:VT.I64,In.Length:2} add)return false;
+        var a=add.In[0];var b=add.In[1];if(b.IsConst)(a,b)=(b,a);
+        if(!a.IsConst||(a.UImm&0xfffffffful)!=0||
+           b is not{Op:Op.Shl,Type:VT.I64,In.Length:2}||!b.In[1].IsConstValue(32))return false;
+        var x=StripExtension(b.In[0]);if(x.Type!=VT.I32)return false;
+        value=x;delta=unchecked((int)(a.UImm>>32));return true;
+    }
+
     private HExpr? ScaledIndex(Node index, long scale, long elementSize)
     {
+        if(Environment.GetEnvironmentVariable("REWIND_NO_PACKED_SIGNED_INDEX")==null&&
+           _m.Image.Arch==Rewind.Binary.CpuArch.Arm64&&TryPackedSignedIndex(index,scale,elementSize,out var packed,out int delta))
+        {
+            var v=IntValue(packed);
+            if(v.Type is PrimitiveSig{Element:Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4})
+            {
+                var signed=new HConv(HConvKind.I4,v){Type=_int};
+                return delta==0?signed:new HBinary(HBinaryOp.Add,signed,new HConst(delta,_int)){Type=_int};
+            }
+        }
+
         HExpr Times(HExpr e, long k) => k == 1 ? e : new HBinary(HBinaryOp.Mul, e, new HConst((int)k, _int)) { Type = _int };
         if (scale > elementSize && scale % elementSize == 0)
             return Times(IntValue(StripExtension(index)), scale / elementSize);
@@ -1845,6 +1985,20 @@ public sealed partial class HirBuilder
                 bool isStruct = byRef.ElementType.Definition is { IsValueType: true, IsEnum: false } && byRef.ElementType is not PrimitiveSig;
                 if (a.Index == null && a.Offset == 0 && !isStruct) return new PLocation(target, byRef.ElementType);
                 if (a.Index == null && isStruct) return FieldPlace(target, byRef.ElementType, (int)a.Offset, size);
+                // A spilled array-element address remains a managed reference. Full
+                // element strides can be applied without converting it to a long.
+                if (!isStruct && _p.Layouts.SizeOf(byRef.ElementType) is { Known: true, Size: > 0 } element &&
+                    (size < 0 || size == element.Size) && a.Offset % element.Size == 0 && (a.Index == null || a.Scale == element.Size))
+                {
+                    HExpr displacement = a.Index == null ? new HConst(a.Offset, _long) : Value(a.Index);
+                    if (a.Index != null && a.Scale != 1)
+                        displacement = new HBinary(HBinaryOp.Mul, displacement, new HConst(a.Scale, _long)) { Type = _long };
+                    if (a.Index != null && a.Offset != 0)
+                        displacement = new HBinary(HBinaryOp.Add, displacement, new HConst(a.Offset, _long)) { Type = _long };
+                    var nativeOffset = new HConv(HConvKind.I, displacement) { Type = _nint };
+                    var pointer = new HBinary(HBinaryOp.Add, e, nativeOffset) { Type = type };
+                    return new PLocation(new HDeref(pointer) { Type = byRef.ElementType }, byRef.ElementType);
+                }
                 return new PUnknown("indexed access through a ref");
             }
         }
@@ -2338,7 +2492,13 @@ public sealed partial class HirBuilder
                 MarkReferenceInPieces(n, valueNode);
                 Sem s = Eval(valueNode);
                 HExpr low, high;
-                if (s is SPair p) (low, high) = (p.Low, p.High);
+                if (s is SPair)
+                {
+                    // SIMD lanes carry raw bits. Use the typed part-store path so an integer mask
+                    // written into float fields is reinterpreted, preserving signed zero and NaNs.
+                    StoreParts([new Part(0, 4, pair.Low), new Part(4, 4, pair.High)], valueNode, n.Addr);
+                    return;
+                }
                 else if (valueNode.IsConst)
                 {
                     low = Coerce(new HConst((int)(valueNode.UImm & 0xFFFFFFFF), _int), pair.Low.Type!);
@@ -2520,9 +2680,7 @@ public sealed partial class HirBuilder
             }
             if (a.BaseSem is SVal { Type: PrimitiveSig { Element: Il2CppTypeEnum.I or Il2CppTypeEnum.U } }) return BinarySem(n);
             // An address into something no managed location was found in: the arithmetic stays, as the operand
-            // of a marker (a number added to a reference is no value IL has). Moving a managed or unmanaged
-            // pointer on is IL ("ref Unsafe.Add(ref r, 1)"), and does what the native code did: it stays as it is,
-            // reported as before.
+            // of a marker (a number added to a reference is no value IL has).
             string what = "address computation: " + (place is PUnknown unknown ? unknown.Why : place.GetType().Name[1..]);
             Problem(what);
             Sem arithmetic = BinarySem(n);
@@ -2560,12 +2718,13 @@ public sealed partial class HirBuilder
         TypeSig? type = Eval(value) switch
         {
             SVal { Expr: not HConst } v => v.Expr.Type,
+            SRef r => _m.Sigs.ByRef(r.Type),
             SNewObject o => o.Type,
             _ => null,
         };
         // (A struct of just those eight bytes stored whole - a call's Nullable<float>, say - holds the slot as well.)
         bool wholeStruct = !NoStructVotes && type != null && IsStructType(type) && _p.Layouts.SizeOf(type) is { Known: true, Size: 8 };
-        TypeSig vote = type != null && (IsReference(type) || wholeStruct) && !Open(type) && Nameable(type) ? type : _long;
+        TypeSig vote = type != null && (IsReference(type) || type is ByRefSig or PointerSig || wholeStruct) && !Open(type) && Nameable(type) ? type : _long;
         if (!_frameVotes.TryGetValue(offset, out HashSet<TypeSig>? votes)) _frameVotes[offset] = votes = [];
         votes.Add(vote);
     }

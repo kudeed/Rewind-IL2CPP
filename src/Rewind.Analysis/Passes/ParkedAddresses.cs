@@ -22,7 +22,7 @@ public static class ParkedAddresses
         if (Tracing) Console.WriteLine("  [park] " + text);
     }
 
-    private enum Kind { Park, Other }
+    private enum Kind { Park, Other, Partial }
 
     /// <summary>
     /// Writes every "stack pointer + constant + constant" as one "stack pointer + constant". The builder folds
@@ -107,7 +107,7 @@ public static class ParkedAddresses
                 if (n.Op == Op.Store && stack(n.In[0]) is int at && Overlaps(at, n.In[1].Type.Bytes()))
                 {
                     bool park = at == slot && n.In[1].Type == VT.I64 && stack(n.In[1]) is not null;
-                    (list ??= []).Add((n, true, park ? Kind.Park : Kind.Other, park ? stack(n.In[1])!.Value : 0));
+                    (list ??= []).Add((n, true, park ? Kind.Park : at <= slot && at + n.In[1].Type.Bytes() >= end ? Kind.Other : Kind.Partial, park ? stack(n.In[1])!.Value : 0));
                 }
                 else if (n.Op == Op.Load && stack(n.In[0]) is int from && Overlaps(from, n.Type.Bytes()))
                     (list ??= []).Add((n, false, Kind.Other, 0));
@@ -119,8 +119,9 @@ public static class ParkedAddresses
                     {
                         if (stack(n.In[i]) is not int arg || arg > slot) continue;
                         int extent = escapeExtent?.Invoke(n, i) ?? -1;
+                        if (extent == StackPromotion.NotTaken) continue;
                         if (slot >= arg + (extent > 0 ? extent : 256)) continue;
-                        (list ??= []).Add((n, true, Kind.Other, 0));
+                        (list ??= []).Add((n, true, Kind.Partial, 0));
                         reachable = true;
                         break;
                     }
@@ -155,9 +156,15 @@ public static class ParkedAddresses
             moving = false;
             foreach (Block b in cfg.ReversePostOrder)
             {
-                HashSet<Node?> outSet;
-                if (events.TryGetValue(b, out var list) && list.LastOrDefault(e => e.IsDef) is { Node: not null } last) outSet = [last.Node];
-                else outSet = In(b);
+                HashSet<Node?> outSet = In(b);
+                if (events.TryGetValue(b, out var list))
+                    foreach (var e in list)
+                        if (e.IsDef)
+                        {
+                            // A partial or possible write does not replace all bytes of the parked pointer.
+                            if (e.Kind == Kind.Partial) outSet.Add(e.Node);
+                            else outSet = [e.Node];
+                        }
                 if (!defsOut.TryGetValue(b, out HashSet<Node?>? old) || !old.SetEquals(outSet))
                 {
                     defsOut[b] = outSet;
@@ -183,7 +190,8 @@ public static class ParkedAddresses
             {
                 if (e.IsDef)
                 {
-                    reaching = [e.Node];
+                    if (e.Kind == Kind.Partial) reaching.Add(e.Node);
+                    else reaching = [e.Node];
                     continue;
                 }
                 if (!reaching.Any(d => d != null && parked.ContainsKey(d))) continue;

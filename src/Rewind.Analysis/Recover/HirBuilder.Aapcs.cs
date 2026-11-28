@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): gaps always marked, floating-point negation.
 using Rewind.Analysis.Abi;
 using Rewind.Analysis.Hir;
 using Rewind.Analysis.Ir;
@@ -217,6 +218,18 @@ public sealed partial class HirBuilder
     /// The registers a pair or aggregate parameter arrives in hold its fields: the first eight bytes and the rest
     /// (a pair), or one member each (an aggregate).
     /// </summary>
+    // One whole reference/pointer occupies this word. Keep its semantic type so
+    // address recovery can see it; packing it into SParts hides its pointer base.
+    // Partial fields and multiple fields remain byte parts, preserving their bits.
+    private static Sem StructWord(List<Part>? leaves, int size)
+    {
+        if (leaves == null) return SJunk.Instance;
+        if (leaves is [{ Offset: 0, Size: var width, Value: var value }] && width == size &&
+            (IsReference(value.Type) || value.Type is PointerSig or ByRefSig))
+            return new SVal(value);
+        return new SParts(leaves, size);
+    }
+
     private void BindRegisterStruct(AbiParam p, HExpr arg)
     {
         RegisterModel regs = _fn.Regs;
@@ -229,7 +242,7 @@ public sealed partial class HirBuilder
             {
                 if (r + word >= regs.IntArgs.Length || !_fn.Params.TryGetValue(regs.IntArgs[r + word], out Node? reg)) continue;
                 List<Part>? leaves = StructLeaves(arg, type, 8 * word, Math.Min(8, size - 8 * word));
-                _sem[reg] = leaves != null ? new SParts(leaves, 8) : SJunk.Instance;
+                _sem[reg] = StructWord(leaves, 8);
             }
             return;
         }
@@ -272,7 +285,7 @@ public sealed partial class HirBuilder
             {
                 if (!projs.TryGetValue(word == 0 ? CallResult.IntReturn : CallResult.IntReturn2, out Node? reg)) continue;
                 List<Part>? leaves = StructLeaves(new HLocal(t) { Type = returnType }, returnType, 8 * word, Math.Min(8, size - 8 * word));
-                _sem[reg] = leaves != null ? new SParts(leaves, 8) : SJunk.Instance;
+                _sem[reg] = StructWord(leaves, 8);
             }
             return;
         }

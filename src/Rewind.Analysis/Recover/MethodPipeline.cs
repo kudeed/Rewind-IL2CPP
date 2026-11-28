@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): gaps always marked, base constructor calls, inlined constructor folding.
 using Rewind.Analysis.Abi;
 using Rewind.Analysis.Hir;
 using Rewind.Analysis.Ir;
@@ -342,6 +343,17 @@ public sealed class MethodPipeline
             DeadCode.Run(fn);
             _normalizer.Cleanup(fn);
         }
+        if (_program.Model.Image is Rewind.Binary.ElfImage elf &&
+            _program.Model.Image.Arch == Rewind.Binary.CpuArch.Arm64 &&
+            fn.TryRegions.Count == 1 && elf.ExceptionTableOf(fn.Address) is { } table)
+        {
+            int moved = NativeTryPrefix.Run(fn, table.CallSites);
+            if (moved > 0)
+            {
+                normalization.ReceiverNotes.Add($"native try prefix: {moved} nodes before protected calls");
+                _normalizer.Cleanup(fn);
+            }
+        }
         if (Environment.GetEnvironmentVariable("REWIND_NO_LEFTOVERS") == null && UndefinedValues.Run(fn, Leftovers(fn, abi), deadArguments: !fn.Regs.SharedPositions))
         {
             DeadCode.Run(fn);
@@ -385,8 +397,68 @@ public sealed class MethodPipeline
             _normalizer.CanonicalizeSlots(fn);
             _normalizer.Cleanup(fn);
         }
+        if (_program.Model.Image.Arch == Rewind.Binary.CpuArch.Arm64 &&
+            _program.Model.Image.Format == Rewind.Binary.ImageFormat.Elf &&
+            Environment.GetEnvironmentVariable("REWIND_NO_LATE_METADATA_GOT") == null)
+        {
+            _normalizer.CanonicalizeSlots(fn);
+            _normalizer.Cleanup(fn);
+        }
+        if(classArgs.Length!=0||methodArgs.Length!=0)
+        {
+            _normalizer.FoldOwnMethodKlass(fn,abi);
+            _normalizer.FoldOwnMethodRgctx(fn,abi);
+            _normalizer.Cleanup(fn);
+        }
+        if (_program.Model.Image.Arch == Rewind.Binary.CpuArch.Arm64 && IndexedBaseMerges.Run(fn))
+        {
+            _normalizer.Cleanup(fn);
+            normalization.ReceiverNotes.Add("indexed base merge split: exact incoming address load");
+        }
         CheckShape(fn, "class merges");
         if (Environment.GetEnvironmentVariable("REWIND_NO_WIDENED_CONSTANTS") == null) FoldWidenedConstants(fn);
+        if (_program.Model.Image.Arch == Rewind.Binary.CpuArch.Arm64 &&
+            Rewind.Analysis.Arm64.A64Lifter.FoldResolvedStackGuardReads(fn) > 0)
+        {
+            normalization.ReceiverNotes.Add("resolved stack guard: exact TPIDR_EL0 plus 0x28 read");
+            _normalizer.Cleanup(fn);
+        }
+        // Promoted registers and folded constants can expose a stack-only
+        // initialization prefix that was obscured in the first prologue pass.
+        if (!fn.Regs.SharedPositions && Environment.GetEnvironmentVariable("REWIND_NO_TRY_PROLOGUES") == null && TryPrologues.Run(fn))
+        {
+            normalization.ReceiverNotes.Add("late try prologue: stack-only prefix before first throwing operation");
+            _normalizer.Cleanup(fn);
+            if (Environment.GetEnvironmentVariable("REWIND_NO_PARKED") == null &&
+                ParkedAddresses.Run(fn, (call, input) => EscapeExtent(call, input, fn, boxes)))
+            {
+                DeadCode.Run(fn);
+                _normalizer.Cleanup(fn);
+            }
+            ParkedAddresses.Canonicalize(fn);
+            frame = StackPromotion.Run(fn, (call, input) => EscapeExtent(call, input, fn, boxes), stackArguments);
+            DeadCode.Run(fn);
+            _normalizer.Cleanup(fn);
+            CheckShape(fn, "late try prologue");
+        }
+        if (Environment.GetEnvironmentVariable("REWIND_NO_EQUIVALENT_BRANCHES") == null && EquivalentBranches.Run(fn) is > 0 and var equivalentBranches)
+        {
+            normalization.ReceiverNotes.Add($"equivalent equality branch arms collapsed: {equivalentBranches}");
+            _normalizer.Cleanup(fn);
+            CheckShape(fn, "equivalent branch arms");
+        }
+        if (Environment.GetEnvironmentVariable("REWIND_NO_METADATA_UNUSED_RECEIVER") == null &&
+            MetadataReceivers.Run(_program, fn, method, abi, normalization.ReceiverNotes.Add) > 0)
+        {
+            _normalizer.Cleanup(fn);
+            CheckShape(fn, "same-owner unused metadata receivers");
+        }
+        if (Environment.GetEnvironmentVariable("REWIND_NO_CAPTURED_OWNER_RECEIVER") == null &&
+            CapturedOwnerReceivers.Run(_program, fn, method, abi, normalization.ReceiverNotes.Add) > 0)
+        {
+            _normalizer.Cleanup(fn);
+            CheckShape(fn, "captured-owner unused receivers");
+        }
         return new LiftedMethod
         {
             Method = method,
@@ -575,14 +647,16 @@ public sealed class MethodPipeline
         if (WrapperFolding.Lift(result, this))
         {
             StructFolding.Run(result, _program, this);
-            _inlineFolding.Run(result);
+            Inline.Run(result);
         }
         StructFromParts.Run(result, this);
         WriteBacks.Run(result, _program);
         AccessorFolding.Run(result, _program);
+        Arm64TargetPositionSetter.Run(result, _program);
         LibraryInternals.Run(result, _program);
         HiddenImplementations.Run(result, _program);
         BaseConstructorCalls.Run(result, this, _program);
+        MergedDelegateConstruction.Run(result);
         ConstructorFolding.MarkRawConstructors(result);
         InitializerOrder.Run(result);
         UnsetLocals.Run(result);
@@ -903,6 +977,29 @@ public sealed class MethodPipeline
     private HMethod BuildCoreOf(LiftedMethod lifted)
     {
         (HirBuilder builder, HMethod result) = BuildRounds(lifted);
+        // Use the already typed call choices to prove array cursor recovery.
+        // Rebuild from SSA only after a complete bounded shape was recognized.
+        if(Environment.GetEnvironmentVariable("REWIND_NO_ARRAY_CURSOR_RECOVERY")==null&&
+           _program.Model.Image.Arch==Rewind.Binary.CpuArch.Arm64)
+        {
+            int? ProvenSize(Node array,Node receiverCall)
+            {
+                if(array is not {Op:Op.Proj,Imm:CallResult.IntReturn,In.Length:1}||
+                   !builder.ChosenCalls.TryGetValue(array.In[0],out var producer)||
+                   producer.Shift!=0||producer.Method.IsGenericDefinition||producer.Method.DeclaringType.IsGenericDefinition||
+                   producer.Method.ReturnType is not SzArraySig {ElementType:TypeDefSig element}||
+                   !element.Definition.IsValueType||element.Definition.IsEnum||
+                   !builder.ChosenCalls.TryGetValue(receiverCall,out var consumer)||consumer.Shift!=0||
+                   consumer.Method.IsStatic||consumer.Method.IsVirtual||consumer.Method.IsGenericDefinition||
+                   consumer.Method.Parameters.Length!=0||consumer.Method.DeclaringType!=element.Definition||
+                   receiverCall.Aux is not CallInfo ci||ci.Target!=consumer.Method.Address)return null;
+                var layout=_program.Layouts.SizeOf(element);
+                return layout.Known&&layout.Size>0?layout.Size:null;
+            }
+            if(ArrayCursorRecovery.Run(lifted.Function,4*_program.Model.Image.PointerSize,ProvenSize,
+              (at,size)=>lifted.Normalization.ReceiverNotes.Add($"array cursor at 0x{at:X}, exact element stride {size}"))!=0)
+                (builder,result)=BuildRounds(lifted);
+        }
         // Code for two classes merged because their fields sit at the same offsets: un-merge and build again.
         for (int round = 0; round < 2 && builder.MergedObjects.Count != 0; round++)
         {
@@ -983,6 +1080,10 @@ public sealed class MethodPipeline
         EnumeratorLoops.Run(result, _program);
         if (LateMoves.Run(result)) StructConstruction.Run(result);
         SwitchRanges.Run(result);
+        DelegateChoiceFolding.Run(result);
+        ListAppendFolding.Run(result, _program.Model.Sigs, _program.Model.Image);
+        ListClearFolding.Run(result, _program.Model.Sigs);
+        ListValueClearFolding.Run(result, _program.Model.Sigs, new LayoutCalculator(_program.Model));
         return result;
     }
 
@@ -1186,6 +1287,9 @@ public sealed class MethodPipeline
         int position = _program.Abi.Regs.IntPositionOfSlot(slot);
         if (position < 0) return false;
         CallTarget target = _program.Resolve(info.Target);
+        // modf never reads the previous integer-part output. Its scalar FP input and pointer
+        // use separate register banks on ARM64 and shared argument positions on x64.
+        if (target.Helper is { Kind: HelperKind.Modf }) return position == (_program.Abi.Regs.SharedPositions ? 1 : 0);
         if (target.Helper != null || !target.IsManaged) return false;
         bool all = true, any = false;
         void Consider(MethodDef method, MethodAbi abi)
@@ -1367,7 +1471,13 @@ public sealed class MethodPipeline
         {
             var taken = new HashSet<int>();
             foreach (AbiParam p in abi.Params)
-                if (p.Pass != PassKind.Float && regs.IntRegisterOf(p.Position) is int r and >= 0) taken.Add(r);
+                if (p.Pass != PassKind.Float && regs.IntRegisterOf(p.Position) is int r and >= 0)
+                {
+                    taken.Add(r);
+                    // AAPCS64 passes a 9-16 byte aggregate in two registers.
+                    // Its second word is live even when it is only forwarded.
+                    if (p.Pass == PassKind.IntegerPair && r + 1 < regs.IntArgs.Length) taken.Add(r + 1);
+                }
             for (int position = 0; position < regs.IntArgs.Length; position++)
                 if (!taken.Contains(position)) Add(regs.IntArgs[position]);
         }
@@ -1531,7 +1641,8 @@ public sealed class MethodPipeline
             // modf(x, &whole) writes the whole part there, one number as wide as x, and nothing else. (Without a
             // bound, the address of a pasted Math.Round's local reached the whole frame, and nothing on the stack
             // became a value: the registers a catch handler saves stayed stores, of what it cannot know.)
-            if (!NoHelperExtents && target.Helper.Kind == HelperKind.Modf && position == 1) return target.Helper.IsDouble ? 8 : 4;
+            if (!NoHelperExtents && target.Helper.Kind == HelperKind.Modf &&
+                position == (_program.Abi.Regs.SharedPositions ? 1 : 0)) return target.Helper.IsDouble ? 8 : 4;
             return HelperReads(call, info, target.Helper.Kind, position);
         }
 

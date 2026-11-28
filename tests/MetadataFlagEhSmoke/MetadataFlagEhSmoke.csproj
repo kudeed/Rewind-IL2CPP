@@ -1,0 +1,1 @@
+<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><AssemblyName>FsmConstructionSmoke</AssemblyName></PropertyGroup><ItemGroup><ProjectReference Include="../../src/Rewind.Analysis/Rewind.Analysis.csproj" /></ItemGroup></Project>

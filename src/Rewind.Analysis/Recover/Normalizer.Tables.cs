@@ -29,6 +29,36 @@ public sealed partial class Normalizer
                 // The value compared with the bound: the index itself or what was widened into it.
                 Node compared = index.Op is Op.ZExt or Op.SExt ? index.In[0] : index;
                 if (Bound(b, index, compared) is not long last || last >= MaxTableEntries) continue;
+                // String-pointer tables are often longer than the original
+                // linear-choice budget, and a long linear chain cannot later
+                // be canonicalized as a choice among metadata slots.
+                if (size == 8 && Environment.GetEnvironmentVariable("REWIND_NO_BALANCED_LITERAL_TABLES") == null &&
+                    compared.Type.Bits() is >= 8 and <= 32 &&
+                    LiteralLookupTable.TryRead(program.Model.Image, table, (int)last + 1,
+                        slot => program.Model.ResolveUsageSlot(slot) is { Kind: Rewind.Model.UsageKind.StringLiteral },
+                        out ulong[] literalEntries))
+                {
+                    int position = i;
+                    _replace[load] = LiteralLookupTable.BuildChoice(_fn, b, ref position, compared, literalEntries, load.Addr);
+                    load.Dead = true;
+                    i = position;
+                    changed = true;
+                    continue;
+                }
+                if (size == 8 && Environment.GetEnvironmentVariable("REWIND_NO_METHOD_SLOT_TABLES") == null &&
+                    compared.Type.Bits() is >= 8 and <= 32 &&
+                    LiteralLookupTable.TryRead(program.Model.Image, table, (int)last + 1,
+                        slot => program.Model.ResolveUsageSlot(slot) is { Kind: Rewind.Model.UsageKind.MethodDef, Method: { IsStatic: true, IsAbstract: false } m } &&
+                            m.Address != 0 && m.GenericParameters.Length == 0 && m.DeclaringType.GenericParameters.Length == 0,
+                        out ulong[] methodEntries))
+                {
+                    int position = i;
+                    _replace[load] = LiteralLookupTable.BuildChoice(_fn, b, ref position, compared, methodEntries, load.Addr);
+                    load.Dead = true;
+                    i = position;
+                    changed = true;
+                    continue;
+                }
                 var entries = new long[last + 1];
                 if (!ReadTable(table, size, entries)) continue;
 

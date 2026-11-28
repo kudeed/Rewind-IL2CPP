@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): helpers behind widening wrappers.
 using System.Diagnostics;
 using Iced.Intel;
 using Rewind.Analysis;
@@ -46,7 +47,7 @@ internal static class LiftLab
             foreach (string line in Rewind.Analysis.Runtime.HelperDiscovery.Complete(model, context, index, matched)) Console.WriteLine(line);
             var watch = Stopwatch.StartNew();
             var analysis = new ProgramAnalysis(model, matched, context);
-            Console.WriteLine($"exact copies: {analysis.ExactCopies.Copies.Count} of {analysis.ExactCopies.Examined} unlisted functions equal a listed method ({analysis.ExactCopies.Rounds} rounds); witnessed copies: {analysis.InlineCopies.Count}; near copies: {analysis.NearCopies.Count}; P/Invoke stubs: {analysis.PInvokeStubs.Count}; program analysis {watch.ElapsedMilliseconds} ms");
+            Console.WriteLine($"exact copies: {analysis.ExactCopies.Copies.Count} of {analysis.ExactCopies.Examined} unlisted functions equal a listed method ({analysis.ExactCopies.Rounds} rounds); witnessed copies: {analysis.InlineCopies.Count}; near copies: {analysis.NearCopies.Count}; program analysis {watch.ElapsedMilliseconds} ms");
             return analysis;
         }
         Dictionary<ulong, List<string>> symbols = CallStats.LoadSymbols(model.Image, symbolsPath);

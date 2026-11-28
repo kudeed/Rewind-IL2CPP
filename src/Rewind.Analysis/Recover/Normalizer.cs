@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): floating-point negation, engine-method lookups merged from several paths.
 using Rewind.Model;
 using Rewind.Analysis.Ir;
 using Rewind.Analysis.Passes;
@@ -20,6 +21,7 @@ public sealed record CastFact(Block At, Node Object, Node Klass, Node? From = nu
 public sealed class NormalizeResult
 {
     public List<CastFact> Casts = [];
+    public List<string> ReceiverNotes = [];
     /// <summary>(operation, left, right) triples whose overflow is checked.</summary>
     public HashSet<(Op, Node, Node)> CheckedArithmetic = [];
     public int GuardsRemoved, HelpersRemoved, RegionsRemoved;
@@ -47,6 +49,7 @@ public sealed partial class Normalizer(ProgramAnalysis program)
         _slotValues.Clear();
         _lazyTargets.Clear();
         if (ExpandLookupTables()) ApplyReplacements();
+        FoldLateMetadataFlags();
         CanonicalizeSlotLoads();
         RemoveNoOpHelpers();
         RemoveInitFlagStores();
@@ -56,7 +59,12 @@ public sealed partial class Normalizer(ProgramAnalysis program)
         bool changed = true;
         for (int round = 0; changed && round < 16; round++)
         {
-            changed = RemoveGuards();
+            // Structural cleanup can turn a merged class pointer into an already
+            // proven metadata class. Revisit the same constructor-flag proof;
+            // never treat an unresolved class or an arbitrary field as initialized.
+            changed = AssumeClassesInitialized();
+            ApplyReplacements();
+            changed |= RemoveGuards();
             changed |= RemoveInlineBarriers();
             changed |= Structure();
             changed |= CollapseInterfaceLookups();
@@ -67,6 +75,7 @@ public sealed partial class Normalizer(ProgramAnalysis program)
             changed |= CollapseDelegateGuards();
             changed |= CollapsePInvokeTargets();
         }
+        RestoreArrayArgumentReceivers();
         return _result;
     }
 
@@ -273,7 +282,8 @@ public sealed partial class Normalizer(ProgramAnalysis program)
     {
         // Merges of one value (left behind when a lookup collapsed into the value it looked up) are that value.
         foreach (Block b in _fn.Blocks.ToList()) SimplifyPhis(b);
-        bool changed = CollapsePhiCycles();
+        bool changed = FoldImmutableImageLoads();
+        changed |= CollapsePhiCycles();
         changed |= RefoldTruncations();
         changed |= RejoinSplitMerges();
         changed |= UseKnownZeros();
@@ -299,7 +309,12 @@ public sealed partial class Normalizer(ProgramAnalysis program)
         _result ??= new NormalizeResult();
         _replace.Clear();
         bool changed = true;
-        for (int round = 0; changed && round < 16; round++) changed = Structure();
+        for (int round = 0; changed && round < 16; round++)
+        {
+            changed = AssumeClassesInitialized();
+            ApplyReplacements();
+            changed |= Structure();
+        }
     }
 
     // ---- value replacement ---------------------------------------------------------------------------------
@@ -362,6 +377,8 @@ public sealed partial class Normalizer(ProgramAnalysis program)
     /// </summary>
     private void CanonicalizeSlotLoads()
     {
+        if (Environment.GetEnvironmentVariable("REWIND_NO_LATE_METADATA_GOT") == null)
+            FoldMetadataGotLoads();
         // A read through a choice of slots (a select or phi of their addresses) reads the chosen slot's value.
         var chosen = new List<Node>();
         foreach (Block b in _fn.Blocks)
@@ -389,6 +406,36 @@ public sealed partial class Normalizer(ProgramAnalysis program)
             n.Dead = true;
         }
         foreach (Block b in _fn.Blocks) b.Nodes.RemoveAll(n => n.Dead);
+    }
+
+    // Late SSA simplification can expose ADRP + constant after the lifter has
+    // already missed the read-only GOT load. Only fold a full-width aligned
+    // RELRO pointer when its relocated value is an actual metadata slot.
+    // Never read arbitrary writable globals as constants.
+    private void FoldMetadataGotLoads()
+    {
+        NativeImage image = program.Model.Image;
+        if (image.Arch != CpuArch.Arm64 || image.Format != ImageFormat.Elf || image.PointerSize != 8) return;
+        foreach (Block b in _fn.Blocks)
+        {
+            foreach (Node n in b.Nodes)
+            {
+                if (n.Dead || n.Op != Op.Load || n.Type != VT.I64) continue;
+                Node a = Resolve(n.In[0]);
+                ulong va;
+                if (a.IsConst) va = a.UImm;
+                else if (a.Op == Op.Add && a.Type == VT.I64 &&
+                         Resolve(a.In[0]) is { IsConst: true } left &&
+                         Resolve(a.In[1]) is { IsConst: true } right)
+                    va = unchecked(left.UImm + right.UImm);
+                else continue;
+                if (!MetadataGotLoad.TryResolve(image, va, IsMetadataSlot, out ulong slot)) continue;
+                _replace[n] = _b.Const(VT.I64, unchecked((long)slot));
+                n.Dead = true;
+            }
+            b.Nodes.RemoveAll(n => n.Dead);
+        }
+        ApplyReplacements();
     }
 
     // ---- helpers with no managed meaning -------------------------------------------------------------------
@@ -561,10 +608,11 @@ public sealed partial class Normalizer(ProgramAnalysis program)
     /// ("if (!klass->cctor_finished) run it"). Managed code has no such check - the runtime sees to it - and the
     /// call that would run the constructor is already gone, so the check reads as "it has run".
     /// </summary>
-    private void AssumeClassesInitialized()
+    private bool AssumeClassesInitialized()
     {
         int flag = program.Klass.CctorFinished;
-        if (flag <= 0) return;
+        if (flag <= 0) return false;
+        bool changed = false;
         foreach (Block b in _fn.Blocks)
         {
             foreach (Node n in b.Nodes)
@@ -577,9 +625,11 @@ public sealed partial class Normalizer(ProgramAnalysis program)
                 if (!NamedClass(Resolve(address.In[0]), 0)) continue;
                 _replace[n] = _b.Const(VT.I32, 1);
                 n.Dead = true;
+                changed = true;
             }
             b.Nodes.RemoveAll(n => n.Dead);
         }
+        return changed;
     }
 
     private bool NamedClass(Node klass, int depth)
@@ -1460,6 +1510,7 @@ public sealed partial class Normalizer(ProgramAnalysis program)
                 if (kind == ThrowKind.InvalidCast && a != null && b != null)
                     _result.Casts.Add(new CastFact(p, PhiInputFor(a, target, p), PhiInputFor(b, target, p)));
                 if (kind == ThrowKind.Overflow) NoteOverflow(term.In[0]);
+                if (kind == ThrowKind.NullReference) RestoreGuardedReceiver(p, other, term.In[0], side);
 
                 RemoveEdge(p, target);
                 term.Op = Op.Jump;

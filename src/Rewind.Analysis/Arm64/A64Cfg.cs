@@ -45,6 +45,7 @@ public sealed class A64Cfg
 
         var instructions = new SortedDictionary<ulong, A64Instruction>();
         var leaders = new HashSet<ulong> { start };
+        var branchIslands = new HashSet<ulong>();
         var ends = new Dictionary<ulong, (BlockEnd End, List<ulong> Successors)>();
         var work = new Stack<ulong>();
         if (extraRoots != null)
@@ -62,13 +63,37 @@ public sealed class A64Cfg
 
         bool InFunction(ulong a) => a >= start && a < limit && (a == start || !context.IsFunctionStart(a));
 
+        // Accept only a bounded, straight-line executable island whose final direct
+        // branch demonstrably rejoins this function. Calls, returns, traps and indirect
+        // or conditional transfers keep the existing external-tail-call classification.
+        List<ulong>? ReturningBranchIsland(ulong target)
+        {
+            if ((target & 3) != 0) return null;
+            ImageSection? islandSection = image.SectionAt(target);
+            if (islandSection == null || !islandSection.IsExecutable) return null;
+            ulong islandLimit = context.NextFunctionStart(target);
+            if (islandLimit == 0 || islandLimit > islandSection.End) islandLimit = islandSection.End;
+            var addresses = new List<ulong>();
+            for (ulong address = target; addresses.Count < 4 && address + 4 <= islandLimit; address += 4)
+            {
+                if (InFunction(address) || !image.TrySpan(address, 4, out _)) return null;
+                A64Instruction instruction = A64Decoder.Decode(image.U32(address), address);
+                addresses.Add(address);
+                if (instruction.Op == A64Op.B)
+                    return InFunction(instruction.Target) ? addresses : null;
+                if (instruction.Op is not (A64Op.Nop or A64Op.Adr or A64Op.Adrp or
+                    A64Op.Ldr or A64Op.LdrLit or A64Op.Str or A64Op.AddImm or A64Op.SubImm)) return null;
+            }
+            return null;
+        }
+
         while (work.Count > 0)
         {
             ulong ip = work.Pop();
             while (true)
             {
                 if (instructions.ContainsKey(ip)) break;
-                if (ip < start || ip >= limit)
+                if ((ip < start || ip >= limit) && !branchIslands.Contains(ip))
                 {
                     cfg.Problems.Add($"control flow runs outside the function at 0x{ip:X}");
                     break;
@@ -110,8 +135,19 @@ public sealed class A64Cfg
                     case A64Op.B:
                     {
                         ulong target = ins.Target;
-                        if (!InFunction(target))
+                        if (!InFunction(target) && !branchIslands.Contains(target))
                         {
+                            // Linker/outline islands can branch back into the caller. Keep their
+                            // instructions and register effects: this is a jump, not a call/return.
+                            List<ulong>? island = ReturningBranchIsland(target);
+                            if (island != null)
+                            {
+                                foreach (ulong address in island) branchIslands.Add(address);
+                                ends[ip] = (BlockEnd.Jump, [target]);
+                                leaders.Add(target);
+                                work.Push(target);
+                                goto nextBlock;
+                            }
                             ends[ip] = (BlockEnd.TailCall, []);
                             goto nextBlock;
                         }
@@ -343,6 +379,6 @@ public sealed class A64Cfg
         or A64Op.FAbs or A64Op.FNeg or A64Op.FSqrt or A64Op.FCvt or A64Op.FRint or A64Op.FAdd or A64Op.FSub or A64Op.FMul or A64Op.FDiv
         or A64Op.FMax or A64Op.FMin or A64Op.FMaxNm or A64Op.FMinNm or A64Op.FNMul or A64Op.FMAdd or A64Op.FMSub or A64Op.FNMAdd or A64Op.FNMSub
         or A64Op.FCsel or A64Op.Scvtf or A64Op.Ucvtf or A64Op.Movi or A64Op.VMov or A64Op.Dup or A64Op.DupScalar or A64Op.DupGp or A64Op.Ins
-        or A64Op.InsGp or A64Op.VAnd or A64Op.VOrr or A64Op.VEor or A64Op.VBic or A64Op.VFAdd or A64Op.VFSub or A64Op.VFMul or A64Op.VFDiv or A64Op.Vector
+        or A64Op.InsGp or A64Op.VAnd or A64Op.VOrr or A64Op.VEor or A64Op.VBic or A64Op.VOrImm or A64Op.VBicImm or A64Op.VFAdd or A64Op.VFSub or A64Op.VFMul or A64Op.VFDiv or A64Op.Vector
         or A64Op.VecOp or A64Op.Ld1Lane or A64Op.Ld1R;
 }

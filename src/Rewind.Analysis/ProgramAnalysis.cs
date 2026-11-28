@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): slot-specialized invokers.
 using Rewind.Analysis.Abi;
 using Rewind.Analysis.Ir;
 using Rewind.Analysis.Runtime;
@@ -275,6 +276,7 @@ public sealed class ProgramAnalysis
     /// </summary>
     private bool IsPlainLeaf(ulong target)
     {
+        if (Model.Image.Arch == Rewind.Binary.CpuArch.Arm64) return false;
         if (Model.Image.SectionAt(target) is not { IsExecutable: true } || RangeOf(target) != null) return false;
         // (Its neighbours are of the same kind and nothing lists them: where it ends is told by its code alone.)
         X64Cfg body = X64Cfg.Build(Context, target);
@@ -309,7 +311,14 @@ public sealed class ProgramAnalysis
         {
             if (_inlinable.TryGetValue(target, out bool known)) return known;
             if (Environment.GetEnvironmentVariable("REWIND_NO_INLINE") == "1") return _inlinable[target] = false;
-            bool result = ((Model.Image.SectionAt(target) is { Name: "il2cpp", IsExecutable: true } && SizeBound(target) <= 2048) || IsPlainLeaf(target)) &&
+            // Clang may emit outlined managed cleanup lambdas in .text. The
+            // ARM64 lifter separately proves a complete bounded CFG, rejects
+            // callee EH/recursion/unknown code, and pastes exact instructions.
+            bool arm64Body = Model.Image.Arch == Rewind.Binary.CpuArch.Arm64 &&
+                Model.Image.SectionAt(target) is { IsExecutable: true } &&
+                RangeOf(target) is { } extent && extent.Start == target &&
+                extent.End > target && extent.End - target <= 2048;
+            bool result = ((Model.Image.SectionAt(target) is { Name: "il2cpp", IsExecutable: true } && SizeBound(target) <= 2048) || arm64Body || IsPlainLeaf(target)) &&
                           !Context.NoReturn.Contains(target) && Helpers.At(target) == null &&
                           ExceptionInfo(target) == null && (Resolve(target) is { IsManaged: false, Helper: null } || IsHeaderLeafCopy(target));
             return _inlinable[target] = result;
@@ -327,38 +336,6 @@ public sealed class ProgramAnalysis
 
     /// <summary>What a P/Invoke declaration imports (library, entry point, ...), when its wrapper could be read.</summary>
     public PInvokeImport? PInvokeOf(MethodDef method) => PInvoke.ByMethod.GetValueOrDefault(method);
-
-    private Dictionary<ulong, List<MethodDef>>? _pinvokeStubs;
-
-    /// <summary>
-    /// AArch64: the P/Invoke declarations a function the image imports (a PLT stub, by its symbol) is called for.
-    /// A declaration whose code calls one imported function and no other is that function's wrapper; IL2CPP links
-    /// such imports directly instead of resolving them at run time, so a call of the stub is a call of the
-    /// declaration (made through it, the way its wrapper marshals the arguments).
-    /// </summary>
-    public IReadOnlyDictionary<ulong, List<MethodDef>> PInvokeStubs => _pinvokeStubs ??= FindPInvokeStubs();
-
-    private Dictionary<ulong, List<MethodDef>> FindPInvokeStubs()
-    {
-        var result = new Dictionary<ulong, List<MethodDef>>();
-        if (Model.Image is not Rewind.Binary.ElfImage { Arch: Rewind.Binary.CpuArch.Arm64 } elf || elf.ImportStubs.Count == 0 ||
-            Environment.GetEnvironmentVariable("REWIND_NO_PINVOKE_STUBS") != null) return result;
-        foreach (MethodDef method in Model.Methods)
-        {
-            if ((method.Flags & MethodDef.PInvokeImpl) == 0 || method.Address == 0 || !method.IsStatic) continue;
-            Arm64.A64Cfg cfg = Arm64.A64Cfg.Build(Context, method.Address);
-            var stubs = new HashSet<ulong>();
-            foreach (Arm64.A64Block block in cfg.Blocks)
-                foreach (Arm64.A64Instruction ins in block.Instructions)
-                    if (ins.Op is Arm64.A64Op.Bl or Arm64.A64Op.B && elf.ImportStubs.ContainsKey(ins.Target) && Helpers.At(ins.Target) == null)
-                        stubs.Add(ins.Target);
-            if (stubs.Count != 1) continue;
-            ulong stub = stubs.First();
-            if (!result.TryGetValue(stub, out List<MethodDef>? list)) result[stub] = list = [];
-            list.Add(method);
-        }
-        return result;
-    }
 
     /// <summary>All P/Invoke declarations whose wrapper could be read.</summary>
     public IEnumerable<PInvokeImport> PInvokeDeclarations => PInvoke.ByMethod.Values;

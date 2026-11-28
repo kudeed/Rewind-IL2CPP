@@ -173,6 +173,13 @@ public sealed partial class A64Lifter
                     result[k] = Bits(_b.Raw(op, ft, F(A(k))));
                 }
                 break;
+            case VecKind.FRint:
+                for (int k = 0; k < count; k++)
+                {
+                    string name = RoundingName((A64Rounding)i.Amount) ?? throw new NotSupportedException($"vector rounding {(A64Rounding)i.Amount}");
+                    result[k] = Bits(Intrinsic("math." + name, ft, F(A(k))));
+                }
+                break;
             case VecKind.Scvtf or VecKind.Ucvtf:
                 for (int k = 0; k < count; k++)
                     result[k] = Bits(_b.Raw(kind == VecKind.Scvtf ? Op.SIntToF : Op.UIntToF, ft, A(k)));
@@ -233,6 +240,42 @@ public sealed partial class A64Lifter
                     widened[k] = i.Amount == 0 ? e : _b.Shift(Op.Shl, e, C(VT.I8, i.Amount));
                 }
                 SetElems(i.Rd, wide, widened);
+                return;
+            }
+            case VecKind.Rev64:
+                // Reverse element order separately within each 64-bit half.
+                // Compute all elements before writing even when Rd == Rn.
+                int perHalf = 8 / bytes;
+                for (int k = 0; k < count; k++)
+                    result[k] = A((k / perHalf) * perHalf + perHalf - 1 - k % perHalf);
+                break;
+            case VecKind.FCmLtZero:
+                for (int k = 0; k < count; k++)
+                    result[k] = AllOnes(_b.Raw(Op.FCmpLt, VT.I1, F(A(k)), C(ft, 0)), t);
+                break;
+            case VecKind.Ushl:
+                for (int k = 0; k < count; k++)
+                {
+                    // USHL takes the signed LOW BYTE of each count. A shift
+                    // beyond the element width is zero, not a masked count.
+                    Node value = A(k), shift = _b.SExt(_b.Trunc(B(k), VT.I8), VT.I32);
+                    Node negative = _b.Cmp(Op.CmpLtS, shift, C(VT.I32, 0));
+                    Node magnitude = _b.Select(negative, _b.Neg(shift), shift);
+                    Node outside = _b.Cmp(Op.CmpLeU, C(VT.I32, bytes * 8), magnitude);
+                    Node safe = _b.Trunc(_b.And(magnitude, C(VT.I32, bytes * 8 - 1)), VT.I8);
+                    Node shifted = _b.Select(negative, _b.Shift(Op.ShrU, value, safe), _b.Shift(Op.Shl, value, safe));
+                    result[k] = _b.Select(outside, C(t, 0), shifted);
+                }
+                break;
+            case VecKind.FCvtN:
+            {
+                // Snapshot both source doubles before any destination write:
+                // FCVTN2 can overlap its source and must preserve its low half.
+                var narrowed = new Node[2];
+                for (int k = 0; k < 2; k++)
+                    narrowed[k] = Bits(_b.Raw(Op.FTrunc, VT.F32, AsF(Elem(i.Rn, 8, k))));
+                if (!q) SetElems(i.Rd, 4, narrowed);
+                else for (int k = 0; k < 2; k++) SetElem(i.Rd, 4, 2 + k, narrowed[k]);
                 return;
             }
             case VecKind.Xtn:

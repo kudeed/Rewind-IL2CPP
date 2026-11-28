@@ -15,7 +15,7 @@ public sealed partial class HirBuilder
     /// <summary>True when <paramref name="bytes"/> is exactly one value of the struct type.</summary>
     private bool CopiesWhole(TypeSig? type, int bytes)
     {
-        if (!IsStructType(type) || Open(type!)) return false;
+        if (type == null || !IsStructType(type) || Open(type)) return false;
         var (size, _, known) = _p.Layouts.SizeOf(type);
         return known && size == bytes;
     }
@@ -236,6 +236,7 @@ public sealed partial class HirBuilder
     /// </summary>
     private bool TryEmitCopy(Node toAddress, Node fromAddress, int size, ulong address, bool quiet)
     {
+        if (TryEmitLeadingPaddingCopy(toAddress, fromAddress, size, address)) return true;
         Place? to = BlockPlace(toAddress, size, null), from = BlockPlace(fromAddress, size, null);
         if (to == null && from is PLocation { Type: var known } && CopiesWhole(known, size)) to = BlockPlace(toAddress, size, known);
         else if (from == null && to is PLocation { Type: var known2 } && CopiesWhole(known2, size)) from = BlockPlace(fromAddress, size, known2);
@@ -325,7 +326,7 @@ public sealed partial class HirBuilder
             foreach (Node n in b.Nodes)
             {
                 if (n.Dead || n.Op != Op.Store || n.In[1] is not { Op: Op.Load, Dead: false } load || !ReferenceEquals(load.Block, b)) continue;
-                if (_spillStores.Contains(n) || _caughtStores.Contains(n)) continue;
+                if (_spillStores.Contains(n) || _caughtStores.Contains(n) || _pieceMembers.Contains(n)) continue;
                 if (!_uses.TryGetValue(load, out List<Node>? users) || users.Count != 1 || !_position.ContainsKey(load)) continue;
                 int size = load.Type.Bytes();
                 if (size <= 0) continue;
@@ -350,7 +351,7 @@ public sealed partial class HirBuilder
                         end = Math.Max(end, list[j].From + list[j].Size);
                         j++;
                     }
-                    if (end - start > 16 && j - i >= 2) ConsiderPieces(b, list.GetRange(i, j - i), toBase, fromBase, apart, start, end);
+                    if (end - start >= 16 && j - i >= 2) ConsiderPieces(b, list.GetRange(i, j - i), toBase, fromBase, apart, start, end);
                     i = j;
                 }
             }

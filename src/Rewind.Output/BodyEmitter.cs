@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): inlined constructor folding, bits read as float/double.
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 using Mono.Cecil.Rocks;
@@ -45,7 +46,11 @@ public sealed class BodyEmitter
     /// <summary>Replaces the placeholder body of <paramref name="method"/>. Returns null on success, else why not.</summary>
     public string? Emit(MethodDef method, HMethod h)
     {
-        MethodDefinition target = _emitter[method];
+        return EmitTo(method,h,_emitter[method]);
+    }
+
+    internal string? EmitTo(MethodDef method,HMethod h,MethodDefinition target)
+    {
         MethodBody saved = target.Body;
         try
         {
@@ -531,27 +536,41 @@ public sealed class BodyEmitter
         private string Describe(HExpr e) => HirPrinter.Print(e, _h);
 
         /// <summary>The integer width an expression has on the IL stack: 64 for long and native int, else 32.</summary>
-        private static int StackBits(HExpr e) => Bits(e.Type) == 64 ? 64 : 32;
+        // ldloc pushes the declared local type even when a merge read has no annotation.
+        private static TypeSig? EmittedType(HExpr e)
+        {
+            if (e is HLocal local) return local.Variable.Type;
+            if (e is not HBinary binary) return e.Type;
+            TypeSig? left = EmittedType(binary.Left), right = EmittedType(binary.Right);
+            if (IsFloat(left) || IsFloat(right)) return e.Type ?? left ?? right;
+            if (left is not PrimitiveSig || right is not PrimitiveSig) return e.Type;
+            bool shift = binary.Op is HBinaryOp.Shl or HBinaryOp.Shr or HBinaryOp.ShrUn;
+            TypeSig actual = Bits(left) == 64 || shift ? left : right;
+            // Binary emits at the operands' stack width; an expression annotation does not narrow it.
+            return Bits(e.Type) == Bits(actual) ? e.Type : actual;
+        }
+        private static int StackBits(HExpr e) => Bits(EmittedType(e)) == 64 ? 64 : 32;
 
         /// <summary>Pushes a value and adapts integer width to what the destination holds.</summary>
         private void ValueAs(HExpr e, TypeSig? target)
         {
+            TypeSig? source = EmittedType(e);
             // "null" given to a T is T's nothing: null only where T is a class.
-            if (Own(target) != null && e is HConst { Value: null })
+            if (target != null && Own(target) != null && e is HConst { Value: null })
             {
                 Default(target);
                 return;
             }
             Value(e);
             // The address of a local handed over as an unmanaged pointer: "&local" (ldloca, conv.u).
-            if (target is PointerSig && (e is HAddressOf || e.Type is ByRefSig))
+            if (target is PointerSig && (e is HAddressOf || source is ByRefSig))
             {
                 _il.Emit(OpCodes.Conv_U);
                 return;
             }
             // A T handed on as something else - an object, the class or interface it is declared to be - is
             // boxed, which leaves a reference what it is; something else handed on as a T is taken out likewise.
-            if (Own(e.Type) is { } from)
+            if (Own(source) is { } from)
             {
                 if (target != null && !ReferenceEquals(target, from) && target is not (GenericParamSig or ByRefSig or PointerSig) && !target.IsValueType)
                     _il.Emit(OpCodes.Box, Ref(from));
@@ -559,14 +578,14 @@ public sealed class BodyEmitter
             }
             if (Own(target) is { } to)
             {
-                if (e.Type != null && e.Type is not (ByRefSig or PointerSig) && !e.Type.IsValueType) _il.Emit(OpCodes.Unbox_Any, Ref(to));
+                if (source != null && source is not (ByRefSig or PointerSig) && !source.IsValueType) _il.Emit(OpCodes.Unbox_Any, Ref(to));
                 return;
             }
-            if (target == null || IsFloat(target) || IsFloat(e.Type)) return;
-            int want = Bits(target), have = Bits(e.Type);
+            if (target == null || IsFloat(target) || IsFloat(source)) return;
+            int want = Bits(target), have = Bits(source);
             if (want == 64 && have == 32 && target is PrimitiveSig or { Definition.IsEnum: true })
-                _il.Emit(IsUnsigned(e.Type) ? OpCodes.Conv_U8 : OpCodes.Conv_I8);
-            else if (want == 32 && have == 64 && e.Type is PrimitiveSig)
+                _il.Emit(IsUnsigned(source) ? OpCodes.Conv_U8 : OpCodes.Conv_I8);
+            else if (want == 32 && have == 64 && source is PrimitiveSig)
                 _il.Emit(OpCodes.Conv_I4);
         }
 
@@ -586,7 +605,7 @@ public sealed class BodyEmitter
                 return;
             }
             Value(e);
-            if (Bits(e.Type) == 64) _il.Emit(OpCodes.Conv_I4);
+            if (StackBits(e) == 64) _il.Emit(OpCodes.Conv_I4);
         }
 
         private static readonly bool WideIndexConstants = Environment.GetEnvironmentVariable("REWIND_WIDE_INDEX_CONSTANTS") != null;
@@ -724,6 +743,17 @@ public sealed class BodyEmitter
                     return;
                 case HField f:
                 {
+                    if (_model.Image.Arch == Rewind.Binary.CpuArch.Arm64 &&
+                        Environment.GetEnvironmentVariable("REWIND_NO_PUBLIC_COLOR32_OVERLAY") == null &&
+                        f.Object is { } color &&
+                        PublicOverlayRead.TryColor32(f.Field,color.Type,2*_model.Image.PointerSize,out FieldDef[] channels))
+                    {
+                        var snapshot=new VariableDefinition(Ref(color.Type));
+                        _body.Variables.Add(snapshot);
+                        Value(color);
+                        PublicOverlayRead.Emit(_il,snapshot,channels.Select(c=>_e.ImportField(_module,c)).ToArray());
+                        return;
+                    }
                     FieldReference field = _e.ImportField(_module, f.Field, f.DeclaringType);
                     if (f.Object == null)
                     {
@@ -872,7 +902,7 @@ public sealed class BodyEmitter
             bool shift = b.Op is HBinaryOp.Shl or HBinaryOp.Shr or HBinaryOp.ShrUn;
             bool wide = StackBits(b.Left) == 64 || (!shift && StackBits(b.Right) == 64);
             Value(b.Left);
-            if (wide && StackBits(b.Left) == 32 && !IsFloat(b.Left.Type)) _il.Emit(IsUnsigned(b.Left.Type) ? OpCodes.Conv_U8 : OpCodes.Conv_I8);
+            if (wide && StackBits(b.Left) == 32 && !IsFloat(EmittedType(b.Left))) _il.Emit(IsUnsigned(EmittedType(b.Left)) ? OpCodes.Conv_U8 : OpCodes.Conv_I8);
             Value(b.Right);
             if (shift)
             {
@@ -884,8 +914,8 @@ public sealed class BodyEmitter
                     _il.Emit(OpCodes.And);
                 }
             }
-            else if (wide && StackBits(b.Right) == 32 && !IsFloat(b.Right.Type))
-                _il.Emit(IsUnsigned(b.Right.Type) ? OpCodes.Conv_U8 : OpCodes.Conv_I8);
+            else if (wide && StackBits(b.Right) == 32 && !IsFloat(EmittedType(b.Right)))
+                _il.Emit(IsUnsigned(EmittedType(b.Right)) ? OpCodes.Conv_U8 : OpCodes.Conv_I8);
 
             _il.Emit(b.Op switch
             {
@@ -896,28 +926,37 @@ public sealed class BodyEmitter
                 HBinaryOp.SubOvf => OpCodes.Sub_Ovf, HBinaryOp.SubOvfUn => OpCodes.Sub_Ovf_Un, HBinaryOp.MulOvf => OpCodes.Mul_Ovf,
                 _ => OpCodes.Mul_Ovf_Un,
             });
+            // ARM64 scalar/vector FP32 arithmetic rounds at each instruction.
+            // A CLI runtime may retain excess precision on the evaluation
+            // stack (in particular Mono before widening an operand to R8).
+            // Preserve the native rounding boundary explicitly.
+            if (_model.Image.Arch == Rewind.Binary.CpuArch.Arm64 &&
+                b.Type is PrimitiveSig { Element: Il2CppTypeEnum.R4 } &&
+                b.Op is HBinaryOp.Add or HBinaryOp.Sub or HBinaryOp.Mul or HBinaryOp.Div or HBinaryOp.Rem &&
+                Environment.GetEnvironmentVariable("REWIND_NO_EXPLICIT_FP32_ROUNDING") == null)
+                _il.Emit(OpCodes.Conv_R4);
         }
 
         private void Compare(HCompare c)
         {
-            bool isFloat = IsFloat(c.Left.Type) || IsFloat(c.Right.Type);
+            bool isFloat = IsFloat(EmittedType(c.Left)) || IsFloat(EmittedType(c.Right));
             // ("x as long" is an object or null, not a number of 64 bits: nothing to widen the other side to.)
             bool tested = c.Left is HTypeExpr { Op: HTypeOp.IsInst } || c.Right is HTypeExpr { Op: HTypeOp.IsInst };
             bool wide = !isFloat && !tested && (StackBits(c.Left) == 64 || StackBits(c.Right) == 64);
             Value(c.Left);
-            if (wide && StackBits(c.Left) == 32 && c.Left.Type is PrimitiveSig) _il.Emit(IsUnsigned(c.Left.Type) ? OpCodes.Conv_U8 : OpCodes.Conv_I8);
+            if (wide && StackBits(c.Left) == 32 && EmittedType(c.Left) is PrimitiveSig) _il.Emit(IsUnsigned(EmittedType(c.Left)) ? OpCodes.Conv_U8 : OpCodes.Conv_I8);
             // A T is compared (with null, with another reference) as the object it is when boxed.
-            if (Own(c.Left.Type) is { } openLeft) _il.Emit(OpCodes.Box, Ref(openLeft));
+            if (Own(EmittedType(c.Left)) is { } openLeft) _il.Emit(OpCodes.Box, Ref(openLeft));
             Value(c.Right);
-            if (wide && StackBits(c.Right) == 32 && c.Right.Type is PrimitiveSig) _il.Emit(IsUnsigned(c.Right.Type) ? OpCodes.Conv_U8 : OpCodes.Conv_I8);
-            if (Own(c.Right.Type) is { } openRight) _il.Emit(OpCodes.Box, Ref(openRight));
+            if (wide && StackBits(c.Right) == 32 && EmittedType(c.Right) is PrimitiveSig) _il.Emit(IsUnsigned(EmittedType(c.Right)) ? OpCodes.Conv_U8 : OpCodes.Conv_I8);
+            if (Own(EmittedType(c.Right)) is { } openRight) _il.Emit(OpCodes.Box, Ref(openRight));
 
             void Not()
             {
                 _il.Emit(OpCodes.Ldc_I4_0);
                 _il.Emit(OpCodes.Ceq);
             }
-            bool unsigned = IsUnsigned(c.Left.Type) && (IsUnsigned(c.Right.Type) || c.Right is HConst);
+            bool unsigned = IsUnsigned(EmittedType(c.Left)) && (IsUnsigned(EmittedType(c.Right)) || c.Right is HConst);
             switch (c.Op)
             {
                 case HCompareOp.Eq: _il.Emit(OpCodes.Ceq); break;
@@ -959,6 +998,13 @@ public sealed class BodyEmitter
         private void Call(HCall call)
         {
             MethodDef m = call.Method;
+            if(call.ReceiverIndependent&&(call.This is not HArg {Index:-1}||m.IsStatic||m.IsVirtual||
+                m.IsConstructor||m.IsGenericDefinition||m.DeclaringType.IsValueType||m.DeclaringType.IsGenericDefinition||
+                _method.IsStatic||_method.IsConstructor||_method.IsGenericDefinition||
+                !Rewind.Analysis.Recover.HirBuilder.IsNonGenericReceiverOwner(_method.DeclaringType,m.DeclaringType)||
+                !ReferenceEquals(call.This.Type?.Definition,_method.DeclaringType)||
+                call.Virtual||call.Constrained!=null||call.MethodArguments.Length!=0||call.DeclaringType!=null||call.Alternatives.Count!=0))
+                throw new CannotEmit("invalid proven receiver-independent direct call");
             MethodReference target = Instantiate(_e.ImportMethod(_module, m, call.DeclaringType), call.MethodArguments);
             if (call.Constrained != null)
             {
@@ -973,9 +1019,9 @@ public sealed class BodyEmitter
             }
             // A method called on a T: on the T where it is, with its type for the runtime to find the method by
             // (right for a class and for a struct alike).
-            if (!m.IsStatic && m.Name != ".ctor" && Own(call.This?.Type) is { } receiver)
+            if (!m.IsStatic && m.Name != ".ctor" && call.This is { } thisReceiver && Own(thisReceiver.Type) is { } receiver)
             {
-                Address(call.This);
+                Address(thisReceiver);
                 Arguments(m, call.DeclaringType, call.Arguments);
                 _il.Emit(OpCodes.Constrained, Ref(receiver));
                 _il.Emit(OpCodes.Callvirt, target);
@@ -992,7 +1038,7 @@ public sealed class BodyEmitter
 
             // Calls on objects check the receiver for null, as "callvirt" does; a direct "call" is for struct
             // methods, constructors, and "base.Method()".
-            bool direct = m.IsStatic || structReceiver || m.Name == ".ctor" || (m.IsVirtual && !call.Virtual);
+            bool direct = call.ReceiverIndependent || m.IsStatic || structReceiver || m.Name == ".ctor" || (m.IsVirtual && !call.Virtual);
             _il.Emit(direct ? OpCodes.Call : OpCodes.Callvirt, target);
         }
 

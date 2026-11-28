@@ -34,6 +34,14 @@ public sealed class DecompileOptions
     /// code has exactly the shape the C# compiler gives such a class; the class itself is always what ran.
     /// </summary>
     public bool StateMachines;
+    /// <summary>Keep compiler-generated local methods and closures as members.</summary>
+    public bool RawClosures;
+    /// <summary>Preserve explicit single-precision rounding in C# output.</summary>
+    public bool PreserveFloatBoundaries = true;
+    /// <summary>Keep raw private runtime operations for explicit source projection; bypass lossy cleanup.</summary>
+    public bool PreservePrivateInternals = true;
+    /// <summary>Optional exact top-level type filter for source-only export.</summary>
+    public HashSet<string>? SourceTypes;
     /// <summary>
     /// How many threads recover method bodies; zero for the default (REWIND_THREADS, else one per processor).
     /// What comes out is the same for any number.
@@ -53,7 +61,7 @@ public sealed class DecompileResult
 }
 
 /// <summary>Runs the whole pipeline: recover method bodies, rebuild the assemblies with them, write C# source.</summary>
-public static class Decompiler
+public static partial class Decompiler
 {
     public static DecompileResult Run(Il2CppModel model, ProgramAnalysis? program, DecompileOptions options)
     {
@@ -65,6 +73,11 @@ public static class Decompiler
 
         var selected = new HashSet<AssemblyModel>(model.Assemblies.Where(a => options.Assemblies?.Invoke(a) ?? true));
         var report = new StringBuilder();
+        var evidence = new RecoveryEvidence(model, program, selected);
+        // A row names the method in full: the assembly and the parameter types tell overloads and same-named types
+        // in different assemblies apart, which "Type::Method" alone does not.
+        static string Row(string kind, MethodDef method, string reason) =>
+            $"{kind}\t{method.FullName}\t{reason}\t{method.DeclaringType.Assembly.Name}\t{method.FullName}({string.Join(", ", method.Parameters.Select(p => p.Type.DisplayName))})";
 
         if (program != null)
         {
@@ -80,6 +93,7 @@ public static class Decompiler
             // Where parts of it are left open they are marked as in any other method (the placeholder said
             // nothing of what the method does; what was recovered around a gap does).
             var work = new List<(MethodDef Method, MethodInst? Shared)>();
+            var sharedGaps = new HashSet<MethodDef>();
             foreach (MethodDef method in model.Methods)
             {
                 if (!selected.Contains(method.DeclaringType.Assembly)) continue;
@@ -116,17 +130,24 @@ public static class Decompiler
                             HMethod generic = recovered.Recovered!;
                             if (generic.Problems.Count != 0)
                             {
-                                report.AppendLine($"generic, gaps\t{method.FullName}\t{string.Join(" | ", generic.Problems.Distinct().Take(6))}");
-                                if (!genericGaps) return;
+                                sharedGaps.Add(method);
+                                report.AppendLine(Row("generic, gaps", method, string.Join(" | ", generic.Problems.Distinct().Take(6))));
+                                if (!genericGaps)
+                                {
+                                    evidence.Record(method, work[i].Shared!.Address, "generic_gaps_not_emitted", generic);
+                                    return;
+                                }
                             }
                             string? refused = bodies.Emit(method, generic);
-                            if (refused != null) report.AppendLine($"generic, not emitted\t{method.FullName}\t{refused}");
+                            evidence.Record(method, work[i].Shared!.Address, refused != null ? "not_emitted" : generic.Problems.Count == 0 ? "clean" : "gaps", generic, refused);
+                            if (refused != null) report.AppendLine(Row("generic, not emitted", method, refused));
                             else if (generic.Problems.Count == 0) result.GenericClean++;
                             else result.GenericWithGaps++;
                         }
                         catch (Exception e)
                         {
-                            report.AppendLine($"generic, failed\t{method.FullName}\t{e.GetType().Name}: {e.Message}");
+                            report.AppendLine(Row("generic, failed", method, $"{e.GetType().Name}: {e.Message}"));
+                            evidence.Record(method, work[i].Shared!.Address, "failed", recovered.Recovered, $"{e.GetType().Name}: {e.Message}");
                         }
                         return;
                     }
@@ -137,25 +158,28 @@ public static class Decompiler
                         HMethod h = recovered.Recovered!;
                         result.Recovered++;
                         string? why = bodies.Emit(method, h);
+                        evidence.Record(method, method.Address, why != null ? "not_emitted" : h.Problems.Count == 0 ? "clean" : "gaps", h, why);
                         if (why != null)
                         {
                             result.NotEmitted++;
                             result.EmitFailures[why] = result.EmitFailures.GetValueOrDefault(why) + 1;
-                            report.AppendLine($"not emitted\t{method.FullName}\t{why}");
+                            report.AppendLine(Row("not emitted", method, why));
                         }
                         else if (h.Problems.Count == 0) result.Clean++;
                         else
                         {
                             result.WithGaps++;
-                            report.AppendLine($"gaps\t{method.FullName}\t{string.Join(" | ", h.Problems.Distinct().Take(6))}");
+                            report.AppendLine(Row("gaps", method, string.Join(" | ", h.Problems.Distinct().Take(6))));
                         }
                     }
                     catch (Exception e)
                     {
                         result.Crashed++;
-                        report.AppendLine($"failed\t{method.FullName}\t{e.GetType().Name}: {e.Message}");
+                        report.AppendLine(Row("failed", method, $"{e.GetType().Name}: {e.Message}"));
+                        evidence.Record(method, method.Address, "failed", recovered.Recovered, $"{e.GetType().Name}: {e.Message}");
                     }
                 });
+            ClosedArraySpecializations.Run(model,program,emitter,bodies,work.Select(w=>w.Method),sharedGaps,options);
             options.Log($"method bodies: {result.Methods} with native code, {result.Clean} recovered completely, {result.WithGaps} with gaps marked in the output, " +
                         $"{result.NotEmitted + result.Crashed} left as stubs ({sw.ElapsedMilliseconds} ms)");
             if (result.GenericShared != 0)
@@ -171,6 +195,7 @@ public static class Decompiler
 
         Directory.CreateDirectory(options.OutputDirectory);
         File.WriteAllText(Path.Combine(options.OutputDirectory, "recovery-report.tsv"), report.ToString());
+        evidence.Write(options.OutputDirectory);
 
         if (options.WriteSource)
         {
@@ -243,6 +268,9 @@ public static class Decompiler
             ThrowOnAssemblyResolveErrors = false,
             // Compiler-generated members are part of what was compiled; keep the names as they are.
             ShowXmlDocumentation = false,
+            // Keep explicit delegate constructions; a method-group cast can
+            // be ill-typed on C# 9 and may introduce caching on newer compilers.
+            UseImplicitMethodGroupConversion = false,
         };
         if (stateMachines)
         {
@@ -259,10 +287,25 @@ public static class Decompiler
         return new CSharpDecompiler(module, resolver, settings);
     }
 
+    /// <summary>Export an already recovered assembly without rerunning native analysis.</summary>
+    public static DecompileResult ExportSource(string assemblyPath, string targetDirectory, DecompileOptions options)
+    {
+        var result = new DecompileResult();
+        string fullPath = Path.GetFullPath(assemblyPath);
+        WriteSource(fullPath, Path.GetDirectoryName(fullPath)!, targetDirectory, result, options);
+        return result;
+    }
+
     /// <summary>Decompiles one rebuilt assembly into one C# file per top-level type.</summary>
     private static void WriteSource(string assemblyPath, string assemblyDirectory, string targetDirectory, DecompileResult result, DecompileOptions options)
     {
+        if (!options.PreservePrivateInternals)
+            throw new ArgumentException("Lossy source cleanup is disabled: preserve private operations and resolve unsupported code with typed recovery or semantic source projection.", nameof(options));
         Action<string> log = options.Log;
+        using var sourceImage = new SourceFloatBoundaries(assemblyPath, options.PreserveFloatBoundaries);
+        assemblyPath = sourceImage.AssemblyPath;
+        if (sourceImage.Calls != 0)
+            log($"source precision: {sourceImage.Calls} explicit rounding boundaries, {sourceImage.Negations} typed negations in temporary {Path.GetFileName(assemblyPath)}");
         List<(string File, FullTypeName Name)> types = [];
         try
         {
@@ -274,7 +317,8 @@ public static class Decompiler
                 TypeDefinition definition = reader.GetTypeDefinition(handle);
                 if (!definition.GetDeclaringType().IsNil) continue; // nested types come with their parent
                 string name = reader.GetString(definition.Name), ns = reader.GetString(definition.Namespace);
-                if (name is "<Module>" or "__Rewind") continue;
+                if (name is "<Module>" or "__Rewind" || name == SourceFloatBoundaries.HelperName && ns.Length == 0) continue;
+                if (options.SourceTypes != null && !options.SourceTypes.Contains(ns.Length == 0 ? name : ns + "." + name)) continue;
                 string relative = Path.Combine(ns.Length == 0 ? "" : Path.Combine(ns.Split('.').Select(SafeName).ToArray()), SafeName(name));
                 string unique = relative;
                 for (int n = 2; !used.Add(unique); n++) unique = relative + "_" + n;
@@ -287,7 +331,10 @@ public static class Decompiler
             return;
         }
 
-        int errors = 0, iteratorsKept = 0, closuresKept = 0;
+        if (options.SourceTypes != null && types.Count != options.SourceTypes.Count)
+            throw new InvalidDataException("one or more requested top-level source types were not found");
+        Directory.CreateDirectory(targetDirectory);
+        int errors = 0, iteratorsKept = 0, closuresKept = 0, markersUsed = 0, precisionUsed = 0;
         var work = new ConcurrentQueue<(string File, FullTypeName Name)>(types);
         int workers = Math.Max(1, Math.Min(Environment.ProcessorCount, 1 + types.Count / 64));
         var threads = new List<Thread>();
@@ -302,7 +349,7 @@ public static class Decompiler
                 CSharpFormattingOptions format = new DecompilerSettings(options.Language).CSharpFormattingOptions;
                 try
                 {
-                    decompiler = NewDecompiler(assemblyPath, assemblyDirectory, options.Language, options.StateMachines);
+                    decompiler = NewDecompiler(assemblyPath, assemblyDirectory, options.Language, options.StateMachines, closures: options.RawClosures);
                 }
                 catch (Exception e)
                 {
@@ -320,7 +367,7 @@ public static class Decompiler
                         // state machines as classes instead (see IteratorCheck).
                         if (!options.StateMachines && !NoIteratorCheck && IteratorCheck.HasStuckIterator(tree))
                         {
-                            machines ??= NewDecompiler(assemblyPath, assemblyDirectory, options.Language, stateMachines: true, iteratorsOnly: true);
+                            machines ??= NewDecompiler(assemblyPath, assemblyDirectory, options.Language, stateMachines: true, iteratorsOnly: true, closures: options.RawClosures);
                             tree = machines.DecompileType(item.Name);
                             machinesUsed = true;
                             Interlocked.Increment(ref iteratorsKept);
@@ -345,6 +392,10 @@ public static class Decompiler
                         text = DecompileMemberwise(decompiler, item.Name, e);
                     }
                     if (MarkFailedMembers(ref text)) failed = true;
+                    SanitizeIdentifiers(ref text);
+                    if (text.Contains("__Rewind.", StringComparison.Ordinal)) Interlocked.Exchange(ref markersUsed, 1);
+                    if (sourceImage.Calls != 0 && text.Contains(SourceFloatBoundaries.HelperName, StringComparison.Ordinal))
+                        Interlocked.Exchange(ref precisionUsed, 1);
                     if (failed) Interlocked.Increment(ref errors);
                     string file = Path.Combine(targetDirectory, item.File);
                     Directory.CreateDirectory(Path.GetDirectoryName(file)!);
@@ -355,6 +406,10 @@ public static class Decompiler
             threads.Add(thread);
         }
         foreach (Thread t in threads) t.Join();
+        // The marker calls the written bodies make (__Rewind.Note, .Opaque, .Effect) name a type the body writer
+        // adds to the rebuilt assembly; it is not written from the metadata, so the file that declares it is.
+        if (markersUsed != 0) File.WriteAllText(Path.Combine(targetDirectory, "__Rewind.cs"), MarkerHelper);
+        if (precisionUsed != 0) File.WriteAllText(Path.Combine(targetDirectory, SourceFloatBoundaries.HelperName + ".cs"), SourceFloatBoundaries.HelperSource);
         if (iteratorsKept != 0)
             log($"note:     {iteratorsKept} types written with their iterators as state machine classes: the C# decompiler's \"yield return\" for them could not advance");
         if (closuresKept != 0)
@@ -370,6 +425,39 @@ public static class Decompiler
     private static readonly bool NoIteratorCheck = Environment.GetEnvironmentVariable("REWIND_NO_ITERATOR_CHECK") != null;
 
     private const string FailedMember = "// ILSpy could not decompile this member";
+
+    /// <summary>
+    /// The type the marker calls in the written bodies need. Its members say what the decompiler could not put back:
+    /// <c>Note</c> does nothing (a gap whose code is not needed to compile), <c>Opaque</c> and <c>Effect</c> throw if
+    /// the method is ever called, because the value or the call they stand for was not recovered.
+    /// </summary>
+    private const string MarkerHelper = """
+        internal static class __Rewind
+        {
+            internal static T Opaque<T>(string what) { throw new System.NotSupportedException(what); }
+            internal static void Effect(string what) { throw new System.NotSupportedException(what); }
+            internal static void Note(string what) { }
+            internal static ref T Ref<T>(T value) => ref RefCell<T>.Value;
+            internal static int Sign(System.Numerics.BigInteger value) => value.Sign;
+            private static class RefCell<T> { internal static T Value; }
+            internal static uint StringHash(string s) { uint num = 0u; if (s != null) { num = 2166136261u; for (int i = 0; i < s.Length; i++) num = (s[i] ^ num) * 16777619u; } return num; }
+            internal static UnityEngine.Vector3 Slerp(in UnityEngine.Vector3 a, in UnityEngine.Vector3 b, float t) => UnityEngine.Vector3.Slerp(a, b, t);
+            internal static UnityEngine.Vector3 RotateTowards(in UnityEngine.Vector3 current, in UnityEngine.Vector3 target, float maxRadiansDelta, float maxMagnitudeDelta) => UnityEngine.Vector3.RotateTowards(current, target, maxRadiansDelta, maxMagnitudeDelta);
+            internal static UnityEngine.Vector3 Normalize(in UnityEngine.Vector3 v) => UnityEngine.Vector3.Normalize(v);
+            internal static UnityEngine.Vector3 Cross(in UnityEngine.Vector3 a, in UnityEngine.Vector3 b) => UnityEngine.Vector3.Cross(a, b);
+            internal static UnityEngine.Vector3 Project(in UnityEngine.Vector3 v, in UnityEngine.Vector3 onNormal) => UnityEngine.Vector3.Project(v, onNormal);
+            internal static UnityEngine.Vector3 ProjectOnPlane(in UnityEngine.Vector3 v, in UnityEngine.Vector3 planeNormal) => UnityEngine.Vector3.ProjectOnPlane(v, planeNormal);
+            internal static UnityEngine.Quaternion Slerp(in UnityEngine.Quaternion a, in UnityEngine.Quaternion b, float t) => UnityEngine.Quaternion.Slerp(a, b, t);
+            internal static UnityEngine.Quaternion Lerp(in UnityEngine.Quaternion a, in UnityEngine.Quaternion b, float t) => UnityEngine.Quaternion.Lerp(a, b, t);
+            internal static UnityEngine.Quaternion AngleAxis(float angle, in UnityEngine.Vector3 axis) => UnityEngine.Quaternion.AngleAxis(angle, axis);
+            internal static UnityEngine.Quaternion FromToRotation(in UnityEngine.Vector3 from, in UnityEngine.Vector3 to) => UnityEngine.Quaternion.FromToRotation(from, to);
+            internal static UnityEngine.Quaternion Inverse(in UnityEngine.Quaternion q) => UnityEngine.Quaternion.Inverse(q);
+            internal static UnityEngine.Quaternion LookRotation(in UnityEngine.Vector3 forward, in UnityEngine.Vector3 upwards) => UnityEngine.Quaternion.LookRotation(forward, upwards);
+            internal static UnityEngine.Matrix4x4 TRS(in UnityEngine.Vector3 pos, in UnityEngine.Quaternion q, in UnityEngine.Vector3 s) => UnityEngine.Matrix4x4.TRS(pos, q, s);
+            internal static UnityEngine.Matrix4x4 Inverse(in UnityEngine.Matrix4x4 m) => m.inverse;
+            internal static bool TestPlanesAABB(UnityEngine.Plane[] planes, in UnityEngine.Bounds bounds) => UnityEngine.GeometryUtility.TestPlanesAABB(planes, bounds);
+        }
+        """ + "\n";
 
     /// <summary>
     /// A member the C# decompiler gave up on comes out as a body of comments: an empty method, which compiles and

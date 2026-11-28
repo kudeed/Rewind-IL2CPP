@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): floating-point negation.
 namespace Rewind.Analysis.Ir;
 
 /// <summary>

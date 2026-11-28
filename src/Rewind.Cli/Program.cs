@@ -16,7 +16,8 @@ internal static class Program
           rewind info <input>                 show what the input is and whether it can be read
           rewind dump <input> [-o <dir>]      write dump.cs: every type and member with addresses and offsets
           rewind decompile <input> [-o <dir>] rebuild the .NET assemblies with recovered method bodies and write
-                                              C# source (assemblies/, src/, recovery-report.tsv)
+                                              C# source (assemblies/, src/, recovery-report.tsv, recovery-evidence.jsonl)
+          rewind source <assembly.dll> [-o <dir>] re-export C# from an existing recovered managed assembly
 
         <input> may be a game folder, the game's .exe, an APK / XAPK / APKS / AAB, an IPA,
         or the IL2CPP binary itself (GameAssembly.dll, libil2cpp.so, UnityFramework).
@@ -31,6 +32,9 @@ internal static class Program
           --no-source            decompile: write the assemblies only, skip C# source
           --csharp <version>     decompile: write source for this C# version (e.g. 9 for a Unity 2021.2+ project;
                                  default: the latest)
+          --raw-closures        keep compiler-generated local functions and closures as members
+          --no-source-fp32      source export: disable explicit FP32 rounding preservation (A/B)
+          --source-type <name>  source: exact top-level type to export (repeatable)
           --state-machines       decompile: write iterators and async methods as the classes the compiler made of
                                  them (no "yield return" or "await")
           --signatures <path>    decompile: signature file or folder for recognizing runtime functions
@@ -44,7 +48,8 @@ internal static class Program
     {
         public string Command = "";
         public string? Input, OutDir, Metadata, Binary, Abi, Unity, Signatures, CSharp;
-        public bool StateMachines;
+        public bool StateMachines, RawClosures, NoSourceFp32;
+        public List<string> SourceTypes = [];
         public int Threads;
         public List<string> Assemblies = [];
         public bool Verbose, NoSource;
@@ -90,6 +95,7 @@ internal static class Program
                 "info" => Info(o),
                 "dump" => Dump(o),
                 "decompile" => Decompile(o),
+                "source" => Source(o),
                 _ => UnknownCommand(o.Command),
             };
         }
@@ -135,6 +141,11 @@ internal static class Program
                 case "--signatures": o.Signatures = Next(); break;
                 case "--csharp": o.CSharp = Next(); break;
                 case "--state-machines": o.StateMachines = true; break;
+                case "--raw-closures": o.RawClosures = true; break;
+                case "--no-source-fp32": o.NoSourceFp32 = true; break;
+                case "--source-type":
+                    if (Next() is not { } typeName) return null;
+                    o.SourceTypes.Add(typeName); break;
                 case "--threads":
                     if (!int.TryParse(Next(), out o.Threads) || o.Threads < 1)
                     {
@@ -159,6 +170,11 @@ internal static class Program
                     o.Input = a;
                     break;
             }
+        }
+        if (o.SourceTypes.Count != 0 && o.Command != "source")
+        {
+            Console.Error.WriteLine("error: --source-type is only supported by the source command");
+            return null;
         }
         if (o.Input == null)
         {
@@ -243,6 +259,8 @@ internal static class Program
         };
         if (o.CSharp != null) options.Language = ParseLanguage(o.CSharp);
         options.StateMachines = o.StateMachines;
+        options.RawClosures = o.RawClosures;
+        options.PreserveFloatBoundaries = !o.NoSourceFp32;
         options.Threads = o.Threads;
         if (o.Assemblies.Count != 0)
         {
@@ -255,6 +273,23 @@ internal static class Program
         Console.WriteLine($"done:     output in {outDir}");
         _ = result;
         return 0;
+    }
+
+    private static int Source(Options o)
+    {
+        string outDir = Path.GetFullPath(o.OutDir ?? "rewind-source");
+        var options = new DecompileOptions
+        {
+            StateMachines = o.StateMachines,
+            RawClosures = o.RawClosures,
+            PreserveFloatBoundaries = !o.NoSourceFp32,
+            SourceTypes = o.SourceTypes.Count == 0 ? null : new HashSet<string>(o.SourceTypes, StringComparer.Ordinal),
+            Log = Console.WriteLine,
+        };
+        if (o.CSharp != null) options.Language = ParseLanguage(o.CSharp);
+        var result = Rewind.Output.Decompiler.ExportSource(o.Input!, outDir, options);
+        Console.WriteLine($"source: {result.Types} types, {result.TypesWithErrors} with decompiler errors, output {outDir}");
+        return result.Types == 0 || result.TypesWithErrors != 0 ? 1 : 0;
     }
 
     /// <summary>"9", "9.0", "7.3", "latest" as a version of the C# language.</summary>

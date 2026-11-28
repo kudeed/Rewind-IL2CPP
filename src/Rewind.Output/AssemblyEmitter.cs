@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): one AssemblyRef per assembly.
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 using Rewind.Model;
@@ -84,6 +85,19 @@ public sealed class AssemblyEmitter
         CreateAssemblies();
         CreateTypeShells();
         MarkPrimitives();
+        // Cecil determines a definition's value-type kind from its base.
+        // A generic base/interface/constraint can import a value type from
+        // a later assembly before that definition's hierarchy is assigned.
+        // Seed value-type bases before any such signature is imported;
+        // otherwise Cecil caches a CLASS TypeRef instead of VALUETYPE.
+        if (Environment.GetEnvironmentVariable("REWIND_NO_EARLY_VALUE_TYPE_BASES") == null)
+        {
+            foreach (TypeDef type in _model.Types.Where(t => t.IsValueType && t.BaseType != null))
+            {
+                TypeDefinition definition = _types[type];
+                definition.BaseType = Import(definition.Module, type.BaseType!);
+            }
+        }
         foreach (TypeDef type in _model.Types) DefineHierarchy(type);
         foreach (TypeDef type in _model.Types) DefineMembers(type);
         foreach (TypeDef type in _model.Types) DefineOverrides(type);

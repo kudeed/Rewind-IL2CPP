@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): byte-indexed two-level jump tables.
 using Iced.Intel;
 using Rewind.Binary;
 

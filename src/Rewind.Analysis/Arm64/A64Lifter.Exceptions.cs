@@ -246,6 +246,32 @@ public sealed partial class A64Lifter
             var others = Enumerable.Range(0, pads.Count).Where(i => regionOfPad[i] == t && i != primary[t]).ToList();
             var mainOwn = new HashSet<Block>(main);
             foreach (int other in others) mainOwn.ExceptWith(reach[other]);
+            // Compare complete prefix values before declaring that an
+            // intermediate ADRP differs from the primary prefix's final LDR.
+            var sameSetup = new Dictionary<(int Pad, int Variable), bool>();
+            bool SameSetup(int other, int variable)
+            {
+                if (sameSetup.TryGetValue((other, variable), out bool known)) return known;
+                var common = new HashSet<Block>(main);
+                common.IntersectWith(reach[other]);
+                List<A64Instruction>? Prefix(int index)
+                {
+                    var result = new List<A64Instruction>();
+                    var seen = new HashSet<Block>();
+                    Block block = blockAt[pads[index]];
+                    while (!common.Contains(block))
+                    {
+                        if (!seen.Add(block) || result.Count > 64 || !rawOf.TryGetValue(block, out var raw) ||
+                            block.Succs.Count != 1 || raw.End is not (BlockEnd.Jump or BlockEnd.FallThrough)) return null;
+                        result.AddRange(raw.End == BlockEnd.Jump ? raw.Instructions.Take(raw.Instructions.Count - 1) : raw.Instructions);
+                        block = block.Succs[0];
+                    }
+                    return result;
+                }
+                bool equal = Prefix(primary[t]) is { } left && Prefix(other) is { } right &&
+                    A64LandingPadSetup.EquivalentRegister(left, right, variable);
+                return sameSetup[(other, variable)] = equal;
+            }
             var mainWrites = new Dictionary<int, uint>();
             foreach (Block b in mainOwn)
                 foreach (A64Instruction ins in rawOf[b].Instructions)
@@ -261,7 +287,7 @@ public sealed partial class A64Lifter
                         {
                             if (mainWrites.TryGetValue(v, out uint word))
                             {
-                                if (word != ins.Word) return Fail("the landing pads of one try region set up registers differently");
+                                if (word != ins.Word && !SameSetup(other, v)) return Fail($"the landing pads of one try region set up registers differently (register {v}; primary pad 0x{pads[primary[t]]:X}, word 0x{word:X8}; other pad 0x{pads[other]:X}, instruction 0x{ins.Address:X}, word 0x{ins.Word:X8})");
                                 continue;
                             }
                             padLost[t].Add(v);
@@ -442,7 +468,7 @@ public sealed partial class A64Lifter
         // Every call a region protects is inside it (and not in one nested in it that catches for itself).
         foreach (var (b, regions) in callRegions)
             foreach (int r in regions)
-                if (r >= 0 && b.Scope != 2 * r) return Fail("a protected call outside its try region");
+                if (r >= 0 && b.Scope != 2 * r) return Fail($"a protected call outside its try region (block 0x{b.Start:X}, region {r}, scope {b.Scope}, entry {found.FirstOrDefault(f => f.Region == r).Entry?.Start:X}; planned={string.Join(";", found.Select(f => $"{f.Region}@{f.Entry.Start:X}:body{f.Body.Count}:calls{protectedCalls[f.Region].Count}:pad{pads[primary[f.Region]]:X}"))}; handler-links={string.Join(",",handlerCalls.Distinct().Select(h=>$"{h.Handler}->{h.Region}"))})");
         bool Encloses(int region, int scope)
         {
             for (int s = scope, guard = 0; s >= 0 && guard < 64; guard++, s = _fn.TryRegions[s >> 1].Outer)

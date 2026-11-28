@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): inlined constructor folding.
 using Rewind.Analysis.Hir;
 using Rewind.Model;
 using Rewind.Runtime;
@@ -34,7 +35,9 @@ internal static partial class ConstructorFolding
                 if (block.Statements[i] is not HAssign { Target: HLocal target, Value: HTypeExpr { Op: HTypeOp.Allocate } allocation }) continue;
                 string problem = $"the constructor of {allocation.Target.ShortName} was inlined and could not be folded back";
                 string note = $"the constructor of {allocation.Target.ShortName} was inlined here; the object is allocated raw and its statements follow";
-                if (TryFold(block, i, target, allocation.Target, program, pipeline) || TryFoldChain(method, block, i, target, allocation.Target, program, pipeline) ||
+                if (BranchConstructorFolding.TryFold(method, block, i, program.Model.Sigs) ||
+                    TryFold(block, i, target, allocation.Target, program, pipeline) || TryFoldChain(method, block, i, target, allocation.Target, program, pipeline) ||
+                    TryFoldScheduledReads(method, block, i, target, allocation.Target, program, pipeline) ||
                     TryFoldAround(block, i, target, allocation.Target, program, pipeline))
                 {
                     if (again)
@@ -133,22 +136,24 @@ internal static partial class ConstructorFolding
     private static readonly bool NoMarkedRawConstructors = Environment.GetEnvironmentVariable("REWIND_NO_MARKED_RAW_CONSTRUCTORS") != null;
 
     /// <summary>
-    /// In the finished method: an object allocated raw whose own constructor was not put back, but a constructor
-    /// was, as a call on the object. A constructor run on anything but "this" inside a constructor is no IL a
-    /// verifier accepts, and C# cannot say it. The code does what the original did (the runtime runs it), so it
-    /// stays and the method counts as recovered, as it did before; a note says what the code does there.
+    /// In the finished method: an object allocated raw whose own constructor was not put back, but a base
+    /// class's constructor was, as a call on the object. A constructor run on anything but "this" inside a
+    /// constructor is no IL a verifier accepts. The code does what the original did, so it stays; the place is
+    /// marked with a note (one that does not stop the code) and the method is reported incomplete.
     /// </summary>
     public static void MarkRawConstructors(HMethod method)
     {
         if (NoMarkedRawConstructors) return;
         foreach (HBlock block in method.Blocks)
-            foreach (HStmt s in block.Statements)
+            for (int i = block.Statements.Count - 1; i >= 0; i--)
             {
-                if (s is not HAssign { Target: HLocal { Variable: var created }, Value: HTypeExpr { Op: HTypeOp.Allocate } allocation } ||
+                if (block.Statements[i] is not HAssign { Target: HLocal { Variable: var created }, Value: HTypeExpr { Op: HTypeOp.Allocate } allocation } ||
                     !RunsConstructorOn(method, created))
                     continue;
-                string note = $"the constructor of {allocation.Target.ShortName} runs as a call on the object allocated raw (unverifiable IL, what the native code does)";
-                if (!method.Notes.Contains(note)) method.Notes.Add(note);
+                string invalid = $"the constructor of {allocation.Target.ShortName} was not put back: a constructor runs on the object allocated raw";
+                if (method.Problems.Count < 64) method.Problems.Add(invalid);
+                method.SiteProblems.Add(invalid);
+                block.Statements.Insert(i, new HEval(new HOpaque("raw_constructor") { Problem = invalid, Remark = true }) { Address = block.Statements[i].Address });
             }
     }
 
@@ -262,6 +267,50 @@ internal static partial class ConstructorFolding
             a = b;
         }
         return unifier;
+    }
+
+    /// <summary>Recover a constructor with a caller-this field read scheduled
+    /// between its base call and its final plain stores to the fresh object.
+    /// The read is moved only across those stores, not across a call.
+    /// </summary>
+    private static bool TryFoldScheduledReads(HMethod method, HBlock block, int at, HLocal target, TypeSig type, ProgramAnalysis program, MethodPipeline pipeline)
+    {
+        if (Environment.GetEnvironmentVariable("REWIND_NO_SCHEDULED_CTOR_READS") != null ||
+            method.Method.Name != ".ctor" || method.Method.IsStatic || method.Method.DeclaringType.IsValueType ||
+            type is not TypeDefSig { Definition: { IsValueType: false } definition } ||
+            definition.GenericParameters.Length != 0) return false;
+        var site = block.Statements;
+        var created = target.Variable;
+        foreach (MethodDef ctor in definition.Methods)
+        {
+            if (ctor.Name != ".ctor" || ctor.IsStatic || pipeline.ConstructorBody(ctor, []) is not { } body)
+                continue;
+            var template = body.Blocks[0].Statements;
+            if (!ScheduledConstructorReads.TryGather(method.Method, site, at, created, template.Count - 1,
+                    out List<int> picked)) continue;
+            var gathered = picked.Select(i => site[i]).ToList();
+            var unifier = new Unifier(created, ctor.Parameters.Length) { Constructor = ctor, Quiet = c => QuietConstructor(c, pipeline) };
+            bool match = true;
+            for (int k = 0; k < picked.Count && match; k++)
+                match = unifier.Statement(template[k], gathered[k], k);
+            if (!match || !unifier.ArgumentsAreValid(gathered, 0, picked.Count)) continue;
+            // A matched argument must not be supplied by any moved read.
+            var delayed = Enumerable.Range(picked[0], picked[^1] - picked[0] + 1)
+                .Where(i => !picked.Contains(i)).Select(i => ((HLocal)((HAssign)site[i]).Target).Variable).ToArray();
+            if (unifier.Arguments.Any(arg => arg != null && delayed.Any(v => Mentions(arg, v)))) continue;
+            if (unifier.Arguments.Any(arg => arg == null)) continue; // require all arguments
+            var creation = new HAssign(target, new HNewObject
+            {
+                Constructor = ctor, Type = type, Arguments = unifier.Arguments.Select(a => a!).ToArray()
+            }) { Address = site[at].Address };
+            int first = picked[0];
+            for (int k = picked.Count - 1; k >= 0; k--) site.RemoveAt(picked[k]);
+            site.Insert(first, creation);
+            site.RemoveAt(at);
+            method.Notes.Add($"constructor scheduled reads: {ctor.FullName}, {delayed.Length} independent caller field read(s)");
+            return true;
+        }
+        return false;
     }
 
     private static readonly bool NoAround = Environment.GetEnvironmentVariable("REWIND_NO_CONSTRUCTOR_INTERLEAVING") != null;
@@ -554,7 +603,7 @@ internal static partial class ConstructorFolding
                 var copy = new HCall
                 {
                     Method = call.Method, DeclaringType = call.DeclaringType, MethodArguments = call.MethodArguments, This = self,
-                    Arguments = arguments, Virtual = call.Virtual, Constrained = call.Constrained, Type = call.Type,
+                    Arguments = arguments, Virtual = call.Virtual, Constrained = call.Constrained, ReceiverIndependent = call.ReceiverIndependent, Type = call.Type,
                 };
                 copy.Alternatives.AddRange(call.Alternatives);
                 return copy;

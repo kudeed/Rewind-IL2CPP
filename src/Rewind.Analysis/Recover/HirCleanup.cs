@@ -165,6 +165,7 @@ public static class HirCleanup
     {
         for (int round = 0; round < 6 && Simplify(method); round++) { }
         RemoveUnreachable(method);
+        if (Environment.GetEnvironmentVariable("REWIND_NO_DEAD_SCALAR_CYCLES") == null) HirDeadScalarCycles.Run(method);
         bool changed = true;
         for (int round = 0; changed && round < 8; round++)
         {

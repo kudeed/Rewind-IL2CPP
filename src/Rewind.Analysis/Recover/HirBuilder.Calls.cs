@@ -1,3 +1,4 @@
+// Modified by xob0t (2026): float arguments of native calls, slot-specialized invokers, offset-0 field addresses, gaps always marked, small structs as numbers, floating-point negation, inlined compare-exchange on references, one virtual method through nested merges, objects copied into a merge before their constructor runs.
 using Rewind.Analysis.Abi;
 using Rewind.Analysis.Hir;
 using Rewind.Analysis.Ir;
@@ -243,6 +244,9 @@ public sealed partial class HirBuilder
                         {
                             if (helper.Kind == HelperKind.Box && position == 1 && IntAt(call, 0) is { } k) type = EvalKlass(k);
                             else if (helper.Kind is HelperKind.UnboxAny or HelperKind.UnboxNullable && position == 2 && IntAt(call, 1) is { } k2) type = EvalKlass(k2);
+                            // modf writes one scalar through its integer-register pointer argument. A stack
+                            // slot previously used for a struct must enter the existing lifetime splitter.
+                            else if (helper.Kind == HelperKind.Modf && position == IntArgPosition(0, 1)) type = helper.IsDouble ? _double : _float;
                         }
                         else
                         {
@@ -291,7 +295,7 @@ public sealed partial class HirBuilder
                     {
                         // (One call takes a struct there, another a different struct: the memory holds one object,
                         // then another - a Vector3 for one call, a Quaternion for the next. Each its own lifetime.)
-                        _frameTypes.TryAdd(offset, type);
+                        if (!_frameTypes.TryAdd(offset, type) && _frameTypes[offset].Key != type.Key) FrameConflicts.Add(offset);
                     }
                     else
                     {
@@ -551,6 +555,35 @@ public sealed partial class HirBuilder
         return Site(new HOpaque("struct_from_value", e) { Type = structType }, problem);
     }
 
+    // A native tail call may return more HFA registers than its caller exposes.
+    // Rebuild exactly the caller's register prefix; evaluate the callee only once.
+    private HExpr? TailFloatAggregatePrefix(HExpr value, TypeSig result, ulong address)
+    {
+        if (_fn.Regs.SharedPositions || value.Type == null) return null;
+        TypeLayout source = _p.Layouts.Of(value.Type), target = _p.Layouts.Of(result);
+        if (!source.Known || !target.Known || target.Fields.Length == 0 ||
+            target.Fields.Length >= source.Fields.Length || source.Fields.Length > 4) return null;
+        var given = source.Fields.OrderBy(f => f.Offset).ToArray();
+        var wanted = target.Fields.OrderBy(f => f.Offset).ToArray();
+        TypeSig scalar = given[0].Type;
+        if (!IsFloat(scalar)) return null;
+        int size = given[0].Size;
+        if (source.Size != given.Length * size || target.Size != wanted.Length * size) return null;
+        for (int i = 0; i < given.Length; i++)
+            if (given[i].Offset != i * size || given[i].Size != size || given[i].Type.Key != scalar.Key) return null;
+        for (int i = 0; i < wanted.Length; i++)
+            if (wanted[i].Offset != i * size || wanted[i].Size != size || wanted[i].Type.Key != scalar.Key) return null;
+        HVar input = _h.NewLocal(value.Type, "t"), output = _h.NewLocal(result, "s");
+        input.AddressTaken = true;
+        output.AddressTaken = true;
+        Emit(new HAssign(new HLocal(input) { Type = value.Type }, value), address);
+        for (int i = 0; i < wanted.Length; i++)
+            Emit(new HAssign(
+                new HField { Object = new HLocal(output) { Type = result }, Field = wanted[i].Field, DeclaringType = result, Type = scalar },
+                new HField { Object = new HLocal(input) { Type = value.Type }, Field = given[i].Field, DeclaringType = value.Type, Type = scalar }), address);
+        return new HLocal(output) { Type = result };
+    }
+
     private void FinishCall(Node call, HExpr expr, ReturnKind kind, TypeSig returnType, bool tail)
     {
         expr.Type ??= returnType;
@@ -566,7 +599,9 @@ public sealed partial class HirBuilder
                 // A struct returned where the call's result is something else (a conversion operator pasted in):
                 // the struct made from it.
                 if (_abi.ReturnType is { } returned && IsStructType(returned) && expr.Type is { } given && given.Key != returned.Key)
-                    expr = StructOfValue(expr, returned, call.Addr);
+                    expr = kind == ReturnKind.FloatAggregate && _abi.Return == ReturnKind.FloatAggregate
+                        ? TailFloatAggregatePrefix(expr, returned, call.Addr) ?? StructOfValue(expr, returned, call.Addr)
+                        : StructOfValue(expr, returned, call.Addr);
                 Emit(new HReturn(expr), call.Addr);
             }
             return;
@@ -666,6 +701,16 @@ public sealed partial class HirBuilder
         return FloatAt(call, position, isDouble);
     }
 
+    /// <summary>The address of a metadata slot a value is: a constant, or a slot read the normalizer folded.</summary>
+    private static bool MetadataSlot(Node n, out ulong address)
+    {
+        address = 0;
+        if (n.IsConst) address = (ulong)n.Imm;
+        else if (n.Op == Op.SlotValue) address = (ulong)n.Imm;
+        else return false;
+        return address != 0;
+    }
+
     private void EmitCall(Node call, bool tail)
     {
         var info = (CallInfo)call.Aux!;
@@ -701,18 +746,17 @@ public sealed partial class HirBuilder
             EmitHelperCall(call, target.Helper, tail);
             return;
         }
-        // An imported function a P/Invoke declaration wraps (AArch64, linked directly): a call of the declaration,
-        // where it is the only declaration of that function (overloads would have to be told apart).
-        // (Each assembly declares its own copy of Interop's imports: declarations that agree in every type are one.)
-        // (In the declaration's own wrapper it is the declaration itself, as on x64: declarations are written without a
-        // body, extern, whatever their wrapper's code says.)
-        if (!NoPInvokeStubs && _p.PInvokeStubs.TryGetValue(info.Target, out List<MethodDef>? declarations) &&
-            (declarations.Contains(_method) || declarations.All(d => SameSignature(d, declarations[0]))))
+        // A function no table lists that is handed a metadata slot: the runtime's metadata initializer. Its
+        // result is the slot's content (the class, method, field or string), and calling it only makes sure
+        // that content exists. (Unity 6 keeps one such initializer per code shape, so the signature library
+        // cannot list them all.)
+        if (!tail && IntAt(call, 0) is { } slot && MetadataSlot(slot, out ulong slotAddress) && _m.ResolveUsageSlot(slotAddress) is { } usage)
         {
-            MethodDef declaration = declarations.Contains(_method) ? _method
-                : declarations.FirstOrDefault(d => ReferenceEquals(d.DeclaringType.Assembly, _method.DeclaringType.Assembly)) ?? declarations[0];
-            if (TryBuildPInvokeCall(call, declaration, tail)) return;
+            _h.Notes.Add($"call to 0x{info.Target:X} with a metadata slot: treated as the runtime's metadata initializer");
+            if (Projections(call).TryGetValue(CallResult.IntReturn, out Node? held) && IsUsed(held)) _sem[held] = UsageSem(usage);
+            return;
         }
+        _h.UnidentifiedNativeCalls.Add(new NativeCallObservation(call.Addr, info.Target, tail, info.NoReturn));
         Problem($"call to unidentified native function 0x{info.Target:X}");
         var args = new List<HExpr>();
         for (int i = 0; i < 4; i++)
@@ -1690,6 +1734,7 @@ public sealed partial class HirBuilder
         ChosenCalls[call] = (method, abi, shift);
 
         HExpr? thisExpr = null;
+        bool restoredUnusedReceiver=false;
         var args = new HExpr[method.Parameters.Length];
         MethodDef? stringConstructor = null;
         HExpr? returnLocation = null;
@@ -1722,6 +1767,31 @@ public sealed partial class HirBuilder
                             thisExpr = Value(node);
                         }
                     }
+                    else if (node.Op==Op.SlotValue&&node.Type==VT.I64&&
+                             _m.ResolveUsageSlot((ulong)node.Imm) is {Kind:UsageKind.TypeInfo,Type:TypeDefSig}&&
+                             CanRestoreUnusedReceiver(call,method,classArgs,methodArgs,isVirtual,alternatives,receiverOverride,shift))
+                    {
+                        thisExpr=new HArg(-1){Type=_method.DeclaringType.Sig};restoredUnusedReceiver=true;
+                        _h.Notes.Add($"receiver-independent resolved metadata at 0x{call.Addr:X} to 0x{method.Address:X}");
+                    }
+                    else if (Environment.GetEnvironmentVariable("REWIND_NO_GUARDED_ARGUMENT_RECEIVER") == null &&
+                             (node.IsConstValue(0) ||
+                              Eval(node) is SVal { Expr: { } staleArg } &&
+                              (staleArg.Type ?? (staleArg as HLocal)?.Variable.Type) is PrimitiveSig { Element: Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4 }) &&
+                             method.ReturnType.IsVoid && method.Parameters.Length>0 &&
+                             method.Parameters[0].Type is TypeDefSig { Definition: { IsValueType: false } } &&
+                             _p.RangeOf(method.Address) is {} argRange &&
+                             Rewind.Analysis.Arm64.Arm64ReceiverProof.GuardedFirstArgument(_p.Model.Image,argRange.Start,argRange.End,
+                                 target=>_p.Helpers.KindAt(target)==HelperKind.ThrowNullReference) &&
+                             CanRestoreUnusedReceiver(call,method,classArgs,methodArgs,isVirtual,alternatives,receiverOverride,shift,allowArglessThrow:true))
+                    {
+                        // The native first argument is the actual receiver of
+                        // the callee's first operation. Its independent null
+                        // check must still throw; never substitute that argument.
+                        thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                        restoredUnusedReceiver=true;
+                        _h.Notes.Add($"receiver-independent guarded first argument at 0x{call.Addr:X} to 0x{method.Address:X}");
+                    }
                     else if (!NoNullReceivers && node.IsConstValue(0))
                     {
                         // A string constructor: IL2CPP makes each one a method "CreateString" with the same
@@ -1730,12 +1800,104 @@ public sealed partial class HirBuilder
                         // An instance method handed zero for its object: the code it shares never reads the
                         // object, and the C++ compiler, seeing that, did not keep which one it was. "null" here
                         // would throw where the program does not; what it was called on is not known.
+                        else if (CanRestoreUnusedReceiver(call, method, classArgs, methodArgs, isVirtual, alternatives, receiverOverride, shift, allowArglessThrow:true))
+                        {
+                            thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                        restoredUnusedReceiver=true;
+                            _h.Notes.Add($"receiver-independent direct call at 0x{call.Addr:X} to 0x{method.Address:X}");
+                            break;
+                        }
                         else Problem(UnkeptReceiver);
                         thisExpr = new HConst(null, p.Type);
+                    }
+                    else if (Environment.GetEnvironmentVariable("REWIND_NO_SCALAR_UNUSED_RECEIVER") == null &&
+                             node.Op == Op.Phi &&
+                             Eval(node) is SVal { Expr: { } scalar } &&
+                             (scalar.Type ?? (scalar as HLocal)?.Variable.Type) is PrimitiveSig { Element: Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8 } &&
+                             CanRestoreUnusedReceiver(call, method, classArgs, methodArgs, isVirtual, alternatives, receiverOverride, shift))
+                    {
+                        // A merged stale scalar return register is not a
+                        // managed receiver. The same-class direct callee
+                        // demonstrably overwrites x0 on every entry path.
+                        thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                        restoredUnusedReceiver=true;
+                        _h.Notes.Add($"receiver-independent merged scalar at 0x{call.Addr:X} to 0x{method.Address:X}");
+                    }
+                    else if (Environment.GetEnvironmentVariable("REWIND_NO_TAIL_UNUSED_RECEIVER") == null &&
+                             tail && call.Op == Op.TailCall && method.ReturnType.IsVoid &&
+                             method.Parameters.Length == 1 &&
+                             method.Parameters[0].Type is TypeDefSig { Definition: { IsValueType: false } } &&
+                             Eval(node) is SVal { Expr: { } tailScalar } &&
+                             (tailScalar.Type ?? (tailScalar as HLocal)?.Variable.Type) is PrimitiveSig { Element: Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8 } &&
+                             Rewind.Analysis.Arm64.Arm64ReceiverProof.DirectRestoredTail(_p.Model.Image,call.Addr,method.Address) &&
+                             CanRestoreUnusedReceiver(call,method,classArgs,methodArgs,isVirtual,alternatives,receiverOverride,shift))
+                    {
+                        // A direct tail branch after restoring the caller's
+                        // callee-saved frame can reuse a dead integer x0. The
+                        // actual reference argument must remain untouched.
+                        thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                        restoredUnusedReceiver=true;
+                        _h.Notes.Add($"receiver-independent restored scalar tail at 0x{call.Addr:X} to 0x{method.Address:X}");
+                    }
+                    else if (Environment.GetEnvironmentVariable("REWIND_NO_I64_UNUSED_RECEIVER") == null &&
+                             Eval(node) is SVal { Expr: HLocal capturedInteger } &&
+                             (capturedInteger.Type ?? capturedInteger.Variable.Type) is PrimitiveSig { Element: Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8 } &&
+                             CanRestoreUnusedReceiver(call, method, classArgs, methodArgs, isVirtual, alternatives, receiverOverride, shift))
+                    {
+                        // The evaluation was already captured; keep it and all arguments. Only the
+                        // receiver is unused, as proven independently from the exact native callee.
+                        thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                        restoredUnusedReceiver = true;
+                        _h.Notes.Add($"receiver-independent materialized int64 scalar at 0x{call.Addr:X} to 0x{method.Address:X}");
+                    }
+                    else if (Environment.GetEnvironmentVariable("REWIND_NO_I32_UNUSED_RECEIVER") == null &&
+                             Eval(node) is SVal { Expr: { } stale } &&
+                             (stale.Type ?? (stale as HLocal)?.Variable.Type) is PrimitiveSig { Element: Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4 } &&
+                             CanRestoreUnusedReceiver(call, method, classArgs, methodArgs, isVirtual, alternatives, receiverOverride, shift))
+                    {
+                        // The original compiler reuses the integer return register
+                        // as an ignored instance receiver. Never emit scalar-as-object IL.
+                        thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                        restoredUnusedReceiver=true;
+                        _h.Notes.Add($"receiver-independent int32 scalar at 0x{call.Addr:X} to 0x{method.Address:X}");
+                    }
+                    else if (Environment.GetEnvironmentVariable("REWIND_NO_BOOL_UNUSED_RECEIVER") == null&&
+                             Eval(node) is SVal {Expr:HLocal heldBool}&&
+                             (heldBool.Type??heldBool.Variable.Type) is PrimitiveSig {Element:Il2CppTypeEnum.Boolean}&&
+                             CanRestoreUnusedReceiver(call,method,classArgs,methodArgs,isVirtual,alternatives,receiverOverride,shift,allowArglessThrow:true))
+                    {
+                        // Keep the already materialized boolean and all its evaluations in the caller.
+                        thisExpr=new HArg(-1){Type=_method.DeclaringType.Sig};restoredUnusedReceiver=true;
+                        _h.Notes.Add($"receiver-independent materialized boolean at 0x{call.Addr:X} to 0x{method.Address:X}");
+                    }
+                    else if (Environment.GetEnvironmentVariable("REWIND_NO_BOOL_UNUSED_RECEIVER") == null &&
+                             Eval(node) is SVal { Expr: { } staleBool } &&
+                             (staleBool.Type ?? (staleBool as HLocal)?.Variable.Type) is PrimitiveSig { Element: Il2CppTypeEnum.Boolean } &&
+                             method.Parameters.Length==0 && method.ReturnType is PrimitiveSig { Element: Il2CppTypeEnum.Boolean } &&
+                             Rewind.Analysis.Arm64.Arm64ReceiverProof.RepeatedBooleanCall(_p.Model.Image,call.Addr,method.Address) &&
+                             CanRestoreUnusedReceiver(call, method, classArgs, methodArgs, isVirtual, alternatives, receiverOverride, shift, allowArglessThrow:true))
+                    {
+                        thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                        restoredUnusedReceiver=true;
+                        _h.Notes.Add($"receiver-independent bool scalar at 0x{call.Addr:X} to 0x{method.Address:X}");
                     }
                     else
                     {
                         thisExpr = Value(node);
+                        // The incoming native x0 may be an already materialized, unrelated
+                        // reference left by an earlier call. It is not a castable managed
+                        // receiver. Substitute this only when the exact same-owner callee
+                        // independently proves that x0 is overwritten on every entry path.
+                        // Keep the materialized value and all its evaluations in the caller.
+                        if (thisExpr is HLocal local &&
+                            (local.Type ?? local.Variable.Type) is TypeDefSig { Definition: { IsValueType: false } } heldReference &&
+                            !IsAssignable(heldReference, p.Type) &&
+                            CanRestoreUnusedReceiver(call, method, classArgs, methodArgs, isVirtual, alternatives, receiverOverride, shift))
+                        {
+                            thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                        restoredUnusedReceiver=true;
+                            _h.Notes.Add($"receiver-independent materialized reference at 0x{call.Addr:X} to 0x{method.Address:X}");
+                        }
                         // A struct wrapping the object (see IsReferenceWrapper): the receiver is the object.
                         if (thisExpr.Type is { } held && IsReferenceWrapper(held)) thisExpr = Coerce(thisExpr, p.Type);
                         if (Eval(node) is SNewObject) { }
@@ -1779,6 +1941,12 @@ public sealed partial class HirBuilder
                         else
                         {
                             arg = ValueFor(node, type);
+                            if (IsReference(type) && arg is HMethodPointer mp && ReferenceEquals(mp.Method, _method)
+                                && CanRestoreUnusedMetadataArgument(call, method, classArgs, methodArgs, isVirtual, alternatives, shift, position))
+                            {
+                                arg = new HConst(null, type);
+                                _h.Notes.Add($"unused native argument x{position} at 0x{call.Addr:X} to 0x{method.Address:X}, metadata pointer discarded");
+                            }
                             if (IsReference(type) && CheckedClassHere(node) is { } checkedAs &&
                                 !IsAssignable(arg.Type, type) && IsAssignable(checkedAs, type))
                                 arg = new HTypeExpr(HTypeOp.CastClass, checkedAs, arg) { Type = checkedAs };
@@ -1889,6 +2057,7 @@ public sealed partial class HirBuilder
             DeclaringType = declaring,
             MethodArguments = methodArgs,
             This = thisExpr,
+            ReceiverIndependent = restoredUnusedReceiver && !method.IsVirtual,
             Arguments = args,
             Virtual = virtualCall,
             Type = abi.ReturnType,
@@ -2201,13 +2370,85 @@ public sealed partial class HirBuilder
         return true;
     }
 
-    private static readonly bool NoPInvokeChoices = Environment.GetEnvironmentVariable("REWIND_NO_PINVOKE_CHOICES") != null;
-    private static readonly bool NoPInvokeStubs = Environment.GetEnvironmentVariable("REWIND_NO_PINVOKE_STUBS") != null;
+    // The native receiver was optimized away. Substitute the current instance
+    // only for an unambiguous direct, nonvirtual, non-generic same-type or base-type call
+    // whose exact callee is proven to kill x0 on every entry path.
+    public static bool IsNonGenericReceiverOwner(TypeDef caller, TypeDef target)
+    {
+        var seen = new HashSet<TypeDef>();
+        for (TypeDef? current = caller; current != null;)
+        {
+            if (!seen.Add(current) || current.IsValueType || current.IsGenericDefinition) return false;
+            if (ReferenceEquals(current, target)) return true;
+            if (current.BaseType is not TypeDefSig parent) return false;
+            current = parent.Definition;
+        }
+        return false;
+    }
 
-    /// <summary>Whether two methods take and return the same types (by name, across assemblies).</summary>
-    private static bool SameSignature(MethodDef a, MethodDef b) =>
-        a.Parameters.Length == b.Parameters.Length && a.ReturnType.Key == b.ReturnType.Key &&
-        a.Parameters.Zip(b.Parameters).All(p => p.First.Type.Key == p.Second.Type.Key);
+    private readonly Dictionary<(ulong,bool), bool> _receiverProofs = [];
+    private bool CanRestoreUnusedReceiver(Node call, MethodDef method, TypeSig[] classArgs, TypeSig[] methodArgs,
+        bool isVirtual, List<MethodDef>? alternatives, Node? receiverOverride, int shift, bool allowArglessThrow=false)
+    {
+        if (Environment.GetEnvironmentVariable("REWIND_NO_RECEIVER_PROOF") != null ||
+            _p.Model.Image.Arch != Rewind.Binary.CpuArch.Arm64 ||
+            _method.IsStatic || _method.IsConstructor || method.IsStatic || method.IsConstructor ||
+            (method.IsVirtual && (method.Flags & MethodDef.Final)==0) || isVirtual || method.IsAbstract ||
+            !IsNonGenericReceiverOwner(_method.DeclaringType, method.DeclaringType) ||
+            method.DeclaringType.IsValueType || method.DeclaringType.IsGenericDefinition ||
+            method.IsGenericDefinition || _method.IsGenericDefinition ||
+            classArgs.Length != 0 || methodArgs.Length != 0 ||
+            alternatives is { Count: > 0 } || receiverOverride != null || shift != 0 ||
+            method.Address == 0 || call.Aux is not CallInfo { Indirect: false, Intrinsic: null } ci ||
+            ci.Target != method.Address ||
+            _p.RangeOf(method.Address) is not { } range) return false;
+        if (!_receiverProofs.TryGetValue((method.Address,allowArglessThrow), out bool proved))
+        {
+            proved = Rewind.Analysis.Arm64.Arm64DirectReceiverProof.IsUnused(_p,range.Start,range.End,allowArglessThrow);
+            _receiverProofs[(method.Address,allowArglessThrow)] = proved;
+        }
+        return proved;
+    }
+
+    // The metadata initializer has one logical argument. Accept an inline
+    // branch alias only if it shares the exact target of an identified
+    // metadata initializer wrapper (save LR; BL; DMB ISH; restore LR; RET).
+    // The wrapper identity is already established by the runtime helper table.
+    private bool IsUnaryMetadataService(ulong target)
+    {
+        var im = _p.Model.Image;
+        if (_p.Helpers.KindAt(target) is HelperKind.MetadataInit or HelperKind.MetadataInitInline) return true;
+        if (!im.IsMapped(target, 4) || im.SectionAt(target) is not { IsExecutable: true }) return false;
+        var alias = Rewind.Analysis.Arm64.A64Decoder.Decode(im.U32(target), target);
+        if (alias.Op != Rewind.Analysis.Arm64.A64Op.B) return false;
+        foreach (var known in _p.Helpers.AddressesOf(HelperKind.MetadataInit))
+        {
+            if (!im.IsMapped(known,20) || im.SectionAt(known) is not { IsExecutable: true }) continue;
+            if (im.U32(known)!=0xF81F0FFE || im.U32(known+8)!=0xD5033BBF ||
+                im.U32(known+12)!=0xF84107FE || im.U32(known+16)!=0xD65F03C0) continue;
+            var branch = Rewind.Analysis.Arm64.A64Decoder.Decode(im.U32(known+4), known+4);
+            if (branch.Op==Rewind.Analysis.Arm64.A64Op.Bl && branch.Target==alias.Target) return true;
+        }
+        return false;
+    }
+
+    private bool CanRestoreUnusedMetadataArgument(Node call, MethodDef method, TypeSig[] classArgs,
+        TypeSig[] methodArgs, bool isVirtual, List<MethodDef>? alternatives, int shift, int position)
+    {
+        if (Environment.GetEnvironmentVariable("REWIND_NO_UNUSED_METADATA_ARGUMENT")!=null ||
+            _p.Model.Image.Arch!=Rewind.Binary.CpuArch.Arm64 || position!=2 || shift!=0 ||
+            _method.IsStatic || method.IsStatic || method.IsConstructor || method.IsVirtual || isVirtual ||
+            method.IsAbstract || !ReferenceEquals(method.DeclaringType,_method.DeclaringType) ||
+            method.DeclaringType.IsValueType || method.DeclaringType.IsGenericDefinition ||
+            method.IsGenericDefinition || _method.IsGenericDefinition ||
+            classArgs.Length!=0 || methodArgs.Length!=0 || alternatives is {Count:>0} ||
+            method.Address==0 || call.Aux is not CallInfo {Indirect:false, Intrinsic:null} ci ||
+            ci.Target!=method.Address || _p.RangeOf(method.Address) is not {} range) return false;
+        return Rewind.Analysis.Arm64.Arm64ReceiverProof.IsUnused(_p.Model.Image,range.Start,range.End,
+            (byte)position,IsUnaryMetadataService);
+    }
+
+    private static readonly bool NoPInvokeChoices = Environment.GetEnvironmentVariable("REWIND_NO_PINVOKE_CHOICES") != null;
     private static readonly bool NoNullReceivers = Environment.GetEnvironmentVariable("REWIND_NO_NULL_RECEIVERS") != null;
     internal const string UnkeptReceiver = "an instance method called on an object the code did not keep";
 
@@ -2360,6 +2601,27 @@ public sealed partial class HirBuilder
         return new HOpaque(name.ToLowerInvariant(), args) { Type = type };
     }
 
+    /// <summary>
+    /// The field a runtime FieldInfo* names, as an access on the object it was handed. Shared generic code reaches
+    /// instance fields this way: the field belongs to the definition, its type is written with the definition's
+    /// type parameters, and the class the call was made on is what those parameters stand for.
+    /// </summary>
+    private HField? InstanceField(Node obj, Node fieldNode)
+    {
+        if (Eval(fieldNode) is not SFieldInfo info)
+        {
+            return null;
+        }
+        FieldDef field = info.Field;
+        TypeSig owner = info.DeclaringType ?? field.DeclaringType.Sig;
+        TypeSig fieldType = field.Type;
+        if (owner is GenericInstSig generic && ReferenceEquals(generic.Definition, field.DeclaringType))
+            fieldType = _m.Sigs.Substitute(fieldType, generic.Arguments, []);
+        HExpr? target = LocationOf(obj, owner);
+        target ??= Value(obj);
+        return new HField { Object = target, Field = field, DeclaringType = owner, Type = fieldType };
+    }
+
     private void EmitHelperCall(Node call, HelperInfo helper, bool tail)
     {
         Dictionary<int, Node> projs = Projections(call);
@@ -2376,7 +2638,10 @@ public sealed partial class HirBuilder
                 // fmod is the IL "rem" instruction applied to floating point operands.
                 HExpr value = helper.MathName == "fmod" && operands.Length == 2
                     ? new HBinary(HBinaryOp.Rem, operands[0], operands[1]) { Type = type }
-                    : MathCall(helper.MathName, helper.IsDouble, operands);
+                    : helper.MathName == "Exp2" && operands.Length == 1
+                        ? MathCall("Pow", helper.IsDouble,
+                            new HConst(helper.IsDouble ? (object)2.0 : 2f, type), operands[0])
+                        : MathCall(helper.MathName, helper.IsDouble, operands);
                 FinishCall(call, value, helper.IsDouble ? ReturnKind.Double : ReturnKind.Float, type, tail);
                 return;
             }
@@ -2597,6 +2862,27 @@ public sealed partial class HirBuilder
                 if (result != null) _sem[result] = new SFrame(boxAt);
                 return;
             }
+            case HelperKind.GetInstanceFieldDataPointer:
+            {
+                // il2cpp_codegen_get_instance_field_data_pointer(obj, field): the field of a generic class or
+                // struct that shared code reaches through its runtime FieldInfo.
+                if (a0 == null || a1 == null || InstanceField(a0, a1) is not { } field) break;
+                if (tail)
+                {
+                    TypeSig pointer = _m.Sigs.Pointer(field.Type!);
+                    FinishCall(call, new HAddressOf(field) { Type = pointer }, ReturnKind.Integer, pointer, tail: true);
+                    return;
+                }
+                if (result != null) _sem[result] = new SRef(field, field.Type!);
+                return;
+            }
+            case HelperKind.WriteInstanceFieldData:
+            {
+                if (a0 == null || a1 == null || a2 == null || InstanceField(a0, a1) is not { Type: { } fieldType } field) break;
+                Emit(new HAssign(field, ValueFor(a2, fieldType)), call.Addr);
+                if (tail) Emit(new HReturn(null), call.Addr);
+                return;
+            }
             case HelperKind.RaiseProfileException:
             {
                 TypeDef? exceptionType = _m.FindType("System.NotSupportedException");
@@ -2629,6 +2915,9 @@ public sealed partial class HirBuilder
                 return;
             case HelperKind.ThrowInvalidCast:
                 Emit(new HThrow(NewException("System.InvalidCastException")), call.Addr);
+                return;
+            case HelperKind.GetOverflowException when helper.NoReturn:
+                Emit(new HThrow(NewException("System.OverflowException")), call.Addr);
                 return;
             case HelperKind.GetOverflowException:
                 FinishCall(call, NewException("System.OverflowException"), ReturnKind.Integer, _object, tail);
