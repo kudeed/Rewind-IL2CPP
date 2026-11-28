@@ -214,9 +214,13 @@ internal static class ListAppendIlFolding
                 FieldDefinition? d;
                 try { d = field.Resolve(); }
                 catch (AssemblyResolutionException) { return false; }
-                // A private field of the current method's declaring type is
-                // already legal. Keep the exact original read at its position.
-                if(d==null || d.IsStatic || (!d.IsPublic && !(extended && d.DeclaringType==body.Method.DeclaringType)) ||
+                // Nested types share the containing type's private access.
+                // Require that exact owner definition on the declaring-type
+                // chain; a name match or unrelated enclosing type is not proof.
+                bool inOwnerScope = false;
+                for (TypeDefinition? context = body.Method.DeclaringType; context != null; context = context.DeclaringType)
+                    if (context == d?.DeclaringType) { inOwnerScope = true; break; }
+                if(d==null || d.IsStatic || (!d.IsPublic && !(extended && inOwnerScope)) ||
                     !Same(d.FieldType,destination.VariableType)) return false;
             }
             else if(extended && moved[1].OpCode.Code==Code.Callvirt &&
