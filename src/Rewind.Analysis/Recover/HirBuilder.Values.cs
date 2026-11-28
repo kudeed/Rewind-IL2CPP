@@ -2128,6 +2128,11 @@ public sealed partial class HirBuilder
                 return new SVal(new HSelect(either.Condition, first.Target, second.Target) { Type = picked.Type });
             case PLocation loc:
             {
+                // A scalar array element names the start of the access, not necessarily all its bytes.
+                // A native word can carry several adjacent elements (for example LDR Dn over float[]).
+                if (loc.Location is HElement element && _p.Layouts.SizeOf(loc.Type) is { Known: true, Size: > 0 } layout &&
+                    n.Type.Bytes() > layout.Size)
+                    return WideArrayRead(n, element, loc.Type, layout.Size);
                 HExpr read = loc.Location is { Type: null } ? WithType(loc.Location, loc.Type) : loc.Location;
                 // The low half of a 64-bit integer ("(int)l" read as the first four bytes of a long field): the
                 // field cut to what was read, as the register holds it (32 bits, compared or extended as the code says).

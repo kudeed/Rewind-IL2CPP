@@ -32,6 +32,8 @@ public enum VecKind : byte
     AddV, SMaxV, SMinV, UMaxV, UMinV, FMaxV, FMinV, FMaxNmV, FMinNmV,
     // floating-point comparison with zero; appended to preserve existing kind values
     FCmLtZero,
+    /// <summary>Reverse element order within each 64-bit block, without changing element bits.</summary>
+    Rev64,
 }
 
 public static partial class A64Decoder
@@ -112,6 +114,7 @@ public static partial class A64Decoder
             i.ElemSize = ElemBytes(size);
             switch (opcode)
             {
+                case 0b00000 when !u && !scalar && size != 3: kind = VecKind.Rev64; break;
                 case 0b01011: kind = u ? VecKind.Neg : VecKind.Abs; break;
                 case 0b00101 when u && size == 0 && !scalar: kind = VecKind.Not; break;
                 case 0b01001: kind = u ? VecKind.CmLeZero : VecKind.CmEqZero; break;

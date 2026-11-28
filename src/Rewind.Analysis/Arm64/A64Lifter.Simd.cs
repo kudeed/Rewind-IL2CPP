@@ -254,6 +254,19 @@ public sealed partial class A64Lifter
             }
 
             // ---- rearranging
+            case VecKind.Rev64:
+            {
+                if (scalar || bytes is not (1 or 2 or 4))
+                {
+                    Unknown(i, "REV64 arrangement");
+                    return;
+                }
+                // The low log2(8/bytes) index bits select an element within a 64-bit block.
+                // Read every input before SetElems writes Rd, including when Rd aliases Rn.
+                int reverseMask = 8 / bytes - 1;
+                for (int k = 0; k < count; k++) result[k] = A(k ^ reverseMask);
+                break;
+            }
             case VecKind.Zip1 or VecKind.Zip2 or VecKind.Uzp1 or VecKind.Uzp2 or VecKind.Trn1 or VecKind.Trn2:
             {
                 var a = new Node[count];
