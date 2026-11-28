@@ -1720,7 +1720,9 @@ public sealed partial class HirBuilder
                 }
                 case ParamRole.This:
                 {
-                    Node? node = receiverOverride ?? IntAt(call, position);
+                    Node? node = receiverOverride ??
+                        (shift == 0 && !isVirtual ? CheckedReceiverFor(call, position, p.Type!) : null) ??
+                        IntAt(call, position);
                     if (node == null) { thisExpr = Missing(p.Type!); break; }
                     if (p.Type!.Definition is { IsValueType: true })
                     {

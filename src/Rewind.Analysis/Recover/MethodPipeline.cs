@@ -1313,13 +1313,13 @@ public sealed class MethodPipeline
                 for (int i = 0; i < call.In.Length; i++)
                 {
                     ArgSlot slot = info.Slots[i];
-                    bool taken = !fn.Regs.SharedPositions ? slot.Kind == ArgSlotKind.Target || exact.Contains(slot) : slot.Kind switch
+                    bool taken = slot.Kind == ArgSlotKind.CheckedReceiver || (!fn.Regs.SharedPositions ? slot.Kind == ArgSlotKind.Target || exact.Contains(slot) : slot.Kind switch
                     {
                         ArgSlotKind.IntReg => integer.Contains(slot.Index),
                         ArgSlotKind.Stack => integer.Contains(slot.Index + 4) || floating.Contains(slot.Index + 4),
                         ArgSlotKind.FloatReg => floating.Contains(slot.Index / 4),
                         _ => true,
-                    };
+                    });
                     if (!taken) continue;
                     inputs.Add(call.In[i]);
                     slots.Add(slot);

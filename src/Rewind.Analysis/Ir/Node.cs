@@ -130,11 +130,17 @@ public readonly record struct ArgSlot(ArgSlotKind Kind, int Index)
         ArgSlotKind.IntReg => "r" + Index,
         ArgSlotKind.FloatReg => "x" + Index / 4 + "." + Index % 4,
         ArgSlotKind.Stack => "stk" + Index,
+        ArgSlotKind.CheckedReceiver => "checked-this" + Index,
         _ => "target",
     };
 }
 
-public enum ArgSlotKind { Target, IntReg, FloatReg, Stack }
+public enum ArgSlotKind
+{
+    Target, IntReg, FloatReg, Stack,
+    /// <summary>Non-ABI evidence: the adjacent null-checked object for an omitted instance argument (Index is its ABI position).</summary>
+    CheckedReceiver,
+}
 
 public sealed class Node
 {
