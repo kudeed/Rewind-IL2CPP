@@ -278,7 +278,7 @@ internal static class Program
         var options = new DecompileOptions
         {
             StateMachines = true,
-            Language = ICSharpCode.Decompiler.CSharp.LanguageVersion.CSharp9,
+            Language = ICSharpCode.Decompiler.CSharp.LanguageVersion.CSharp9_0,
             Log = line => { lock (logs) logs.Add(line); }
         };
         Source.Invoke(null, [assemblyPath, Path.GetDirectoryName(assemblyPath)!, directory, result, options]);
