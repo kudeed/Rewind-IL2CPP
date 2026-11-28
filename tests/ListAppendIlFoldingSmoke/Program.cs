@@ -28,6 +28,7 @@ if(args.Length==2)
 }
 using var resolver = new DefaultAssemblyResolver();
 resolver.AddSearchDirectory(Path.GetDirectoryName(typeof(List<>).Assembly.Location)!);
+resolver.AddSearchDirectory(AppContext.BaseDirectory);
 using var asm = AssemblyDefinition.CreateAssembly(new AssemblyNameDefinition("ListAppendFixture",new Version(1,0)), "ListAppendFixture",
     new ModuleParameters{Kind=ModuleKind.Dll,AssemblyResolver=resolver,Runtime=TargetRuntime.Net_4_0});
 var mod=asm.MainModule;
@@ -264,6 +265,43 @@ foreach(var i in new[]{Instruction.Create(OpCodes.Ldarg,ap),Instruction.Create(O
     Instruction.Create(OpCodes.Ldelem_Any,i32),Instruction.Create(OpCodes.Stloc,arrayRead.Value)})ai.InsertBefore(beforeVersion,i);
 Check(ListAppendIlFolding.Run(am.Body)==1,"array schedule branch proof");
 am.Body.OptimizeMacros();
+
+
+var cellType=new TypeDefinition("Fixture","PreReadCell",TypeAttributes.Public|TypeAttributes.Sealed|TypeAttributes.SequentialLayout,mod.ImportReference(typeof(ValueType)));
+mod.Types.Add(cellType);
+var cellValue=new FieldDefinition("Value",FieldAttributes.Public,i32);cellType.Fields.Add(cellValue);
+var cellInternal=new FieldDefinition("Internal",FieldAttributes.Assembly,i32);cellType.Fields.Add(cellInternal);
+var cellGlobal=new FieldDefinition("Global",FieldAttributes.Public|FieldAttributes.Static,i32);cellType.Fields.Add(cellGlobal);
+MethodDefinition ArrayFieldSchedule(string name, FieldReference field, bool escape=false, bool store=false)
+{
+    var f=Fixture(name,false);var m=f.M;var il=m.Body.GetILProcessor();
+    var input=new ParameterDefinition(new ArrayType(cellType));m.Parameters.Add(input);
+    var prefix=new List<Instruction>{
+        Instruction.Create(OpCodes.Ldarg,input),Instruction.Create(OpCodes.Ldarg,m.Parameters[1]),
+        Instruction.Create(OpCodes.Ldelema,cellType)};
+    if(escape)prefix.Add(Instruction.Create(OpCodes.Dup));
+    if(store)prefix.Add(Instruction.Create(OpCodes.Ldc_I4,23));
+    prefix.Add(Instruction.Create(store?OpCodes.Stfld:OpCodes.Ldfld,field));
+    prefix.Add(Instruction.Create(OpCodes.Stloc,f.Value));
+    foreach(var instruction in prefix)il.InsertBefore(f.Region[3],instruction);
+    return m;
+}
+var cellRead=ArrayFieldSchedule("ArrayFieldSchedule",cellValue);
+Check(ListAppendIlFolding.Run(cellRead.Body)==1,"immediate readonly array-element field schedule");
+Check(!cellRead.Body.Instructions.Any(i=>i.Operand is FieldReference f&&f.Name is "_items" or "_version" or "_size"),"array-field scheduled List internals removed");
+cellRead.Body.OptimizeMacros();
+int arrayFieldNegatives=0;
+foreach(var bad in new[]{
+    ArrayFieldSchedule("ArrayFieldEscapes",cellValue,escape:true),
+    ArrayFieldSchedule("ArrayFieldWrites",cellValue,store:true),
+    ArrayFieldSchedule("ArrayFieldPrivate",cellInternal),
+    ArrayFieldSchedule("ArrayFieldStatic",cellGlobal),
+    ArrayFieldSchedule("ArrayFieldWrongOwner",valField)})
+{
+    string before=Shape(bad.Body);
+    Check(ListAppendIlFolding.Run(bad.Body)==0&&Shape(bad.Body)==before,"reject unproven array-field prefix "+bad.Name);
+    arrayFieldNegatives++;host.Methods.Remove(bad);
+}
 
 var itemRead=Fixture("ItemReadSchedule",false);
 itemRead.M.Parameters.Add(new ParameterDefinition(lt));
@@ -516,6 +554,41 @@ foreach(int capacity in new[]{0,1,128})
 try{appendFp(null!,1f,2f,3f);throw new Exception("lost scheduled FP null check");}catch(NullReferenceException){}
 var appendDefault=runtimeHost.GetMethod("DefaultBranch")!.CreateDelegate<Action<List<int>,int>>();
 var readArray=runtimeHost.GetMethod("ArrayReadSchedule")!.CreateDelegate<Action<List<int>,int,int[]>>();
+
+var readCellMethod=runtimeHost.GetMethod("ArrayFieldSchedule")!;
+var runtimeCell=runtimeHost.Assembly.GetType("Fixture.PreReadCell")!;
+Array Cells(params int[] values) {
+    var array=Array.CreateInstance(runtimeCell,values.Length);
+    for(int i=0;i<values.Length;i++){var cell=Activator.CreateInstance(runtimeCell)!;runtimeCell.GetField("Value")!.SetValue(cell,values[i]);array.SetValue(cell,i);}
+    return array;
+}
+void readCell(List<int> list,int index,Array? cells) {
+    try { readCellMethod.Invoke(null,[list,index,cells]); }
+    catch(TargetInvocationException ex) when(ex.InnerException!=null) {
+        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
+    }
+}
+int arrayFieldRuns=0,arrayFieldExceptions=0;
+foreach(int capacity in new[]{0,1,128})
+{
+    var target=new List<int>(capacity);var expected=new List<int>(capacity);
+    for(int n=0;n<100;n++){
+        readCell(target,n%3,Cells(n,-n,int.MinValue));
+        expected.Add(n%3==0?n:n%3==1?-n:int.MinValue);arrayFieldRuns++;runs++;
+        Check(target.SequenceEqual(expected)&&target.Capacity==expected.Capacity,"array field value and capacity");
+    }
+    foreach(int index in new[]{-1,3}){
+        var enumerator=target.GetEnumerator();
+        try{readCell(target,index,Cells(0,0,0));throw new Exception("lost array-field bounds");}catch(IndexOutOfRangeException){arrayFieldExceptions++;}
+        Check(enumerator.MoveNext()&&target.SequenceEqual(expected),"array-field bounds changed list version");
+    }
+    var old=target.GetEnumerator();
+    try{readCell(target,0,null!);throw new Exception("lost array-field null");}catch(NullReferenceException){arrayFieldExceptions++;}
+    Check(old.MoveNext()&&target.SequenceEqual(expected),"array-field null changed list version");
+}
+try{readCell(null!,99,null!);throw new Exception("lost original list null check");}catch(NullReferenceException){arrayFieldExceptions++;}
+Console.WriteLine($"PRE_VERSION_ARRAY_FIELD_PASS operations={arrayFieldRuns} exception_cases={arrayFieldExceptions} negative={arrayFieldNegatives}");
+
 var observed=runtimeHost.GetField("BranchLocal")!;
 int branchRuns=0;
 foreach(int capacity in new[]{0,1,128})

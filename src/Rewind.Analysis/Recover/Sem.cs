@@ -239,3 +239,10 @@ internal sealed class SConstrained(TypeSig on) : SJunk
 {
     public TypeSig On = on;
 }
+
+/// <summary>The runtime size of one managed T, or the stride of one T[] element. Never an inferred constant.</summary>
+internal sealed class SRuntimeSize(TypeSig type, Node? array = null) : Sem
+{
+    public TypeSig Type = type;
+    public Node? Array = array;
+}

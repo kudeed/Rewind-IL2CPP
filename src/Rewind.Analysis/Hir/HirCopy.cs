@@ -35,6 +35,7 @@ internal static class HirCopy
                 Method = call.Method, DeclaringType = call.DeclaringType, MethodArguments = call.MethodArguments,
                 This = call.This == null ? null : Sub(call.This), Arguments = All(call.Arguments), Virtual = call.Virtual,
                 Constrained = call.Constrained, Alternatives = [.. call.Alternatives],
+                ReceiverIndependentTarget = call.ReceiverIndependentTarget,
             },
             HNewObject n => new HNewObject { Constructor = n.Constructor, DeclaringType = n.DeclaringType, Arguments = All(n.Arguments) },
             HNewArray na => new HNewArray(na.ElementType, Sub(na.Length)),

@@ -1406,6 +1406,13 @@ public sealed partial class HirBuilder
                 _sem[phi] = boundSem;
                 continue;
             }
+            // Immutable class/method/context metadata must keep its identity through a branch join. A
+            // managed integer local would lose the type needed by subsequent rgctx loads and allocations.
+            if (MergedMetadata(phi) is { } metadata)
+            {
+                _sem[phi] = metadata;
+                continue;
+            }
             // One class's static data whichever way in: the compiler merged the paths after each read the
             // pointer (tail merging), and the field reads after the merge are of that class's statics.
             if (!NoMergedStatics && MergedStatics(phi) is { } statics)

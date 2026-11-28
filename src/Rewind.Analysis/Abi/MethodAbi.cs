@@ -48,6 +48,8 @@ public sealed class MethodAbi
     public TypeSig ReturnType = null!;
     public int ReturnSize;
     public bool Known = true;
+    /// <summary>The selected native body uses IL2CPP's explicit fully shared return buffer.</summary>
+    public bool UsesFullySharedReturnBuffer;
 
     /// <summary>FloatAggregate returns: how many members, and whether they are doubles.</summary>
     public int ReturnCount = 1;

@@ -574,8 +574,10 @@ internal static class ListAppendIlFolding
             catch(AssemblyResolutionException){}
             return false;
         }
-        foreach(var ins in SafePostVersionSchedule(scheduled,def,body.Method.Module.TypeSystem,receiver.Operand,array)?Array.Empty<Instruction>():scheduled)
+        var prefix = SafePostVersionSchedule(scheduled,def,body.Method.Module.TypeSystem,receiver.Operand,array) ? Array.Empty<Instruction>() : scheduled;
+        for (int prefixIndex = 0; prefixIndex < prefix.Length; prefixIndex++)
         {
+            var ins = prefix[prefixIndex];
             if(ins.Operand==receiver.Operand||ins.Operand==array)return false;
             if(LoadType(ins) is {} load){stack.Push(load);continue;}
             switch(ins.OpCode.Code)
@@ -597,6 +599,25 @@ internal static class ListAppendIlFolding
                     if(Pop() is not {} index||index.MetadataType!=MetadataType.Int32||
                        Pop() is not ArrayType{IsVector:true} arr||ins.Operand is not TypeReference et||!Same(et,arr.ElementType))return false;
                     stack.Push(et);break;
+                case Code.Ldelema:
+                    // The address is consumed immediately by one public scalar field read.
+                    // It cannot escape or mutate either array or list, and both instructions
+                    // stay before the original version increment, preserving read exceptions.
+                    if (Pop() is not {} fieldIndex || fieldIndex.MetadataType != MetadataType.Int32 ||
+                        Pop() is not ArrayType { IsVector: true } fieldArray ||
+                        ins.Operand is not TypeReference fieldElement || !fieldElement.IsValueType ||
+                        fieldElement.ContainsGenericParameter || !Same(fieldElement, fieldArray.ElementType) ||
+                        prefixIndex + 1 >= prefix.Length || prefix[prefixIndex + 1].OpCode.Code != Code.Ldfld ||
+                        prefix[prefixIndex + 1].Operand is not FieldReference scalarField ||
+                        !Same(scalarField.DeclaringType, fieldElement) || !Scalar(scalarField.FieldType)) return false;
+                    FieldDefinition? scalarDefinition;
+                    try { scalarDefinition = scalarField.Resolve(); } catch (AssemblyResolutionException) { return false; }
+                    if (scalarDefinition is not { IsStatic: false, IsPublic: true } ||
+                        !Same(scalarDefinition.DeclaringType, fieldElement) ||
+                        !Same(scalarDefinition.FieldType, scalarField.FieldType)) return false;
+                    stack.Push(scalarField.FieldType);
+                    prefixIndex++;
+                    break;
                 case Code.Ldfld:
                     if(Pop() is not {} owner||ins.Operand is not FieldReference fr||
                        !RefAssignable(owner,fr.DeclaringType))return false;

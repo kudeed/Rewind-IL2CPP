@@ -216,7 +216,7 @@ internal sealed class GuardedAccessorFolding(MethodPipeline pipeline)
                 case HTypeExpr t:
                     return site is HTypeExpr st && t.Op == st.Op && t.Op != HTypeOp.Allocate && ReferenceEquals(t.Target, st.Target) && Unify(t.Operand, st.Operand);
                 case HCall call:
-                    return site is HCall sc4 && ReferenceEquals(call.Method, sc4.Method) && call.Virtual == sc4.Virtual && call.Arguments.Length == sc4.Arguments.Length &&
+                    return site is HCall sc4 && ReferenceEquals(call.Method, sc4.Method) && call.Virtual == sc4.Virtual && ReferenceEquals(call.ReceiverIndependentTarget, sc4.ReceiverIndependentTarget) && call.Arguments.Length == sc4.Arguments.Length &&
                            Unify(call.This, sc4.This) && All(call.Arguments, sc4.Arguments);
                 case HNewObject n:
                     return site is HNewObject sn && ReferenceEquals(n.Constructor, sn.Constructor) && n.Arguments.Length == sn.Arguments.Length && All(n.Arguments, sn.Arguments);

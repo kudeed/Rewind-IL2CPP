@@ -136,6 +136,9 @@ public sealed class HCall : HExpr
     public HExpr? This;
     public HExpr[] Arguments = [];
     public bool Virtual;
+    // Exact native proof that this target never reads its incoming receiver. The target identity
+    // prevents the permission surviving a later rewrite to a different method.
+    public MethodDef? ReceiverIndependentTarget;
     /// <summary>
     /// Set for an interface method called on a struct where it is ("constrained."): the struct's type, by which
     /// the implementation is found. Method is then the interface's method and This the struct's location.

@@ -1490,6 +1490,10 @@ public sealed partial class Normalizer(ProgramAnalysis program)
                 if (ReferenceEquals(target, other) || Function.IsTryEntry(term.In[0])) continue;
                 ThrowKind kind = ClassifyThrowBlock(target, out Node? a, out Node? b);
                 if (kind == ThrowKind.None) continue;
+                // Exception identity alone does not prove that a recovered indexed operation will repeat
+                // this check. Keep its real branch for multidimensional accesses and pointer induction
+                // too; removing it early can also erase the proof needed to recover a typed array cursor.
+                if (kind == ThrowKind.IndexOutOfRange) continue;
                 // A block that also throws on the other side is not a guard around normal flow.
                 if (ClassifyThrowBlock(other, out _, out _) != ThrowKind.None) continue;
 

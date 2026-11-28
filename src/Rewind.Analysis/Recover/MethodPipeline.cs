@@ -327,7 +327,7 @@ public sealed class MethodPipeline
     {
         classArgs ??= [];
         methodArgs ??= [];
-        MethodAbi abi = _program.Abi.For(method, classArgs, methodArgs);
+        MethodAbi abi = FullySharedAbi.For(_program, method, classArgs, methodArgs, address != 0 ? address : method.Address);
         Function fn = _lifter.Lift(address != 0 ? address : method.Address);
         CheckShape(fn, "lifting");
         // (Landing pads: only calls raise exceptions, so what a try statement stores before its first call is
@@ -610,6 +610,7 @@ public sealed class MethodPipeline
         StructFromParts.Run(result, this);
         WriteBacks.Run(result, _program);
         AccessorFolding.Run(result, _program);
+        CompleteStructInitialization.Run(result, _program, this);
         Arm64TargetPositionSetter.Run(result, _program);
         LibraryInternals.Run(result, _program);
         HiddenImplementations.Run(result, _program);
@@ -661,6 +662,7 @@ public sealed class MethodPipeline
                 case HConv c: Visit(c.Operand); return;
                 case HCall call: Visit(call.This); foreach (HExpr a in call.Arguments) Visit(a); return;
                 case HNewObject n: foreach (HExpr a in n.Arguments) Visit(a); return;
+                case HCachedDelegate cached: Visit(cached.Cache); Visit(cached.Creation); return;
                 case HNewArray na: Visit(na.Length); return;
                 case HTypeExpr t: Visit(t.Operand); return;
                 case HSelect s: Visit(s.Condition); Visit(s.WhenTrue); Visit(s.WhenFalse); return;
@@ -681,12 +683,18 @@ public sealed class MethodPipeline
                 }
             }
         }
-        // (Not when problems were dropped for want of room: then it cannot be told which are left.)
-        if (!NoSiteProblems && method.SiteProblems.Count != 0 && method.Problems.Count < 64)
+        // Problems are collected in full, so every site-linked diagnostic can be checked against its marker.
+        if (!NoSiteProblems && method.SiteProblems.Count != 0)
             method.Problems.RemoveAll(p => method.SiteProblems.Contains(p) && !(sited?.Contains(p) ?? false));
-        if (found == null || method.Problems.Count != 0) return;
-        // Nothing reported this method as incomplete, yet it is.
-        foreach (string text in found) method.Problems.Add($"native operation left in the code ({text})");
+        if (found == null) return;
+        // An existing problem must not hide a different unfinished native operation. Report every marker
+        // kind even when another phase already found gaps; calling this again does not duplicate entries.
+        var reported = new HashSet<string>(method.Problems, StringComparer.Ordinal);
+        foreach (string text in found)
+        {
+            string problem = $"native operation left in the code ({text})";
+            if (reported.Add(problem)) method.Problems.Add(problem);
+        }
     }
 
     private static readonly bool NoSharedConstructors = Environment.GetEnvironmentVariable("REWIND_NO_SHARED_CONSTRUCTORS") != null;
@@ -1247,6 +1255,8 @@ public sealed class MethodPipeline
         int position = _program.Abi.Regs.IntPositionOfSlot(slot);
         if (position < 0) return false;
         CallTarget target = _program.Resolve(info.Target);
+        if (!NoHelperExtents && target.Helper is { } scalar &&
+            ScalarMathWriteExtent.Of(scalar, slot, _program.Abi.Regs) > 0) return true;
         if (target.Helper != null || !target.IsManaged) return false;
         bool all = true, any = false;
         void Consider(MethodDef method, MethodAbi abi)
@@ -1589,10 +1599,10 @@ public sealed class MethodPipeline
         CallTarget target = _program.Resolve(info.Target);
         if (target.Helper != null)
         {
-            // modf(x, &whole) writes the whole part there, one number as wide as x, and nothing else. (Without a
-            // bound, the address of a pasted Math.Round's local reached the whole frame, and nothing on the stack
-            // became a value: the registers a catch handler saves stayed stores, of what it cannot know.)
-            if (!NoHelperExtents && target.Helper.Kind == HelperKind.Modf && position == 1) return target.Helper.IsDouble ? 8 : 4;
+            // modf and sincos write one scalar at each output pointer. An unknown extent here ties unrelated
+            // stack objects together; use the target ABI's separate/shared float argument positions.
+            if (!NoHelperExtents && ScalarMathWriteExtent.Of(target.Helper, slot, _program.Abi.Regs) is > 0 and var written)
+                return written;
             return HelperReads(call, info, target.Helper.Kind, position);
         }
 

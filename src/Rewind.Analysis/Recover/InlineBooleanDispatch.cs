@@ -91,7 +91,8 @@ internal static class InlineBooleanDispatch
         (call.Type == null || call.Type.Key == call.Method.ReturnType.Key);
 
     private static bool SameCall(HCall template, HCall site) => ReferenceEquals(template.Method, site.Method) &&
-        Plain(site, template.Arguments.Length) && template.Virtual == site.Virtual;
+        Plain(site, template.Arguments.Length) && template.Virtual == site.Virtual &&
+        ReferenceEquals(template.ReceiverIndependentTarget, site.ReceiverIndependentTarget);
 
     private static bool Receiver(HMethod caller, HLocal expression, TypeDef owner)
     {

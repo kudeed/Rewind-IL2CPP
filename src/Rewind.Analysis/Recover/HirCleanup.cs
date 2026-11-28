@@ -62,6 +62,12 @@ public static class HirCleanup
         foreach (HBlock a in method.Blocks)
         {
             if (a.Statements.Count == 0 || a.Statements[^1] is not HBranch branch) continue;
+            if (EquivalentBranches.TryTarget(method, a, out HBlock? common))
+            {
+                a.Statements[^1] = new HJump(common!) { Address = branch.Address };
+                any = true;
+                continue;
+            }
 
             // The question asked again with nothing in between has the answer it just had.
             for (int guard = 0; guard < 4; guard++)
@@ -226,7 +232,14 @@ public static class HirCleanup
                 }
             }
 
-            if (changed) continue;
+            if (changed)
+            {
+                // Removing unused register copies can reveal two metadata-guard paths that now do exactly
+                // the same work. Reconsider the control flow before counting the next round's reads.
+                for (int again = 0; again < 6 && Simplify(method); again++) { }
+                RemoveUnreachable(method);
+                continue;
+            }
             // Finally drop the declarations of variables that no statement mentions any more.
             var mentioned = new HashSet<HVar>(reads.Keys);
             foreach (HTryRegion r in method.TryRegions.Values) mentioned.Add(r.Exception);

@@ -1003,7 +1003,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                            (ReferenceEquals(call.Method, sc4.Method) ||
                             (call.Method.Parameters.Length == sc4.Method.Parameters.Length && call.Method.IsStatic == sc4.Method.IsStatic &&
                              (call.Alternatives.Contains(sc4.Method) || sc4.Alternatives.Contains(call.Method)))) &&
-                           call.Virtual == sc4.Virtual && Types(call.DeclaringType, sc4.DeclaringType) && Types(call.Constrained, sc4.Constrained) &&
+                           call.Virtual == sc4.Virtual && ReferenceEquals(call.ReceiverIndependentTarget, sc4.ReceiverIndependentTarget) && Types(call.DeclaringType, sc4.DeclaringType) && Types(call.Constrained, sc4.Constrained) &&
                            SameTypes(call.MethodArguments, sc4.MethodArguments) && Expression(call.This, sc4.This) && All(call.Arguments, sc4.Arguments);
                 case HNewObject n when !NoZeroMade && site is HTypeExpr { Op: HTypeOp.Default, Target: var cleared } && n.Constructor.DeclaringType.IsValueType &&
                                        Types(n.Type, cleared) && _owner.ZeroMade(n.Constructor, n.Type):

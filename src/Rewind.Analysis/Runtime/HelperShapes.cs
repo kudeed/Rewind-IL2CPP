@@ -35,7 +35,7 @@ public static class HelperShapes
                 }
                 if (atomics > 0) found.Add($"{atomics} outlined compare-exchange wrappers");
             }
-            if (!NoArm64Exceptions && AddArm64ExceptionStubs(model, context, helpers) is > 0 and var exceptions)
+            if (!NoArm64Exceptions && (AddArm64TypedExceptionStubs(model, context, helpers) + AddArm64ExceptionStubs(model, context, helpers)) is > 0 and var exceptions)
                 found.Add($"{exceptions} exception throwers");
             return found.Count == 0 ? null : "shapes:   found by their code: " + string.Join("; ", found);
         }
@@ -63,7 +63,7 @@ public static class HelperShapes
             foreach (ulong start in context.FunctionStarts)
             {
                 if (context.IsManaged(start) || helpers.At(start) != null) continue;
-                if (Arm64Stub(model, start) is not { } stub || helpers.At(stub.Target) is not { } info) continue;
+                if (Arm64Stub(model, context, start) is not { } stub || helpers.At(stub.Target) is not { } info) continue;
                 HelperInfo? alias = stub.Kind switch
                 {
                     // A branch is the helper itself.
@@ -96,16 +96,16 @@ public static class HelperShapes
         foreach (ulong start in context.FunctionStarts)
         {
             if (context.IsManaged(start) || helpers.At(start) != null) continue;
-            if (Arm64ExceptionStub(model, start) is not { } info) continue;
+            if (Arm64ExceptionStub(model, context, start) is not { } info) continue;
             helpers.Add(start, info);
             added++;
         }
         return added;
     }
 
-    private static HelperInfo? Arm64ExceptionStub(Il2CppModel model, ulong start)
+    private static HelperInfo? Arm64ExceptionStub(Il2CppModel model, ModelCodeContext context, ulong start)
     {
-        ReadOnlySpan<byte> bytes = model.Image.SpanToSectionEnd(start);
+        ReadOnlySpan<byte> bytes = Arm64Function(model, context, start);
         if (bytes.Length < 20) return null;
         ulong page = 0, text = 0;
         bool call = false, tail = false;
@@ -129,14 +129,75 @@ public static class HelperShapes
         return new HelperInfo(kind, 0, true, false, "exception thrower (by its code)");
     }
 
-    private enum Arm64StubKind { Branch, FlagBranch, CallBarrierReturn }
-
-    private static (Arm64StubKind Kind, ulong Target)? Arm64Stub(Il2CppModel model, ulong start)
+    // A function's neighbour must never supply its message, call or return instruction.
+    private static ReadOnlySpan<byte> Arm64Function(Il2CppModel model, ModelCodeContext context, ulong start)
     {
         ReadOnlySpan<byte> bytes = model.Image.SpanToSectionEnd(start);
-        if (bytes.Length < 8) return null;
+        ulong next = context.NextFunctionStart(start);
+        return next > start && next - start < (ulong)bytes.Length ? bytes[..(int)(next - start)] : bytes;
+    }
+
+    private static int AddArm64TypedExceptionStubs(Il2CppModel model, ModelCodeContext context, RuntimeHelpers helpers)
+    {
+        A64Instruction[] Body(ulong start)
+        {
+            if (!context.IsFunctionStart(start) || context.IsManaged(start)) return [];
+            ReadOnlySpan<byte> bytes = Arm64Function(model, context, start);
+            if (bytes.Length is < 8 or > 64 || bytes.Length % 4 != 0) return [];
+            var result = new A64Instruction[bytes.Length / 4];
+            for (int i = 0; i < result.Length; i++)
+                result[i] = A64Decoder.Decode(BitConverter.ToUInt32(bytes[(i * 4)..]), start + (ulong)i * 4);
+            return result;
+        }
+        string? Text(ulong at) => model.Image.TryCString(at, 100);
+        var contracts = helpers.AddressesOf(HelperKind.ThrowNullReference)
+            .Select(at => Arm64ExceptionChain.FromNullThrower(at, Body, Text)).OfType<Arm64ExceptionChain.Contract>().Distinct().ToArray();
+        if (contracts.Length == 0) return 0;
+        int added = 0;
+        foreach (Arm64ExceptionChain.Contract contract in contracts)
+        {
+            var factories = new HashSet<ulong>();
+            foreach (ulong start in context.FunctionStarts)
+            {
+                if (context.IsManaged(start) || !Arm64ExceptionChain.IsIndexFactory(Body(start), contract, Text)) continue;
+                factories.Add(start);
+                if (helpers.At(start) != null) continue;
+                helpers.Add(start, new HelperInfo(HelperKind.GetIndexOutOfRangeException, 0, false, true, "IndexOutOfRangeException factory (anchored native chain)"));
+                added++;
+            }
+            foreach (ulong start in context.FunctionStarts)
+            {
+                if (context.IsManaged(start) || helpers.At(start) != null || Arm64ExceptionChain.Raise(Body(start)) is not { } raise ||
+                    !factories.Contains(raise.Factory) || raise.Raiser != contract.Raise) continue;
+                helpers.Add(start, new HelperInfo(HelperKind.ThrowIndexOutOfRange, 0, true, false, "index-out-of-range thrower (anchored native chain)"));
+                added++;
+            }
+        }
+        for (int pass = 0; pass < 4; pass++)
+        {
+            int before = added;
+            foreach (ulong start in context.FunctionStarts)
+            {
+                if (context.IsManaged(start) || helpers.At(start) != null || Arm64ExceptionChain.CallOnly(Body(start)) is not { } target ||
+                    helpers.At(target) is not { NoReturn: true, ReturnsValue: false } known ||
+                    known.Kind is not (HelperKind.ThrowIndexOutOfRange or HelperKind.ThrowNullReference)) continue;
+                helpers.Add(start, known with { Name = known.Name + " (no-return call wrapper)" });
+                added++;
+            }
+            if (before == added) break;
+        }
+        return added;
+    }
+
+    private enum Arm64StubKind { Branch, FlagBranch, CallBarrierReturn }
+
+    private static (Arm64StubKind Kind, ulong Target)? Arm64Stub(Il2CppModel model, ModelCodeContext context, ulong start)
+    {
+        ReadOnlySpan<byte> bytes = Arm64Function(model, context, start);
+        if (bytes.Length < 4) return null;
         A64Instruction first = A64Decoder.Decode(BitConverter.ToUInt32(bytes), start);
         if (first.Op == A64Op.B && first.Target != start) return (Arm64StubKind.Branch, first.Target);
+        if (bytes.Length < 8) return null;
         if (first.Op == A64Op.MovZ && first.Rd >= 1 && first.Rd <= 7)
         {
             A64Instruction second = A64Decoder.Decode(BitConverter.ToUInt32(bytes[4..]), start + 4);

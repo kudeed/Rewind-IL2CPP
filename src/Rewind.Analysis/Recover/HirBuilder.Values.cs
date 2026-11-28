@@ -1876,6 +1876,18 @@ public sealed partial class HirBuilder
                 int lengthOffset = _header + _ptr;      // { klass, monitor, bounds, max_length, elements... }
                 int dataOffset = lengthOffset + _ptr;
                 if (a.Index == null && a.Offset == lengthOffset) return new PArrayLength(e);
+                // Full sharing indexes an array with its runtime element stride. The stride must
+                // come from this exact array's class and describe this exact element type.
+                if (size < 0 && a.Offset == dataOffset && a.Scale == 1 && a.Index is { Op: Op.Mul } product)
+                {
+                    Node? scaledIndex = null;
+                    for (int side = 0; side < 2; side++)
+                        if (RuntimeSize(product.In[side]) is { Array: { } of } stride &&
+                            ReferenceEquals(of, a.Base) && stride.Type.Key == array.ElementType.Key)
+                            scaledIndex = product.In[1 - side];
+                    if (scaledIndex != null)
+                        return new PLocation(new HElement { Array = e, Index = IntValue(scaledIndex), Type = array.ElementType }, array.ElementType);
+                }
                 var (elementSize, _, known) = _p.Layouts.SizeOf(array.ElementType);
                 if (!known || elementSize <= 0) return new PUnknown("array element size unknown");
                 if (a.Index == null && a.Offset < dataOffset) return new PInternal("array header");
@@ -1985,6 +1997,11 @@ public sealed partial class HirBuilder
         {
             case SInterfaceEntry e when a.Index == null && a.Offset is 0 or 8 && (a.Offset == 0 || a.Offset == _ptr):
                 return new SVTable(e.Object, e.Slot, a.Offset != 0) { Interface = e.Interface };
+            case SKlass k when _abi.UsesFullySharedReturnBuffer && n.Type == VT.I32 && a.Index == null && _p.Klass.StackSlotSize > 0 && a.Offset == _p.Klass.StackSlotSize:
+                return new SRuntimeSize(k.Type);
+            case SObjKlass o when _abi.UsesFullySharedReturnBuffer && n.Type == VT.I32 && a.Index == null && a.Offset == _p.Klass.ElementSize &&
+                                  Eval(o.Object) is SVal { Type: SzArraySig array }:
+                return new SRuntimeSize(array.ElementType, o.Object);
             case SKlass k when a.Index == null && a.Offset == _p.Klass.TypeHierarchyDepth:
                 return new SDepth(k.Type, null);
             case SObjKlass o when a.Index == null && a.Offset == _p.Klass.TypeHierarchyDepth:

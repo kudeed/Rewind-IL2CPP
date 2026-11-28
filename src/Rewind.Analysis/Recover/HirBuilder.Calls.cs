@@ -612,7 +612,7 @@ public sealed partial class HirBuilder
                 // effectful producer at its own instruction before that
                 // can happen; never lose the native call itself.
                 if (_materialize.Contains(result) || expr is HOpaque ||
-                    IsReceiverScalar(returnType) && !IsPure(expr) && HasProvenReceiverOnlyUse(result))
+                    (IsReceiverScalar(returnType) || Environment.GetEnvironmentVariable("REWIND_NO_TYPED_UNUSED_RECEIVER") == null && IsTypedStaleReceiver(returnType)) && !IsPure(expr) && HasProvenReceiverOnlyUse(result, returnType))
                 {
                     HVar t = Temp(returnType, result.Type);
                     Emit(new HAssign(new HLocal(t) { Type = t.Type }, expr), call.Addr);
@@ -1718,6 +1718,7 @@ public sealed partial class HirBuilder
         ChosenCalls[call] = (method, abi, shift);
 
         HExpr? thisExpr = null;
+        MethodDef? receiverIndependentTarget = null;
         var args = new HExpr[method.Parameters.Length];
         MethodDef? stringConstructor = null;
         HExpr? returnLocation = null;
@@ -1887,6 +1888,19 @@ public sealed partial class HirBuilder
                         thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
                         _h.Notes.Add($"receiver-independent bool scalar at 0x{call.Addr:X} to 0x{method.Address:X}");
                     }
+                    else if (Environment.GetEnvironmentVariable("REWIND_NO_TYPED_UNUSED_RECEIVER") == null &&
+                             Eval(node) is SVal { Expr: { } staleTyped } &&
+                             (staleTyped.Type ?? (staleTyped as HLocal)?.Variable.Type) is { } staleTypedType &&
+                             IsTypedStaleReceiver(staleTypedType) &&
+                             !IsAssignable(staleTypedType, method.DeclaringType.Sig) &&
+                             Plain(staleTyped) && IsPure(staleTyped) &&
+                             CanRestoreProvenStaleReceiver(call, method, classArgs, methodArgs, isVirtual,
+                                 alternatives, receiverOverride, shift))
+                    {
+                        thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                        receiverIndependentTarget = method;
+                        _h.Notes.Add($"receiver-independent proven typed stale x0 at 0x{call.Addr:X} to 0x{method.Address:X}");
+                    }
                     else if (Eval(node) is SVal { Expr: { } invalidScalar } &&
                              IsReceiverScalar(invalidScalar.Type ?? (invalidScalar as HLocal)?.Variable.Type) &&
                              Plain(invalidScalar) && IsPure(invalidScalar) &&
@@ -1904,6 +1918,13 @@ public sealed partial class HirBuilder
                         if (Eval(node) is SNewObject) { }
                         else if (CheckedClassHere(node) is { } checkedAs && !IsAssignable(thisExpr.Type, p.Type))
                             thisExpr = new HTypeExpr(HTypeOp.CastClass, checkedAs, thisExpr) { Type = checkedAs };
+                        // A successful type-test edge dominates this call. The native
+                        // object register keeps its broad static type, but only an
+                        // instance of the tested class can reach this receiver use.
+                        else if (Environment.GetEnvironmentVariable("REWIND_NO_TESTED_CALL_RECEIVER") == null &&
+                                 TestedType(node) is { } testedAs && IsReference(testedAs) &&
+                                 IsAssignable(testedAs, p.Type) && !IsAssignable(thisExpr.Type, p.Type))
+                            thisExpr = new HTypeExpr(HTypeOp.CastClass, testedAs, thisExpr) { Type = testedAs };
                     }
                     break;
                 }
@@ -2058,6 +2079,7 @@ public sealed partial class HirBuilder
             DeclaringType = declaring,
             MethodArguments = methodArgs,
             This = thisExpr,
+            ReceiverIndependentTarget = receiverIndependentTarget,
             Arguments = args,
             Virtual = virtualCall,
             Type = abi.ReturnType,
@@ -2380,6 +2402,12 @@ public sealed partial class HirBuilder
                    Il2CppTypeEnum.U4 or Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8 }
         || type?.Definition is { IsEnum: true, EnumUnderlyingType: { } underlying } && IsReceiverScalar(underlying);
 
+    // Concrete value/reference data can also remain in x0 after the original receiver was
+    // optimized away. Open generics, pointers, and byrefs are outside this proof.
+    private static bool IsTypedStaleReceiver(TypeSig? type) =>
+        type is TypeDefSig { Definition: { IsGenericDefinition: false, IsEnum: false } } ||
+        type is PrimitiveSig { Element: Il2CppTypeEnum.String or Il2CppTypeEnum.Object };
+
     // AAPCS64 returns aggregates larger than 16 bytes through the hidden
     // x8 result pointer. Such methods, like void methods, leave x0 available
     // for an optimized-away receiver; smaller scalar/reference returns do not.
@@ -2432,7 +2460,7 @@ public sealed partial class HirBuilder
         return proved;
     }
 
-    private bool HasProvenReceiverOnlyUse(Node result)
+    private bool HasProvenReceiverOnlyUse(Node result, TypeSig resultType)
     {
         // Follow a unique scalar width alias, not arbitrary arithmetic,
         // merges, memory effects, or multiple users.
@@ -2453,7 +2481,8 @@ public sealed partial class HirBuilder
             for(int i=0;i<ci.Slots.Count&&i<user.In.Length;i++)
                 if(ReferenceEquals(user.In[i],n))slots++;
             if(slots!=1)return false;
-            return CanRestoreProvenStaleReceiver(user,targets[0],[],[],false,null,null,0);
+            return !IsAssignable(resultType, targets[0].DeclaringType.Sig) &&
+                CanRestoreProvenStaleReceiver(user,targets[0],[],[],false,null,null,0);
         }
         return false;
     }

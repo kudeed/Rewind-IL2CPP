@@ -1143,7 +1143,9 @@ public sealed class BodyEmitter
 
             // Calls on objects check the receiver for null, as "callvirt" does; a direct "call" is for struct
             // methods, constructors, and "base.Method()".
-            bool direct = m.IsStatic || structReceiver || m.Name == ".ctor" || (m.IsVirtual && !call.Virtual);
+            bool receiverIndependent = ReferenceEquals(call.ReceiverIndependentTarget, m) &&
+                !m.IsStatic && !m.IsVirtual && !call.Virtual && call.Constrained == null;
+            bool direct = receiverIndependent || m.IsStatic || structReceiver || m.Name == ".ctor" || (m.IsVirtual && !call.Virtual);
             _il.Emit(direct ? OpCodes.Call : OpCodes.Callvirt, target);
         }
 

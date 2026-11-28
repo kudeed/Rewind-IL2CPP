@@ -12,7 +12,7 @@ namespace Rewind.Analysis.Runtime;
 public sealed class KlassLayout
 {
     public int ElementClass, CastClass, DeclaringType, Parent, GenericClass, InterfaceOffsets, StaticFields, RgctxData,
-        TypeHierarchy, CctorStarted, CctorFinished, InstanceSize, ElementSize, Flags, VTableCount, InterfaceOffsetsCount,
+        TypeHierarchy, CctorStarted, CctorFinished, InstanceSize, StackSlotSize, ElementSize, Flags, VTableCount, InterfaceOffsetsCount,
         TypeHierarchyDepth, Rank, Bitflags, VTable, ByvalArg, ThisArg;
 
     /// <summary>Size of one vtable entry: { method pointer, MethodInfo* }.</summary>
@@ -105,7 +105,7 @@ public sealed class KlassLayout
         Field(8, 8);                    // cctor_thread (ALIGN_TYPE(8) size_t)
         Ptr();                          // genericContainerHandle
         k.InstanceSize = U32();
-        if (shape.StackSlotSize) U32(); // stack_slot_size
+        if (shape.StackSlotSize) k.StackSlotSize = U32(); // stack_slot_size
         U32();                          // actualSize
         k.ElementSize = U32();
         U32();                          // native_size

@@ -675,7 +675,7 @@ internal static class FinallyFolding
                 case HCall x:
                 {
                     var y = (HCall)b;
-                    return ReferenceEquals(x.Method, y.Method) && ReferenceEquals(x.DeclaringType, y.DeclaringType) && x.Virtual == y.Virtual &&
+                    return ReferenceEquals(x.Method, y.Method) && ReferenceEquals(x.DeclaringType, y.DeclaringType) && x.Virtual == y.Virtual && ReferenceEquals(x.ReceiverIndependentTarget, y.ReceiverIndependentTarget) &&
                            ReferenceEquals(x.Constrained, y.Constrained) && Same(x.MethodArguments, y.MethodArguments) &&
                            Expression(x.This, y.This) && All(x.Arguments, y.Arguments);
                 }
