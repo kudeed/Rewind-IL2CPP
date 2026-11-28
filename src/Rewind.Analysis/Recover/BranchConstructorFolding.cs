@@ -5,9 +5,9 @@ using Rewind.Runtime;
 namespace Rewind.Analysis.Recover;
 
 /// <summary>
-/// One allocation immediately followed by a pure scalar test, with the same constructor first in both
-/// successor blocks. Capture that test once and construct at the original allocation with selected arguments.
-/// No exception region, type initializer, finalizer, early publication or alias is accepted.
+/// One allocation immediately followed by a pure scalar test, with a constructor first in both
+/// successor blocks. Capture that test once and construct at the original allocation with selected arguments or the selected overload.
+/// No exception region, finalizer, early publication or alias is accepted. For distinct overloads, the captured condition and arguments are unescaped scalar values, so moving their nonthrowing reads before allocation cannot observe a type initializer. The selected new expression preserves initialization and constructor effects.
 /// </summary>
 internal static class BranchConstructorFolding
 {
@@ -18,7 +18,7 @@ internal static class BranchConstructorFolding
            block.Statements[^1] is not HBranch branch||target.Variable.AddressTaken||
            allocation.Target is not TypeDefSig {Definition:{IsValueType:false} definition}||
            target.Variable.Type.Key!=allocation.Target.Key||target.Type?.Key!=allocation.Target.Key||
-           allocation.Type?.Key!=allocation.Target.Key||!PlainHierarchy(definition)||(definition.Flags&(TypeDef.Abstract|TypeDef.Interface))!=0)return false;
+           allocation.Type?.Key!=allocation.Target.Key||(definition.Flags&(TypeDef.Abstract|TypeDef.Interface))!=0)return false;
         HVar created=target.Variable;
         if(method.Blocks.SelectMany(b=>b.Statements).Distinct().Count()!=method.Blocks.Sum(b=>b.Statements.Count))return false;
         HBlock yes=branch.WhenTrue,no=branch.WhenFalse;
@@ -27,14 +27,15 @@ internal static class BranchConstructorFolding
            method.Blocks.Count==0||ReferenceEquals(method.Blocks[0],yes)||ReferenceEquals(method.Blocks[0],no)||
            yes.Statements.Count<2||no.Statements.Count<2||
            yes.Statements[0] is not HEval {Expression:HCall yc}||no.Statements[0] is not HEval {Expression:HCall nc}||
-           !Constructor(yc)||!Constructor(nc)||!ReferenceEquals(yc.Method,nc.Method)||
-           !ReferenceEquals(yc.Method.DeclaringType,definition)||yc.DeclaringType?.Key!=nc.DeclaringType?.Key||
+           !Constructor(yc)||!Constructor(nc)||
+           !ReferenceEquals(yc.Method.DeclaringType,definition)||!ReferenceEquals(nc.Method.DeclaringType,definition)||yc.DeclaringType?.Key!=nc.DeclaringType?.Key||
            yc.DeclaringType!=null&&yc.DeclaringType.Key!=allocation.Target.Key||
-           yc.Arguments.Length!=yc.Method.Parameters.Length||nc.Arguments.Length!=yc.Arguments.Length||
-           !ScalarTest(branch.Condition,method))return false;
-        for(int i=0;i<yc.Arguments.Length;i++)
-            if(!ScalarValue(yc.Arguments[i],method,yc.Method.Parameters[i].Type)||
-               !ScalarValue(nc.Arguments[i],method,yc.Method.Parameters[i].Type))return false;
+           yc.Arguments.Length!=yc.Method.Parameters.Length||nc.Arguments.Length!=nc.Method.Parameters.Length||
+           !ScalarTest(branch.Condition,method)||
+           !PlainHierarchy(definition,allowStaticInitialization:!ReferenceEquals(yc.Method,nc.Method)))return false;
+        foreach(HCall constructor in new[]{yc,nc})
+            for(int i=0;i<constructor.Arguments.Length;i++)
+                if(!ScalarValue(constructor.Arguments[i],method,constructor.Method.Parameters[i].Type))return false;
 
         var predecessors=method.Blocks.ToDictionary(b=>b,_=>new HashSet<HBlock>());
         foreach(HBlock b in method.Blocks)
@@ -86,10 +87,18 @@ internal static class BranchConstructorFolding
         var boolean=sigs.Primitive(Il2CppTypeEnum.Boolean);
         HVar selected=method.NewLocal(boolean,"ctorChoice");
         HLocal ReadChoice()=>new(selected){Type=boolean};
-        var arguments=new HExpr[yc.Arguments.Length];
-        for(int i=0;i<arguments.Length;i++)arguments[i]=new HSelect(ReadChoice(),HirCopy.Of(yc.Arguments[i]),HirCopy.Of(nc.Arguments[i])){Type=yc.Method.Parameters[i].Type};
         var capture=new HAssign(ReadChoice(),HirCopy.Of(branch.Condition)){Address=branch.Address};
-        assign.Value=new HNewObject{Constructor=yc.Method,DeclaringType=yc.DeclaringType,Arguments=arguments,Type=allocation.Target};
+        if(ReferenceEquals(yc.Method,nc.Method))
+        {
+            var arguments=new HExpr[yc.Arguments.Length];
+            for(int i=0;i<arguments.Length;i++)arguments[i]=new HSelect(ReadChoice(),HirCopy.Of(yc.Arguments[i]),HirCopy.Of(nc.Arguments[i])){Type=yc.Method.Parameters[i].Type};
+            assign.Value=new HNewObject{Constructor=yc.Method,DeclaringType=yc.DeclaringType,Arguments=arguments,Type=allocation.Target};
+        }
+        else
+        {
+            HNewObject Create(HCall call)=>new(){Constructor=call.Method,DeclaringType=call.DeclaringType,Arguments=call.Arguments.Select(a=>HirCopy.Of(a)).ToArray(),Type=allocation.Target};
+            assign.Value=new HSelect(ReadChoice(),Create(yc),Create(nc)){Type=allocation.Target};
+        }
         block.Statements.Insert(at,capture);branch.Condition=ReadChoice();
         yes.Statements.RemoveAt(0);no.Statements.RemoveAt(0);
         method.Notes.Add("one raw allocation and two branch constructors restored with one captured pure scalar condition");
@@ -101,14 +110,14 @@ internal static class BranchConstructorFolding
             call.This is HLocal receiver&&ReferenceEquals(receiver.Variable,created)&&receiver.Type?.Key==allocation.Target.Key;
     }
 
-    private static bool PlainHierarchy(TypeDef definition)
+    private static bool PlainHierarchy(TypeDef definition,bool allowStaticInitialization=false)
     {
         var seen=new HashSet<TypeDef>();
         for(TypeDef? current=definition;current!=null;)
         {
             bool systemObject=current.ReflectionName=="System.Object";
             if(!seen.Add(current)||current.GenericParameters.Length!=0||current.IsValueType||
-               current.Methods.Any(m=>m.Name==".cctor"||m.Name=="Finalize"&&!systemObject))return false;
+               current.Methods.Any(m=>(!allowStaticInitialization&&m.Name==".cctor")||m.Name=="Finalize"&&!systemObject))return false;
             if(current.BaseType==null)return current.ReflectionName=="System.Object";
             // System.Object is normally encoded as ELEMENT_TYPE_OBJECT in loaded metadata.
             // Accept that signature only when it resolves to the exact terminal Object definition.
