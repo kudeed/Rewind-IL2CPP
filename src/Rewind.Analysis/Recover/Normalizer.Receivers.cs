@@ -51,18 +51,9 @@ public sealed partial class Normalizer
         return v is >= -4096 and <= -8 && v%8==0;
     }
 
-    private void RestoreGuardedReceiver(Block guard,Block continuation,Node condition,int side)
+    private FieldDef? TypedSelfStaticReference(Node value)
     {
-        if(Environment.GetEnvironmentVariable("REWIND_NO_GUARDED_RECEIVER")!=null||
-            program.Model.Image.Arch!=CpuArch.Arm64||_fn.TryRegions.Count!=0||
-            NullGuardValue(condition,side) is not { Op:Op.Load,Type:VT.I64 } checkedObject||
-            checkedObject.Block!=guard||
-            FirstDirectCall(guard,continuation,_fn.Params.GetValueOrDefault(_fn.Regs.StackPointer)) is not {Aux:CallInfo ci} call)
-            return;
-
-        // A static reference field is Load(Load(Klass+static_fields)+offset).
-        // Only a metadata-identified class and exact recorded field identity
-        // qualify. No arbitrary pointer, integer, or guessed singleton name.
+        if(value.Op!=Op.Load||value.Type!=VT.I64||value.In.Length!=1)return null;
         static (Node Base,long Offset) Split(Node address)
         {
             if(address.Op==Op.Add&&address.In.Length==2)
@@ -72,16 +63,72 @@ public sealed partial class Normalizer
             }
             return(address,0);
         }
-        var (statics,offset)=Split(checkedObject.In[0]);
-        if(statics.Op!=Op.Load||statics.Type!=VT.I64)return;
+        var (statics,offset)=Split(value.In[0]);
+        if(statics.Op!=Op.Load||statics.Type!=VT.I64||statics.In.Length!=1)return null;
         var (klass,klassOffset)=Split(statics.In[0]);
         if(klassOffset!=program.Klass.StaticFields||klass.Op!=Op.SlotValue||
             program.Model.ResolveUsageSlot((ulong)klass.Imm) is not {Kind:UsageKind.TypeInfo,Type:TypeDefSig t}||
-            t.Definition is not {IsValueType:false,IsGenericDefinition:false} owner)
-            return;
+            t.Definition is not {IsValueType:false,IsGenericDefinition:false} owner)return null;
         var fields=owner.Fields.Where(f=>f.IsStatic&&!f.IsLiteral&&f.Offset==offset&&
             f.Type is TypeDefSig&&ReferenceEquals(f.Type.Definition,owner)).ToArray();
-        if(fields.Length!=1)return;
+        return fields.Length==1?fields[0]:null;
+    }
+
+    internal static bool HasOnlyNullGuardUse(Function fn,Block guard,Node condition,Node value)
+    {
+        if(fn.TryRegions.Count!=0||guard.Scope!=-1||value.Dead||condition.Dead||
+            value.Op!=Op.Load||value.Type!=VT.I64||value.In.Length!=1||value.Block!=guard||
+            !guard.Nodes.Contains(value)||guard.Terminator is not {Op:Op.Branch,In.Length:1} branch||
+            !ReferenceEquals(branch.In[0],condition))return false;
+        // A null guard with another observable use may still be represented by
+        // a managed dereference/call. This narrow case has no such operation.
+        // Check all live SSA uses, including phis and other blocks; do not
+        // assume that a later read of the same static field is this snapshot.
+        bool checkedUse=false;
+        foreach(Node node in fn.Blocks.SelectMany(b=>b.Phis.Concat(b.Nodes)))
+        {
+            if(node.Dead)continue;
+            foreach(Node input in node.In)
+            {
+                if(ReferenceEquals(input,value))
+                {
+                    if(!ReferenceEquals(node,condition)||checkedUse)return false;
+                    checkedUse=true;
+                }
+                if(ReferenceEquals(input,condition)&&!ReferenceEquals(node,branch))return false;
+            }
+        }
+        return checkedUse;
+    }
+
+    private bool KeepOrphanStaticNullGuard(Block guard,Node condition,int side)
+    {
+        if(program.Model.Image.Arch!=CpuArch.Arm64||
+            NullGuardValue(condition,side) is not {} value||
+            !HasOnlyNullGuardUse(_fn,guard,condition,value)||
+            TypedSelfStaticReference(value) is not {} field)return false;
+        // The original receiver was erased by native optimization and there
+        // is no remaining managed dereference to throw for this reference.
+        // Keep the original branch and identified throw helper at their exact
+        // positions; HirBuilder already emits the matching managed exception.
+        string note=$"retained orphan static null guard at 0x{guard.Terminator!.Addr:X} via {field.DeclaringType.ReflectionName}::{field.Name}";
+        if(!_result.ReceiverNotes.Contains(note))_result.ReceiverNotes.Add(note);
+        return true;
+    }
+
+    private void RestoreGuardedReceiver(Block guard,Block continuation,Node condition,int side)
+    {
+        if(Environment.GetEnvironmentVariable("REWIND_NO_GUARDED_RECEIVER")!=null||
+            program.Model.Image.Arch!=CpuArch.Arm64||_fn.TryRegions.Count!=0||
+            NullGuardValue(condition,side) is not { Op:Op.Load,Type:VT.I64 } checkedObject||
+            checkedObject.Block!=guard||
+            FirstDirectCall(guard,continuation,_fn.Params.GetValueOrDefault(_fn.Regs.StackPointer)) is not {Aux:CallInfo ci} call)
+            return;
+
+        // A static reference field must be identified by exact metadata,
+        // class-static layout and a unique self-typed reference field.
+        if(TypedSelfStaticReference(checkedObject) is not {} field)return;
+        TypeDef owner=field.DeclaringType;
 
         // Direct and unique definition, with an exactly matching class and
         // a nonvirtual/nonconstructor instance signature.
@@ -106,6 +153,6 @@ public sealed partial class Normalizer
         // in addition to the unique metadata target and unused-x0 entry proof.
         if(crossesEffect&&!Arm64ReceiverProof.ExactDirectTransfer(program.Model.Image,call.Addr,ci.Target,call.Op==Op.TailCall))return;
         call.In[index]=checkedObject;
-        _result.ReceiverNotes.Add($"guarded receiver at 0x{call.Addr:X} to 0x{ci.Target:X} via {owner.ReflectionName}::{fields[0].Name}");
+        _result.ReceiverNotes.Add($"guarded receiver at 0x{call.Addr:X} to 0x{ci.Target:X} via {owner.ReflectionName}::{field.Name}");
     }
 }

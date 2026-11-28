@@ -531,6 +531,49 @@ foreach(int at in new[]{0,1,2,3,4,8,9,10}){var bad=rgctx31.ToArray();bad[at]^=1;
 Check(!Guard31(rgctx31,mi:2)&&!Guard31(rgctx31,arg:3)&&!Guard31(rgctx31,helper:false)&&!Guard31(rgctx31[..10]),"wrong rgctx arguments/helper/range");
 Console.WriteLine("OWN_RGCTX_GUARD_SMOKE_PASS positive=1 negative=12");
 
+// A native null guard whose typed reference has no remaining dereference must
+// survive; these graphs are synthetic and contain no application metadata.
+static (Function Fn,Block Guard,Node Value,Node Condition,Node Branch) OrphanGuardFixture()
+{
+    var guard=new Block{Id=0};var normal=new Block{Id=1};var fail=new Block{Id=2};
+    var address=new Node{Op=Op.Param,Type=VT.I64};
+    var value=new Node{Op=Op.Load,Type=VT.I64,In=[address],Block=guard};
+    var zero=new Node{Op=Op.Const,Type=VT.I64};
+    var condition=new Node{Op=Op.CmpEq,Type=VT.I1,In=[value,zero],Block=guard};
+    var branch=new Node{Op=Op.Branch,In=[condition],Block=guard};
+    guard.Nodes=[value,condition,branch];guard.Succs=[fail,normal];
+    normal.Preds=[guard];normal.Nodes=[new Node{Op=Op.Return,Block=normal}];
+    fail.Preds=[guard];fail.Nodes=[new Node{Op=Op.Call,Aux=new CallInfo{NoReturn=true},Block=fail},new Node{Op=Op.Unreachable,Block=fail}];
+    return(new Function{Blocks=[guard,normal,fail]},guard,value,condition,branch);
+}
+var orphan=OrphanGuardFixture();
+Check(Normalizer.HasOnlyNullGuardUse(orphan.Fn,orphan.Guard,orphan.Condition,orphan.Value),"orphan checked snapshot");
+Rewind.Analysis.Passes.DeadCode.Run(orphan.Fn);
+Check(!orphan.Value.Dead&&orphan.Guard.Nodes.Contains(orphan.Branch),"kept guard retains checked load");
+var orphanMutations=new Action<(Function Fn,Block Guard,Node Value,Node Condition,Node Branch)>[]{
+    guardCase=>guardCase.Value.Type=VT.I32,
+    guardCase=>guardCase.Value.Dead=true,
+    guardCase=>guardCase.Condition.Dead=true,
+    guardCase=>guardCase.Value.Block=guardCase.Fn.Blocks[1],
+    guardCase=>guardCase.Guard.Scope=0,
+    guardCase=>guardCase.Fn.TryRegions.Add(new TryRegionInfo()),
+    guardCase=>guardCase.Branch.Op=Op.Jump,
+    guardCase=>guardCase.Fn.Blocks[1].Nodes.Insert(0,new Node{Op=Op.Call,In=[guardCase.Value]}),
+    guardCase=>guardCase.Fn.Blocks[1].Phis.Add(new Node{Op=Op.Phi,In=[guardCase.Value]}),
+    guardCase=>guardCase.Fn.Blocks[1].Nodes.Insert(0,new Node{Op=Op.Branch,In=[guardCase.Condition]}),
+    guardCase=>guardCase.Condition.In=[guardCase.Value,guardCase.Value],
+    guardCase=>guardCase.Guard.Nodes.Remove(guardCase.Value)
+};
+foreach(var mutation in orphanMutations)
+{
+    var guardCase=OrphanGuardFixture();mutation(guardCase);
+    Check(!Normalizer.HasOnlyNullGuardUse(guardCase.Fn,guardCase.Guard,guardCase.Condition,guardCase.Value),"non-orphan/unsafe guard must stay outside narrow rule");
+}
+var deadOther=OrphanGuardFixture();deadOther.Fn.Blocks[1].Nodes.Insert(0,new Node{Op=Op.Call,In=[deadOther.Value],Dead=true});
+Check(Normalizer.HasOnlyNullGuardUse(deadOther.Fn,deadOther.Guard,deadOther.Condition,deadOther.Value),"dead use is not a surviving dereference");
+Console.WriteLine("ORPHAN_STATIC_GUARD_SMOKE_PASS positive=3 negative="+orphanMutations.Length);
+
+
 sealed class VectorImage:NativeImage{
  public override ImageFormat Format=>ImageFormat.Elf;
  public VectorImage(params uint[] words){

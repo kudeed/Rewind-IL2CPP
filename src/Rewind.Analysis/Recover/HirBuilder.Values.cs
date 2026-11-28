@@ -2197,7 +2197,7 @@ public sealed partial class HirBuilder
             return new SVal(new HLocal(exception) { Type = exception.Type });
         }
         if (ClassDataLoad(n) is { } classData) return classData;
-        Place place = ResolvePlace(n.In[0], n.Type.Bytes());
+        Place place = SelectedObjectFieldLoad(n) ?? ResolvePlace(n.In[0], n.Type.Bytes());
         switch (place)
         {
             case PLocation { Location: HDeref { Pointer: HSelect { WhenTrue: HAddressOf first, WhenFalse: HAddressOf second } either } } picked:
