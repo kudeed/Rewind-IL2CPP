@@ -9,3 +9,5 @@ Accepted shapes are complete primitive elements at aligned, typed SZ-array addre
 The snapshot fixtures model managed null/index exceptions. They do not claim to define the behavior of an original unchecked native access outside allocated array memory, concurrent mutation by another thread, volatile accesses, or native memory faults.
 
 Build this project once against the new isolated CLI directory with `-p:RewindBinaryDir=/absolute/path/to/src/Rewind.Cli/bin/Release/net10.0`, then run its DLL. The JSON report records only this runner's new groups/assertions.
+
+`--group rejections` runs only the fourth group for an incremental retry. Failed reports retain completed-group information and the original exception stack. The synthetic builder initializes an empty `NormalizeResult`, which the existing opaque-address fallback also reads; this is test setup, not a production behavior change.

@@ -34,7 +34,11 @@ internal static class Program
     private static object Call(object obj, string method, params object?[] args)
     {
         try { return obj.GetType().GetMethods(All).Single(m => m.Name == method && m.GetParameters().Length == args.Length).Invoke(obj, args)!; }
-        catch (TargetInvocationException e) { throw e.InnerException!; }
+        catch (TargetInvocationException e) when (e.InnerException != null)
+        {
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(e.InnerException).Throw();
+            throw;
+        }
     }
     private static object Meaning(HExpr e) => Activator.CreateInstance(Val, e)!;
     private static HExpr Expression(object value) => (HExpr)Val.GetField("Expr")!.GetValue(value)!;
@@ -84,6 +88,9 @@ internal static class Program
             Backing(program, "Model", model); Backing(program, "Layouts", layouts);
             Set(Builder, "_p", program); Set(Builder, "_m", model); Set(Builder, "_method", method);
             Set(Builder, "_h", Method); Set(Builder, "_cur", Block); Set(Builder, "_fn", Function);
+            // Unresolved addresses still visit BinarySem when constructing their opaque marker. Supply
+            // the same empty normalization context the real pipeline has, rather than a null fixture field.
+            Set(Builder, "_l", new LiftedMethod { Method = method, Function = Function, Normalization = new NormalizeResult() });
             Set(Builder, "_ptr", 8); Set(Builder, "_header", 16);
             foreach (var pair in new (string, Il2CppTypeEnum)[] {
                 ("_int", Il2CppTypeEnum.I4), ("_uint", Il2CppTypeEnum.U4), ("_long", Il2CppTypeEnum.I8), ("_ulong", Il2CppTypeEnum.U8),
@@ -267,6 +274,7 @@ internal static class Program
             ("unaligned first element", new Fixture(displacement: 2)),
         })
         {
+            Console.Error.WriteLine("Rejection fixture: " + name);
             object value = f.Read();
             Check(Val.IsInstanceOfType(value) && Expression(value) is HOpaque, name + " stays explicit and unresolved");
             Check(f.Method.Problems.Count > 0 && f.Block.Statements.Count == 0, name + " diagnoses before emitting reads");
@@ -280,18 +288,30 @@ internal static class Program
         int before = assertions; action(); Groups.Add(new { name, assertions = assertions - before, passed = true });
     }
 
-    public static int Main()
+    public static int Main(string[] args)
     {
         try
         {
-            Group("float-pair bits, adjacent memory and alias snapshots", FloatPairs);
-            Group("complete primitive ranges at native widths", PrimitiveRanges);
-            Group("null, bounds, ordering and displacement", FailureOrder);
-            Group("unproved shapes rejected; scalar read unchanged", ConservativeRejections);
+            string? only = args.Length == 2 && args[0] == "--group" ? args[1] : null;
+            if (args.Length != 0 && only == null) throw new ArgumentException("Use --group rejections for the failed-group increment.");
+            if (only == null)
+            {
+                Group("float-pair bits, adjacent memory and alias snapshots", FloatPairs);
+                Group("complete primitive ranges at native widths", PrimitiveRanges);
+                Group("null, bounds, ordering and displacement", FailureOrder);
+            }
+            if (only is null or "rejections") Group("unproved shapes rejected; scalar read unchanged", ConservativeRejections);
+            else throw new ArgumentException("Unknown group: " + only);
             Console.WriteLine(JsonSerializer.Serialize(new { schema = "rewind-wide-array-load-tests-v1", groups = Groups.Count,
                 assertions, failed = 0, cases = Groups, historical_tests_rerun = false }, new JsonSerializerOptions { WriteIndented = true }));
             return 0;
         }
-        catch (Exception ex) { Console.Error.WriteLine(ex); return 1; }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex);
+            Console.WriteLine(JsonSerializer.Serialize(new { schema = "rewind-wide-array-load-tests-v1", completed_groups = Groups,
+                assertions, failed = 1, historical_tests_rerun = false }, new JsonSerializerOptions { WriteIndented = true }));
+            return 1;
+        }
     }
 }
