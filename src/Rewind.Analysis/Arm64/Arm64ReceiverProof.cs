@@ -55,7 +55,31 @@ public static class Arm64ReceiverProof
             IsUnused(image,start,end,arglessThrow:arglessThrow);
     }
 
-    public static bool IsUnused(NativeImage image, ulong start, ulong end, byte register = 0, Func<ulong,bool>? unaryMetadataCall = null, Func<ulong,bool>? arglessThrow = null)
+    /// <summary>
+    /// Whether an AAPCS64 method uses x8 as its hidden aggregate result buffer.
+    /// The compiler normally preserves that incoming pointer in x19-x28 or
+    /// stores through x8 before its first call. Restricting the proof to the
+    /// entry block avoids mistaking a later scratch use of x8 for an sret buffer.
+    /// </summary>
+    public static bool HasIndirectReturnBuffer(NativeImage image, ulong start, ulong end)
+    {
+        if (image.Arch != Rewind.Binary.CpuArch.Arm64 || end <= start ||
+            !image.IsMapped(start, 4) || image.SectionAt(start) is not { IsExecutable: true }) return false;
+        int count = (int)Math.Min(64UL, (end - start) / 4);
+        for (int n = 0; n < count; n++)
+        {
+            ulong pc = start + (ulong)n * 4;
+            if (!image.IsMapped(pc, 4)) return false;
+            A64Instruction i = A64Decoder.Decode(image.U32(pc), pc);
+            if (i.Op is A64Op.Bl or A64Op.Blr or A64Op.Ret) return false;
+            if (i.Op == A64Op.Orr && i.Rm == 8 && i.Rd is >= 19 and <= 28) return true;
+            if (i.Op is A64Op.Ldr or A64Op.Str or A64Op.Ldp or A64Op.Stp && i.Rn == 8) return true;
+            if (i.Op == A64Op.AddImm && i.Rn == 8 && i.Rd is >= 19 and <= 28) return true;
+        }
+        return false;
+    }
+
+    public static bool IsUnused(NativeImage image, ulong start, ulong end, byte register = 0, Func<ulong,bool>? unaryMetadataCall = null, Func<ulong,bool>? arglessThrow = null, bool allowVoidReturn = false, bool allowIndirectStructReturn = false)
     {
         if (register > 7 || image.Arch != CpuArch.Arm64 || start >= end || (start & 3) != 0 || (end & 3) != 0 ||
             image.SectionAt(start) is not { IsExecutable: true } section || end > section.End) return false;
@@ -99,6 +123,27 @@ public static class Arm64ReceiverProof
                     break;
                 case A64Op.LdrLit:
                     kill = !i.Vector && i.Rd == register; break;
+                // These decoded scalar bitfields do not read the old Rd.
+                case A64Op.Ubfm or A64Op.Sbfm:
+                    if (i.Rn == register) return false;
+                    kill = i.Rd == register; break;
+                // GP -> SIMD copies/conversions read Rn, never GP Rd.
+                // SIMD register numbers overlap GP numbers; treating a vector
+                // destination as a GP write would falsely prove a kill.
+                case A64Op.DupGp or A64Op.InsGp or A64Op.FMovFromGp or A64Op.FMovFromGpHigh or
+                     A64Op.Scvtf or A64Op.Ucvtf:
+                    if (i.Rn == register) return false;
+                    break;
+                // SIMD -> GP copies/conversions overwrite Rd; Rn is a SIMD register.
+                case A64Op.Umov or A64Op.Smov or A64Op.FMovToGp or A64Op.FMovToGpHigh or A64Op.FCvtToInt:
+                    kill = i.Rd == register; break;
+                case A64Op.Ret:
+                    // Void methods and AAPCS64 indirect aggregate returns do not
+                    // return through x0. For the latter, the hidden result buffer
+                    // is x8; x0 may remain stale provided no path reads it.
+                    // Only ordinary RET x30 is a receiver-independent exit.
+                    if (register==0 && (allowVoidReturn || allowIndirectStructReturn) && image.U32(pc)==0xd65f03c0u) continue;
+                    return false;
                 case A64Op.Bl:
                     // An exactly identified argumentless nonreturning throw
                     // consumes no incoming register and ends this path.

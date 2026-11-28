@@ -536,7 +536,41 @@ public sealed class BodyEmitter
         private string Describe(HExpr e) => HirPrinter.Print(e, _h);
 
         /// <summary>The integer width an expression has on the IL stack: 64 for long and native int, else 32.</summary>
-        private static int StackBits(HExpr e) => Bits(e.Type) == 64 ? 64 : 32;
+        private int StackBits(HExpr e) => e switch
+        {
+            HLocal l => Bits(l.Variable.Type),
+            HArg a when a.Index >= 0 => Bits(ParameterType(a.Index)),
+            HArg a => Bits(a.Type),
+            HBinary b => StackBits(b.Left) == 64 ||
+                         (b.Op is not (HBinaryOp.Shl or HBinaryOp.Shr or HBinaryOp.ShrUn) && StackBits(b.Right) == 64)
+                ? 64 : 32,
+            HConv c => Bits(c.Type),
+            HCompare => 32,
+            HSelect s => Bits(s.Type),
+            _ => Bits(e.Type),
+        };
+
+        // Managed reference downcasts are explicit IL operations. IL2CPP
+        // sometimes leaves only the checked native type test in a getter;
+        // recover that cast when the declared destination is a strict subtype
+        // of the recovered source type (e.g. Graphic -> Image).
+        private bool IsReferenceAssignable(TypeSig from, TypeSig to)
+        {
+            if (ReferenceEquals(from, to)) return true;
+            TypeDef? target = to.Definition;
+            if (target == null) return false;
+            for (TypeSig? t = from; t?.Definition != null;)
+            {
+                TypeDef def = t.Definition;
+                if (ReferenceEquals(def, target)) return true;
+                if (target.IsInterface)
+                    foreach (TypeSig iface in def.Interfaces)
+                        if (ReferenceEquals(iface.Definition, target)) return true;
+                if (def.BaseType == null) break;
+                t = _model.Sigs.Substitute(def.BaseType, t is GenericInstSig g ? g.Arguments : [], []);
+            }
+            return false;
+        }
 
         /// <summary>Pushes a value and adapts integer width to what the destination holds.</summary>
         private void ValueAs(HExpr e, TypeSig? target)
@@ -548,6 +582,14 @@ public sealed class BodyEmitter
                 return;
             }
             Value(e);
+            if (target != null && e.Type != null &&
+                !IsValueType(e.Type) && !IsValueType(target) &&
+                IsReferenceAssignable(target, e.Type) &&
+                !IsReferenceAssignable(e.Type, target))
+            {
+                _il.Emit(OpCodes.Castclass, Ref(target));
+                return;
+            }
             // The address of a local handed over as an unmanaged pointer: "&local" (ldloca, conv.u).
             if (target is PointerSig && (e is HAddressOf || e.Type is ByRefSig))
             {
@@ -568,17 +610,18 @@ public sealed class BodyEmitter
                 return;
             }
             if (target == null || IsFloat(target) || IsFloat(e.Type)) return;
-            int want = Bits(target), have = Bits(e.Type);
+            int want = Bits(target), have = StackBits(e);
             if (want == 64 && have == 32 && target is PrimitiveSig or { Definition.IsEnum: true })
                 _il.Emit(IsUnsigned(e.Type) ? OpCodes.Conv_U8 : OpCodes.Conv_I8);
-            else if (want == 32 && have == 64 && e.Type is PrimitiveSig)
+            else if (want == 32 && have == 64 && e.Type is PrimitiveSig or { Definition.IsEnum: true })
                 _il.Emit(OpCodes.Conv_I4);
         }
 
         private void Index(HExpr e)
         {
-            // A constant is the 32-bit number the instruction takes, whatever width the machine code had it in:
-            // "new T[5] { ... }" is known by it.
+            // The actual IL stack width can differ from the HIR use-site annotation:
+            // a local is loaded with its declared variable type, and a binary expression
+            // widens when either operand is 64-bit. Array instructions still take Int32.
             long? constant = e is HConst { Value: var value } ? value switch
             {
                 long n => n,
@@ -591,7 +634,7 @@ public sealed class BodyEmitter
                 return;
             }
             Value(e);
-            if (Bits(e.Type) == 64) _il.Emit(OpCodes.Conv_I4);
+            if (StackBits(e) == 64) _il.Emit(OpCodes.Conv_I4);
         }
 
         private static readonly bool WideIndexConstants = Environment.GetEnvironmentVariable("REWIND_WIDE_INDEX_CONSTANTS") != null;
@@ -704,7 +747,22 @@ public sealed class BodyEmitter
                     }
                     else _il.Emit(OpCodes.Ldc_I8, l);
                     return;
-                case int i: _il.Emit(OpCodes.Ldc_I4, i); return;
+                case int i:
+                    // HIR may carry a 32-bit literal with an explicitly widened 64-bit
+                    // stack type (e.g. long index + -8). Emit the declared stack width;
+                    // otherwise the following add/ldelem sees mixed Int32/Int64 operands.
+                    if (Bits(c.Type) == 64)
+                    {
+                        if (c.Type is PointerSig or ByRefSig || c.Type is PrimitiveSig
+                            { Element: Il2CppTypeEnum.I or Il2CppTypeEnum.U })
+                        {
+                            _il.Emit(OpCodes.Ldc_I4, i);
+                            _il.Emit(IsUnsigned(c.Type) ? OpCodes.Conv_U : OpCodes.Conv_I);
+                        }
+                        else _il.Emit(OpCodes.Ldc_I8, (long)i);
+                    }
+                    else _il.Emit(OpCodes.Ldc_I4, i);
+                    return;
                 default: throw new CannotEmit("constant of type " + c.Value.GetType().Name);
             }
         }

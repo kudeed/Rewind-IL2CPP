@@ -862,6 +862,19 @@ public sealed partial class HirBuilder
         return constants;
     }
 
+    // Atomic helpers have a managed generic signature even though their
+    // native implementation receives raw pointers. A dominating native
+    // class check (including the null success edge) must survive as a
+    // typed reference at the CAS call just as at ordinary managed calls.
+    private HExpr AtomicCheckedArgument(Node node, TypeSig target)
+    {
+        HExpr arg = ValueFor(node, target);
+        if (!IsAssignable(arg.Type, target) &&
+            CheckedClassHere(node) is { } checkedAs && IsAssignable(checkedAs, target))
+            return new HTypeExpr(HTypeOp.CastClass, checkedAs, arg) { Type = checkedAs };
+        return arg;
+    }
+
     private static readonly bool NoInlineCompareExchange = Environment.GetEnvironmentVariable("REWIND_NO_INLINE_COMPARE_EXCHANGE") != null;
 
     private void EmitIntrinsic(Node call, CallInfo info)
@@ -890,7 +903,7 @@ public sealed partial class HirBuilder
             _m.FindType("System.Threading.Interlocked")?.Methods.FirstOrDefault(m =>
                 m.Name == "CompareExchange" && m.GenericParameters.Length == 1 && m.Parameters.Length == 3) is { } compareExchange)
         {
-            HExpr[] arguments = [new HAddressOf(location) { Type = _m.Sigs.ByRef(held) }, ValueFor(call.In[1], held), ValueFor(call.In[2], held)];
+            HExpr[] arguments = [new HAddressOf(location) { Type = _m.Sigs.ByRef(held) }, AtomicCheckedArgument(call.In[1], held), AtomicCheckedArgument(call.In[2], held)];
             var exchange = new HCall { Method = compareExchange, MethodArguments = [held], Arguments = arguments, Type = held };
             if (!IsUsed(call)) Emit(new HEval(exchange), call.Addr);
             else
@@ -1749,6 +1762,55 @@ public sealed partial class HirBuilder
                         thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
                         _h.Notes.Add($"receiver-independent guarded first argument at 0x{call.Addr:X} to 0x{method.Address:X}");
                     }
+                    else if (Environment.GetEnvironmentVariable("REWIND_EXPERIMENT_UNUSED_REF_SCALAR_RECEIVER") == "1" &&
+                             ReferenceEquals(method.DeclaringType, _method.DeclaringType) &&
+                             IsIndirectStructReturn(method, classArgs, methodArgs) &&
+                             CanRestoreUnusedReceiver(call, method, classArgs, methodArgs,
+                                 isVirtual, alternatives, receiverOverride, shift,
+                                 allowIndirectStructReturn:true))
+                    {
+                        // AAPCS64 returns a large aggregate through x8. The
+                        // callee's native entry proves x0 is not read on any
+                        // path, so the optimized-away same-instance receiver
+                        // is restored without treating the hidden result buffer
+                        // or a stale stack pointer as a managed object.
+                        thisExpr = new HArg(-1) { Type = _method.DeclaringType.Sig };
+                        _h.Notes.Add($"receiver-independent indirect aggregate call at 0x{call.Addr:X} to 0x{method.Address:X}");
+                    }
+                    else if (Environment.GetEnvironmentVariable("REWIND_EXPERIMENT_UNUSED_REF_SCALAR_RECEIVER") == "1" &&
+                             (node.IsConstValue(0) ||
+                              Eval(node) is SVal { Expr: { } staleScalar } &&
+                              (staleScalar.Type ?? (staleScalar as HLocal)?.Variable.Type) is { } staleType &&
+                              (IsReceiverScalar(staleType) ||
+                               (IsReference(staleType) && !IsAssignable(staleType, method.DeclaringType.Sig)))) &&
+                             method.Parameters.Length <= 2 &&
+                             method.Parameters.All(p => IsReference(p.Type) || IsReceiverScalar(p.Type)) &&
+                             (method.ReturnType.IsVoid || IsReceiverScalar(method.ReturnType)))
+                    {
+                        // Narrow scalar/reference case: cross-type calls need
+                        // one exact typed receiver field on the caller.
+                        FieldDef? receiverField = ReferenceEquals(method.DeclaringType, _method.DeclaringType)
+                            ? null : UniqueReceiverField(method.DeclaringType);
+                        if ((ReferenceEquals(method.DeclaringType, _method.DeclaringType) || receiverField != null) &&
+                            CanRestoreUnusedReceiver(call, method, classArgs, methodArgs, isVirtual, alternatives,
+                                receiverOverride, shift, allowArglessThrow:true,
+                                allowVoidReturn:method.ReturnType.IsVoid, receiverField:receiverField))
+                        {
+                            HArg self = new(-1) { Type = _method.DeclaringType.Sig };
+                            thisExpr = receiverField == null
+                                ? self
+                                : new HField { Object = self, Field = receiverField,
+                                    DeclaringType = _method.DeclaringType.Sig, Type = receiverField.Type };
+                            _h.Notes.Add(receiverField == null
+                                ? $"receiver-independent scalar/reference call at 0x{call.Addr:X} to 0x{method.Address:X}"
+                                : $"receiver-independent field receiver {receiverField.Name} at 0x{call.Addr:X} to 0x{method.Address:X}");
+                        }
+                        else
+                        {
+                            Problem(UnkeptReceiver);
+                            thisExpr = Value(node);
+                        }
+                    }
                     else if (!NoNullReceivers && node.IsConstValue(0))
                     {
                         // A string constructor: IL2CPP makes each one a method "CreateString" with the same
@@ -2287,18 +2349,50 @@ public sealed partial class HirBuilder
         return true;
     }
 
-    // The native receiver was optimized away. Substitute the current instance
-    // only for an unambiguous direct, nonvirtual, non-generic same-type call
-    // whose exact callee is proven to kill x0 on every entry path.
-    private readonly Dictionary<(ulong,bool), bool> _receiverProofs = [];
-    private bool CanRestoreUnusedReceiver(Node call, MethodDef method, TypeSig[] classArgs, TypeSig[] methodArgs,
-        bool isVirtual, List<MethodDef>? alternatives, Node? receiverOverride, int shift, bool allowArglessThrow=false)
+    // The native receiver was optimized away. Restore the caller instance for
+    // same-type calls, or one unique exact-typed field for cross-type calls, only
+    // when the direct nonvirtual callee is proven to kill x0 on every entry path.
+    private readonly Dictionary<(ulong,bool,bool,bool), bool> _receiverProofs = [];
+    private static bool IsReceiverScalar(TypeSig? type) => type is PrimitiveSig
+        { Element: Il2CppTypeEnum.Boolean or Il2CppTypeEnum.I1 or Il2CppTypeEnum.U1 or
+                   Il2CppTypeEnum.I2 or Il2CppTypeEnum.U2 or Il2CppTypeEnum.I4 or
+                   Il2CppTypeEnum.U4 or Il2CppTypeEnum.I8 or Il2CppTypeEnum.U8 }
+        || type?.Definition is { IsEnum: true, EnumUnderlyingType: { } underlying } && IsReceiverScalar(underlying);
+
+    // AAPCS64 returns aggregates larger than 16 bytes through the hidden
+    // x8 result pointer. Such methods, like void methods, leave x0 available
+    // for an optimized-away receiver; smaller scalar/reference returns do not.
+    private bool IsIndirectStructReturn(MethodDef method, TypeSig[] classArgs, TypeSig[] methodArgs) =>
+        _p.Model.Image.Arch == Rewind.Binary.CpuArch.Arm64 &&
+        _p.Abi.For(method,classArgs,methodArgs) is { Return: ReturnKind.Buffer, Known: true, ReturnBuffer: { Position: 8 } };
+
+    private FieldDef? UniqueReceiverField(TypeDef receiverType)
     {
+        FieldDef? found = null;
+        foreach (FieldDef field in _method.DeclaringType.Fields)
+        {
+            if (field.IsStatic || !IsReference(field.Type) ||
+                !ReferenceEquals(field.Type.Definition, receiverType)) continue;
+            if (found != null) return null;
+            found = field;
+        }
+        return found;
+    }
+
+    private bool CanRestoreUnusedReceiver(Node call, MethodDef method, TypeSig[] classArgs, TypeSig[] methodArgs,
+        bool isVirtual, List<MethodDef>? alternatives, Node? receiverOverride, int shift,
+        bool allowArglessThrow=false, bool allowVoidReturn=false,
+        bool allowIndirectStructReturn=false, FieldDef? receiverField=null)
+    {
+        bool sameType = ReferenceEquals(method.DeclaringType, _method.DeclaringType);
+        bool exactField = receiverField is { IsStatic: false } &&
+            ReferenceEquals(receiverField.DeclaringType, _method.DeclaringType) &&
+            IsReference(receiverField.Type) && ReferenceEquals(receiverField.Type.Definition, method.DeclaringType);
         if (Environment.GetEnvironmentVariable("REWIND_NO_RECEIVER_PROOF") != null ||
             _p.Model.Image.Arch != Rewind.Binary.CpuArch.Arm64 ||
             _method.IsStatic || _method.IsConstructor || method.IsStatic || method.IsConstructor ||
             (method.IsVirtual && (method.Flags & MethodDef.Final)==0) || isVirtual || method.IsAbstract ||
-            !ReferenceEquals(method.DeclaringType, _method.DeclaringType) ||
+            (!sameType && !exactField) ||
             method.DeclaringType.IsValueType || method.DeclaringType.IsGenericDefinition ||
             method.IsGenericDefinition || _method.IsGenericDefinition ||
             classArgs.Length != 0 || methodArgs.Length != 0 ||
@@ -2306,11 +2400,13 @@ public sealed partial class HirBuilder
             method.Address == 0 || call.Aux is not CallInfo { Indirect: false, Intrinsic: null } ci ||
             ci.Target != method.Address ||
             _p.RangeOf(method.Address) is not { } range) return false;
-        if (!_receiverProofs.TryGetValue((method.Address,allowArglessThrow), out bool proved))
+        if (!_receiverProofs.TryGetValue((method.Address,allowArglessThrow,allowVoidReturn,allowIndirectStructReturn), out bool proved))
         {
             proved = Rewind.Analysis.Arm64.Arm64ReceiverProof.IsUnused(_p.Model.Image, range.Start, range.End,
-                arglessThrow:allowArglessThrow ? target => _p.Helpers.KindAt(target)==HelperKind.ThrowNullReference : null);
-            _receiverProofs[(method.Address,allowArglessThrow)] = proved;
+                arglessThrow:allowArglessThrow ? target => _p.Helpers.KindAt(target)==HelperKind.ThrowNullReference : null,
+                allowVoidReturn:allowVoidReturn && method.ReturnType.IsVoid,
+                allowIndirectStructReturn:allowIndirectStructReturn && IsIndirectStructReturn(method, classArgs, methodArgs));
+            _receiverProofs[(method.Address,allowArglessThrow,allowVoidReturn,allowIndirectStructReturn)] = proved;
         }
         return proved;
     }
@@ -2686,8 +2782,8 @@ public sealed partial class HirBuilder
                     m.Name == (compare ? "CompareExchange" : "Exchange") && m.GenericParameters.Length == 1 && m.Parameters.Length == (compare ? 3 : 2));
                 if (location == null || type == null || method == null || !IsReference(type)) break;
                 HExpr[] arguments = compare
-                    ? [new HAddressOf(location) { Type = _m.Sigs.ByRef(type) }, ValueFor(a1, type), ValueFor(a2!, type)]
-                    : [new HAddressOf(location) { Type = _m.Sigs.ByRef(type) }, ValueFor(a1, type)];
+                    ? [new HAddressOf(location) { Type = _m.Sigs.ByRef(type) }, AtomicCheckedArgument(a1, type), AtomicCheckedArgument(a2!, type)]
+                    : [new HAddressOf(location) { Type = _m.Sigs.ByRef(type) }, AtomicCheckedArgument(a1, type)];
                 FinishCall(call, new HCall { Method = method, MethodArguments = [type], Arguments = arguments, Type = type }, ReturnKind.Integer, type, tail);
                 return;
             }
