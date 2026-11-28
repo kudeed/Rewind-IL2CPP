@@ -62,6 +62,9 @@ public sealed class BodyEmitter
             if (Environment.GetEnvironmentVariable("REWIND_NO_LIST_APPEND_IL_FOLDING") == null &&
                 ListAppendIlFolding.Run(body) is int folded && folded > 0)
                 h.Notes.Add($"public List.Add restored from {folded} complete emitted capacity diamond(s)");
+            if (Environment.GetEnvironmentVariable("REWIND_NO_LIST_CLEAR_IL_FOLDING") == null &&
+                ListClearIlFolding.Run(body) is int cleared && cleared>0)
+                h.Notes.Add($"public List.Clear restored from {cleared} complete emitted clear tail(s)");
             if (Environment.GetEnvironmentVariable("REWIND_NO_DOUBLE_BITCAST_LAYOUT") == null &&
                 _model.FindType("System.ValueType") is { } valueType &&
                 _doubleBitCast.Run(body,_emitter.Import(target.Module,valueType)) is int bitcasts && bitcasts>0)

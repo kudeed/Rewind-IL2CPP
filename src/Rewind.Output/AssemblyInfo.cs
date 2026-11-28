@@ -5,3 +5,4 @@ using System.Runtime.CompilerServices;
 [assembly: InternalsVisibleTo("AggregateNumericOperandsSmoke")]
 [assembly: InternalsVisibleTo("ListAppendIlFoldingSmoke")]
 [assembly: InternalsVisibleTo("DoubleBitCastSmoke")]
+[assembly: InternalsVisibleTo("ListClearIlSmoke")]
