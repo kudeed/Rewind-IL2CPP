@@ -605,7 +605,7 @@ public sealed class MethodPipeline
         if (WrapperFolding.Lift(result, this))
         {
             StructFolding.Run(result, _program, this);
-            _inlineFolding.Run(result);
+            Inline.Run(result);
         }
         StructFromParts.Run(result, this);
         WriteBacks.Run(result, _program);

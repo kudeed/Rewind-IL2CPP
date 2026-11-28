@@ -15,7 +15,7 @@ public sealed partial class HirBuilder
     /// <summary>True when <paramref name="bytes"/> is exactly one value of the struct type.</summary>
     private bool CopiesWhole(TypeSig? type, int bytes)
     {
-        if (!IsStructType(type) || Open(type!)) return false;
+        if (type == null || !IsStructType(type) || Open(type)) return false;
         var (size, _, known) = _p.Layouts.SizeOf(type);
         return known && size == bytes;
     }
