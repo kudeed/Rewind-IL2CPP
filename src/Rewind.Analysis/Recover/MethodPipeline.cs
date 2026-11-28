@@ -1181,13 +1181,16 @@ public sealed class MethodPipeline
     /// </summary>
     private bool WritesOnly(Node call, int inputIndex)
     {
+        if (inputIndex < 0 || inputIndex >= call.In.Length) return false;
         if (BlockCopies.Access(call, inputIndex, _program.Helpers, out _, out bool blockReads, out _)) return !blockReads;
         if (call.Aux is not CallInfo info || info.Indirect || info.Intrinsic != null || inputIndex >= info.Slots.Count) return false;
         ArgSlot slot = info.Slots[inputIndex];
         int position = _program.Abi.Regs.IntPositionOfSlot(slot);
         if (position < 0) return false;
         CallTarget target = _program.Resolve(info.Target);
-        if (target.Helper != null || !target.IsManaged) return false;
+        if (target.Helper != null)
+            return SinCosOutputExtent(call, info, inputIndex, target.Helper, out bool separateOutputs) > 0 && separateOutputs;
+        if (!target.IsManaged) return false;
         bool all = true, any = false;
         void Consider(MethodDef method, MethodAbi abi)
         {
@@ -1203,6 +1206,53 @@ public sealed class MethodPipeline
         foreach (MethodDef m in target.Methods) Consider(m, _program.Abi.For(m, [], []));
         foreach (MethodInst inst in target.Insts) Consider(inst.Method, _program.Abi.For(inst));
         return any && all;
+    }
+
+    /// <summary>
+    /// sincos[f] writes one scalar through each of its two output pointers. The floating argument consumes a
+    /// position on Win64 but not an integer position on AArch64. Without these bounds, an output below a reused
+    /// stack object appears to read that object's old and new lifetimes together. Only a complete, unambiguous
+    /// output-slot mapping grants the bound; the two pointer values themselves may alias.
+    /// </summary>
+    private int SinCosOutputExtent(Node call, CallInfo info, int inputIndex, HelperInfo helper, out bool separateOutputs)
+    {
+        separateOutputs = false;
+        if (NoHelperExtents || helper.Kind != HelperKind.SinCos || info.Indirect || info.Intrinsic != null ||
+            inputIndex < 0 || inputIndex >= call.In.Length || info.Slots.Count != call.In.Length)
+            return -1;
+        int first = _program.Abi.Regs.SharedPositions ? 1 : 0;
+        ArgSlot requested = info.Slots[inputIndex];
+        if (requested.Kind != ArgSlotKind.IntReg || (requested.Index != first && requested.Index != first + 1)) return -1;
+        int sine = -1, cosine = -1;
+        for (int i = 0; i < info.Slots.Count; i++)
+        {
+            ArgSlot slot = info.Slots[i];
+            if (slot.Kind != ArgSlotKind.IntReg || (slot.Index != first && slot.Index != first + 1)) continue;
+            if (call.In[i].Type != VT.I64) return -1;
+            if (slot.Index == first)
+            {
+                if (sine >= 0) return -1;
+                sine = i;
+            }
+            else
+            {
+                if (cosine >= 0) return -1;
+                cosine = i;
+            }
+        }
+        if (sine < 0 || cosine < 0) return -1;
+        int bytes = helper.IsDouble ? 8 : 4;
+        // StackSplitting handles each call input separately. Treating overlapping outputs as write-only
+        // could separate the two definitions and redirect just one pointer. Keep them conservatively
+        // read/write unless both addresses have one identical SSA base and provably disjoint byte ranges.
+        static (Node Base, long Offset) Address(Node value) =>
+            value is { Op: Op.Add, In: [var root, { IsConst: true } offset] }
+                ? (root, IrBuilder.SImm(offset)) : (value, 0);
+        var a = Address(call.In[sine]);
+        var b = Address(call.In[cosine]);
+        if (ReferenceEquals(a.Base, b.Base) && a.Offset is > -0x4000000 and < 0x4000000 && b.Offset is > -0x4000000 and < 0x4000000)
+            separateOutputs = Math.Abs(a.Offset - b.Offset) >= bytes;
+        return bytes;
     }
 
     /// <summary>True for a fill, or a copy seen from its destination: without that memory being read, the call does nothing.</summary>
@@ -1519,6 +1569,7 @@ public sealed class MethodPipeline
     private int EscapeExtent(Node call, int inputIndex, out bool asObject)
     {
         asObject = false;
+        if (inputIndex < 0 || inputIndex >= call.In.Length) return -1;
         if (BlockCopies.Access(call, inputIndex, _program.Helpers, out int blockBytes, out _, out _)) return blockBytes;
         if (call.Aux is not CallInfo info || info.Indirect || info.Intrinsic != null) return -1;
         if (inputIndex >= info.Slots.Count) return -1;
@@ -1529,6 +1580,8 @@ public sealed class MethodPipeline
         CallTarget target = _program.Resolve(info.Target);
         if (target.Helper != null)
         {
+            int written = SinCosOutputExtent(call, info, inputIndex, target.Helper, out _);
+            if (written > 0) return written;
             // modf(x, &whole) writes the whole part there, one number as wide as x, and nothing else. (Without a
             // bound, the address of a pasted Math.Round's local reached the whole frame, and nothing on the stack
             // became a value: the registers a catch handler saves stayed stores, of what it cannot know.)
