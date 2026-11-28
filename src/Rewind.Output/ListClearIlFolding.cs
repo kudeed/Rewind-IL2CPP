@@ -5,9 +5,9 @@ using Mono.Cecil.Rocks;
 namespace Rewind.Output;
 
 // Exact BCL Clear sequences. Value elements must be recursively
-// reference-free. Reference elements must have the original Count snapshot
-// immediately before the version read and the complete Array.Clear tail.
-internal static class ListClearIlFolding
+// reference-free. Reference elements require an exact, fresh Count snapshot
+// on every path to the version read, plus the complete Array.Clear tail.
+internal static partial class ListClearIlFolding
 {
     private static string? Scope(TypeReference t)=>t.Scope switch
     {
@@ -83,6 +83,7 @@ internal static class ListClearIlFolding
         // A Count null check precedes it, as the original version read did.
         if(k+14<a.Length&&a[k+3].OpCode.Code is Code.Ldarg or Code.Ldloc&&
             a[k+4].OpCode.Code==Code.Ldfld&&a[k+5].OpCode.Code==Code.Stloc)scheduled=3;
+        if(scheduled==0&&ConditionalFieldStore(body,a,k+3,list,version))scheduled=11;
         int n=k+3+scheduled;
         if(n+8>=a.Length||!Local(a[n],Code.Ldloc,list)||!Number(a[n+1],0)||
             !Field(a[n+2],Code.Stfld,"_size")||!Local(a[n+3],Code.Ldloc,list)||
@@ -97,7 +98,7 @@ internal static class ListClearIlFolding
         var count=new MethodReference("get_Count",counts[0].ReturnType,gt){HasThis=true,CallingConvention=counts[0].CallingConvention};
         if(Resolve(clear)!=clears[0]||Resolve(count)!=counts[0])return false;
         var region=a.Skip(k).Take(n+8-k).ToHashSet();
-        if(scheduled!=0)
+        if(scheduled==3)
         {
             if(a[k+3].Operand==list||a[k+3].Operand==version||
                 a[k+5].Operand is not VariableDefinition dst||dst==list||dst==version||
@@ -112,45 +113,67 @@ internal static class ListClearIlFolding
         Instruction join=a[n+8];VariableDefinition? savedCount=null;
         int tail=n+8;
         bool leave=false;
+        var countAliases=new HashSet<VariableDefinition>();
+        var skippedBridge=new List<Instruction>();
         if(refs)
         {
-            // Do not use a count carried across a callback, loop, or list mutation.
-            if(scheduled!=0||k<3||!Local(a[k-3],Code.Ldloc,list)||
-                a[k-2].OpCode.Code!=Code.Callvirt||a[k-2].Operand is not MethodReference get||
-                !Same(get.DeclaringType,gt)||Resolve(get)!=counts[0]||
-                a[k-1].OpCode.Code!=Code.Stloc||a[k-1].Operand is not VariableDefinition cv||
-                !Int(cv.VariableType)||cv==version||cv==list||
-                tail+12>=a.Length||!Local(a[tail],Code.Ldloc,cv)||!Number(a[tail+1],1)||
-                a[tail+2].OpCode.Code!=Code.Clt)return false;
+            if(scheduled!=0||tail+12>=a.Length||a[tail].OpCode.Code!=Code.Ldloc||
+                a[tail].Operand is not VariableDefinition cv||!Int(cv.VariableType)||cv==version||cv==list||
+                !Number(a[tail+1],1)||a[tail+2].OpCode.Code!=Code.Clt||
+                !FreshCountSnapshot(body,a,ix,k,list,gt,counts[0],cv,version,out countAliases))return false;
             savedCount=cv;
-            // Match the protected reference Clear shape in the original:
-            // if (oldCount < 1) leave join; else Array.Clear(...); leave join.
-            if(a[tail+3].OpCode.Code!=Code.Brfalse||
-                a[tail+3].Operand is not Instruction nonempty||
-                a[tail+4].OpCode.Code!=Code.Leave||a[tail+4].Operand is not Instruction exit||
-                !ix.TryGetValue(nonempty,out int j)||j!=tail+5)return false;
+            int j;Instruction? exit=null;
+            bool split=a[tail+3].OpCode.Code==Code.Brfalse;
+            if(split)
+            {
+                if(a[tail+3].Operand is not Instruction nonempty||
+                    a[tail+4].OpCode.Code is not (Code.Leave or Code.Br)||a[tail+4].Operand is not Instruction destination||
+                    !ix.TryGetValue(nonempty,out j)||j!=tail+5)return false;
+                exit=destination;leave=a[tail+4].OpCode.Code==Code.Leave;
+            }
+            else
+            {
+                if(a[tail+3].OpCode.Code!=Code.Brtrue||a[tail+3].Operand is not Instruction) return false;
+                j=tail+4;
+            }
             while(j<a.Length&&a[j].OpCode.Code==Code.Nop)j++;
             if(j+5>=a.Length||!Local(a[j],Code.Ldloc,list)||!Field(a[j+1],Code.Ldfld,"_items",true)||
                 !Number(a[j+2],0)||!Local(a[j+3],Code.Ldloc,cv)||
                 a[j+4].OpCode.Code!=Code.Call||a[j+4].Operand is not MethodReference ac||
                 ac.DeclaringType.FullName!="System.Array"||Scope(ac.DeclaringType)!=Scope(gt)||
-                ac.Name!="Clear"||ac.HasThis||ac.Parameters.Count!=3||
+                ac.Name!="Clear"||ac.HasThis||ac.HasGenericParameters||ac is GenericInstanceMethod||ac.Parameters.Count!=3||
                 ac.Parameters[0].ParameterType.FullName!="System.Array"||!Int(ac.Parameters[1].ParameterType)||
                 !Int(ac.Parameters[2].ParameterType)||ac.ReturnType.MetadataType!=MetadataType.Void||
-                Resolve(ac) is not {IsPublic:true,IsStatic:true}||
-                a[j+5].OpCode.Code!=Code.Leave||a[j+5].Operand!=exit)return false;
-            join=exit;leave=true;
-            foreach(var i in a.Skip(tail).Take(j+6-tail))region.Add(i);
+                Resolve(ac) is not {IsPublic:true,IsStatic:true})return false;
+            if(split)
+            {
+                if(a[j+5].OpCode.Code!=a[tail+4].OpCode.Code||a[j+5].Operand!=exit)return false;
+                join=exit!;
+                foreach(var instruction in a.Skip(tail).Take(j+6-tail))region.Add(instruction);
+            }
+            else
+            {
+                join=a[j+5];Instruction skip=(Instruction)a[tail+3].Operand;
+                if(skip!=join)
+                {
+                    if(!ix.TryGetValue(skip,out int bridge))return false;
+                    int endBridge=bridge;
+                    while(endBridge<a.Length&&endBridge-bridge<=4&&a[endBridge].OpCode.Code==Code.Nop)
+                        skippedBridge.Add(a[endBridge++]);
+                    if(endBridge>=a.Length||endBridge-bridge>4||a[endBridge].OpCode.Code!=Code.Br||a[endBridge].Operand!=join)return false;
+                    skippedBridge.Add(a[endBridge]);
+                }
+                foreach(var instruction in a.Skip(tail).Take(j+5-tail))region.Add(instruction);
+            }
         }
         // The count read stays in place. No external incoming edges into
         // the interior (including the version read after the Count snapshot).
-        var entry=refs?a[k-3]:a[k];
+        var entry=a[k];
         var allowed=region.ToHashSet();
-        if(refs)foreach(var i in a.Skip(k-3).Take(3))allowed.Add(i);
         if(region.Contains(join))return false;
         foreach(var i in a)
         {
-            if(i.OpCode.Code==Code.Ldloca&&(i.Operand==list||i.Operand==version||i.Operand==savedCount))return false;
+            if(i.OpCode.Code==Code.Ldloca&&(i.Operand==list||i.Operand==version||i.Operand==savedCount||i.Operand is VariableDefinition alias&&countAliases.Contains(alias)))return false;
             if(!region.Contains(i)&&i.Operand==version)return false;
             if(allowed.Contains(i))continue;
             if(i.Operand is Instruction t&&allowed.Contains(t)&&t!=entry)return false;
@@ -163,9 +186,9 @@ internal static class ListClearIlFolding
             bool Inside(Instruction i,Instruction? start,Instruction? end)=>start!=null&&ix[i]>=ix[start]&&(end==null||ix[i]<ix[end]);
             int S(Instruction i)=>(Inside(i,h.TryStart,h.TryEnd)?1:0)|(Inside(i,h.HandlerStart,h.HandlerEnd)?2:0)|(Inside(i,h.FilterStart,h.HandlerStart)?4:0);
             int scope=S(entry);
-            if((scope&4)!=0||allowed.Any(i=>S(i)!=scope)||!leave&&S(join)!=scope)return false;
+            if((scope&4)!=0||allowed.Any(i=>S(i)!=scope)||skippedBridge.Any(i=>S(i)!=scope)||!leave&&S(join)!=scope)return false;
         }
-        var preserve=scheduled==0?new HashSet<Instruction>():a.Skip(k+3).Take(3).ToHashSet();
+        var preserve=scheduled==0?new HashSet<Instruction>():a.Skip(k+3).Take(scheduled).ToHashSet();
         foreach(var i in region)if(!preserve.Contains(i)){i.OpCode=OpCodes.Nop;i.Operand=null;}
         if(scheduled!=0)
         {

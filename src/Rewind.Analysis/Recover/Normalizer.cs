@@ -1504,6 +1504,10 @@ public sealed partial class Normalizer(ProgramAnalysis program)
                 if (kind == ThrowKind.Overflow) NoteOverflow(term.In[0]);
                 if (kind == ThrowKind.NullReference)
                 {
+                    // An exception helper does not make an arbitrary condition an implicit null check.
+                    // In particular, an exact class test followed by NullReferenceException is the
+                    // original "as T" failure path. Retain its branch and type fact for later uses.
+                    if (NullGuardValue(term.In[0], side) == null) continue;
                     RestoreGuardedReceiver(p, other, term.In[0], side);
                     if (KeepOrphanStaticNullGuard(p, term.In[0], side)) continue;
                 }

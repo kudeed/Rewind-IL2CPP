@@ -639,6 +639,15 @@ public sealed partial class HirBuilder
             _ => HCompareOp.LeUn,
         };
         if (TypeTestCompare(n) is { } typeTest) return typeTest;
+        // A signed register comparison with zero observes only its highest bit. A complete small
+        // struct in that register can expose that bit through its exact, public signed top field.
+        // This is a view for this comparison only: the struct keeps its managed type everywhere else.
+        if (_m.Image.Arch == Rewind.Binary.CpuArch.Arm64 && n.Op == Op.CmpLtS && n.In.Length == 2 &&
+            n.In[0].Type is VT.I32 or VT.I64 && n.In[1].IsConstValue(0) &&
+            Value(n.In[0]) is HLocal { Variable.Type: TypeDefSig signType } signValue &&
+            signType.Definition is { IsValueType: true, IsEnum: false } &&
+            ScalarSignView.Compare(n.Op, n.In[0].Type, n.In[1], signValue, _p.Layouts.Of(signType), _m.Sigs) is { } signTest)
+            return new SVal(signTest);
         // Native OR followed by an exact zero test is a joint reference-null test.
         // Keep bitwise eager evaluation, and do not translate the OR itself as numeric
         // reference arithmetic. Pointer, truncated, masked and nonzero tests are excluded.
@@ -2231,6 +2240,7 @@ public sealed partial class HirBuilder
 
     private Sem LoadSem(Node n)
     {
+        if (MdArrayLoad(n) is { } multiArray) return multiArray;
         if (_spillLoads.TryGetValue(n, out int parked)) return new SFrame(parked);
         if (_refLoads.TryGetValue(n, out Node? reference)) return Eval(reference);
         // The catch object is Il2CppExceptionWrapper&: its first field is the managed exception. (Reading the
@@ -2393,6 +2403,8 @@ public sealed partial class HirBuilder
 
     private void EmitStore(Node n)
     {
+        // These exact header stores were proved with their payload, stack mark and Enum.ToString use.
+        if (_projectedEnumHeaders.Contains(n)) return;
         // The header of a value boxed in place (its class, and the "not a real object" mark) is not a store
         // the program makes.
         if (_fakeBoxes.Count != 0 && IsFrameAddress(n.In[0], out int boxOffset) &&

@@ -103,6 +103,8 @@ public enum HelperKind
     /// calls. Later versions read it out of the method's record in place (virtualMethodPointer).
     /// </summary>
     MethodVirtualCallPointer,
+    /// <summary>Complete rank-two eight-byte element getter; caller must prove reference element and canonical indices.</summary>
+    RectangularArrayGetAt,
 }
 
 public sealed record HelperInfo(HelperKind Kind, int IntArgs, bool NoReturn, bool ReturnsValue, string Name)
@@ -116,6 +118,8 @@ public sealed record HelperInfo(HelperKind Kind, int IntArgs, bool NoReturn, boo
     /// ("Invoke(&amp;result, slot, interfaceClass, obj, args...)").
     /// </summary>
     public bool BufferFirst { get; init; }
+    /// <summary>A proved ARM64 store shape; recovery requires an exact fresh object[] and 32-bit index.</summary>
+    public bool ArrayAccessFreshObjectStore { get; init; }
 }
 
 /// <summary>Maps function addresses to the runtime helpers they implement.</summary>

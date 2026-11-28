@@ -194,13 +194,14 @@ public sealed partial class HirBuilder
                     _fakeBoxes[at] = boxed;
                     _frameTypes[at + _header] = boxed;
                 }
-        if (classes == null || marks == null) return;
-        foreach (var (offset, type) in classes)
-        {
-            if (!marks.Contains(offset + _ptr)) continue;
-            _fakeBoxes[offset] = type;
-            _frameTypes[offset + _header] = type;
-        }
+        if (classes != null && marks != null)
+            foreach (var (offset, type) in classes)
+            {
+                if (!marks.Contains(offset + _ptr)) continue;
+                _fakeBoxes[offset] = type;
+                _frameTypes[offset + _header] = type;
+            }
+        FindProjectedEnumBoxes();
     }
 
     /// <summary>
@@ -2807,12 +2808,27 @@ public sealed partial class HirBuilder
                 if (a0 == null || result == null) break;
                 _sem[result] = new SUnboxed(a0);
                 return;
+            case HelperKind.RectangularArrayGetAt:
+            {
+                if (a0 == null || a1 == null || a2 == null || !MdCanonicalIndex(a1) || !MdCanonicalIndex(a2) ||
+                    !MdArrayApi() || Value(a0) is not { Type: ArraySig { Rank: 2 } arrayType } array ||
+                    arrayType.ElementType.ContainsGenericParameter || !IsReference(arrayType.ElementType)) break;
+                HExpr element = MdElementRead(array, arrayType, IntValue(a1), IntValue(a2), call.Addr);
+                FinishCall(call, element, ReturnKind.Integer, arrayType.ElementType, tail);
+                return;
+            }
             case HelperKind.ArraySetAt or HelperKind.ArrayGetAt or HelperKind.ArrayGetAddressAt:
             {
                 // An array's own accessors (GetAt, SetAt, GetAddressAt: the bounds check, then the element),
                 // which clang keeps as functions of their own: array[index].
                 if (a0 == null || a1 == null || Value(a0) is not { Type: SzArraySig arrayType } array) break;
                 TypeSig elementType = arrayType.ElementType;
+                // The native store omits a covariance check. Only an exact new object[] can
+                // accept every managed reference without introducing a new possible exception.
+                if (helper.ArrayAccessFreshObjectStore &&
+                    (elementType.Key != _object.Key ||
+                     !Arm64ArrayAccessShape.CanonicalIndex(a1) ||
+                     !Arm64ArrayAccessShape.FreshAllocation(a0, _p.Helpers.KindAt))) break;
                 HExpr index = IndexValue(a1, 0);
                 if (index is HConst { Value: long fixedIndex } && fixedIndex is >= 0 and <= int.MaxValue) index = new HConst((int)fixedIndex, _int);
                 var element = new HElement { Array = array, Index = index, Type = elementType };

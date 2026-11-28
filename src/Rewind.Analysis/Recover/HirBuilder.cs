@@ -1820,6 +1820,8 @@ public sealed partial class HirBuilder
             _nodeClock = ++_clock;
             switch (n.Op)
             {
+                case Op.Load when TryEmitMdArrayRead(n):
+                    break;
                 case Op.Store:
                     // A piece of a struct copy: the copy stands where its last piece is stored.
                     if (_pieceMembers.Contains(n))

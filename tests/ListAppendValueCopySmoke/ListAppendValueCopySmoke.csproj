@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/Rewind.Output/ListAppendIlFolding.SharedResize.cs" Link="ListAppendIlFolding.SharedResize.cs"/>
+    <Compile Include="../../src/Rewind.Output/ListAppendIlFolding.cs" Link="ListAppendIlFolding.cs"/>
+    <Compile Include="../../src/Rewind.Output/ListAppendIlFolding.ValueCopies.cs" Link="ListAppendIlFolding.ValueCopies.cs"/>
+    <PackageReference Include="Mono.Cecil" Version="0.11.6"/>
+  </ItemGroup>
+</Project>

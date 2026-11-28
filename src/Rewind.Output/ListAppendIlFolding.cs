@@ -9,7 +9,7 @@ namespace Rewind.Output;
 /// diamond when the earlier HIR folding could not express it. Never fold a
 /// partial private field access or an unproven capacity branch.
 /// </summary>
-internal static class ListAppendIlFolding
+internal static partial class ListAppendIlFolding
 {
     private static readonly Code[] Shape =
     [
@@ -118,10 +118,15 @@ internal static class ListAppendIlFolding
             call.HasGenericParameters || call is GenericInstanceMethod ||
             call.ReturnType.MetadataType != MetadataType.Void || call.Parameters.Any(p=>p.ParameterType.MetadataType!=MetadataType.Single)) return false;
         string type=call.DeclaringType.FullName;
-        int count=type is "UnityEngine.Vector2" or "System.Numerics.Vector2" ? 2 :
-            type is "UnityEngine.Vector3" or "System.Numerics.Vector3" ? 3 :
-            type is "UnityEngine.Vector4" or "System.Numerics.Vector4" ? 4 : 0;
-        if(count==0 || call.Parameters.Count!=count ||
+        int count=call.Parameters.Count;
+        bool known=type is "UnityEngine.Vector2" or "System.Numerics.Vector2" ? count==2 :
+            type=="UnityEngine.Vector3" ? count is 2 or 3 :
+            type=="UnityEngine.Vector4" ? count is 2 or 3 or 4 :
+            type=="System.Numerics.Vector3" ? count==3 :
+            type is "System.Numerics.Vector4" or "UnityEngine.Rect" && count==4;
+        // Original native Vector3/Vector4 short constructors only supply zero trailing components;
+        // Rect stores its four scalar arguments directly. No normalization, call or exceptional edge.
+        if(!known ||
             (type.StartsWith("UnityEngine.",StringComparison.Ordinal) ?
                 call.DeclaringType.Scope.Name is not ("UnityEngine.CoreModule" or "UnityEngine") :
                 call.DeclaringType.Scope.Name is not ("System.Private.CoreLib" or "System.Numerics.Vectors")))return false;
@@ -224,6 +229,7 @@ internal static class ListAppendIlFolding
         int count = 0;
         foreach (Instruction candidate in body.Instructions.Where(Candidate).ToArray())
             if (TryFold(body, candidate) || TryFold(body, candidate, extended: true) || TryPreserveBranches(body, candidate)) count++;
+        count += FoldSharedResize(body);
         if (count == 0)
             foreach (var (i, opcode, operand) in original) { i.OpCode = opcode; i.Operand = operand; }
         return count;
@@ -672,6 +678,8 @@ internal static class ListAppendIlFolding
            !Constant(a[fast+3],1)||a[fast+4].OpCode.Code!=Code.Add||!Field(a[fast+5],Code.Stfld,"_size")||
            !Local(a[fast+6],Code.Ldloc,array)||!Local(a[fast+7],Code.Ldloc,size))return false;
         int v=fast+8,store;
+        if(a[v].OpCode.Code==Code.Ldelema)
+            return TryFieldwiseAppend(body,a,ix,k,n,b,fast,f,gt,def,receiver,array,size);
         VariableDefinition? fastTemp=null,slowTemp=null,slowCopy=null;
         Instruction? fastValue=null;
         Instruction[]? constructedValue=null;

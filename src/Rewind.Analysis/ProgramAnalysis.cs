@@ -756,9 +756,9 @@ public sealed class ProgramAnalysis
                 Returns = helper.IsDouble ? CallReturn.Double : CallReturn.Float,
             };
         }
-        else if (helper != null && helper.Kind is not (HelperKind.InterfaceInvoker or HelperKind.VirtualInvoker
+        else if (helper != null && (helper.ArrayAccessFreshObjectStore || helper.Kind is not (HelperKind.InterfaceInvoker or HelperKind.VirtualInvoker
                 or HelperKind.GenericInterfaceInvoker or HelperKind.GenericVirtualInvoker or HelperKind.ConstrainedInvoker
-                or HelperKind.ArrayGetAt or HelperKind.ArraySetAt or HelperKind.ArrayGetAddressAt))
+                or HelperKind.ArrayGetAt or HelperKind.ArraySetAt or HelperKind.ArrayGetAddressAt)))
         {
             int n = helper.IntArgs;
             shape = new CallShape

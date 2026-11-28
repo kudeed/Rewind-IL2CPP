@@ -37,6 +37,10 @@ public static class HelperShapes
             }
             if (!NoArm64Exceptions && (AddArm64TypedExceptionStubs(model, context, helpers) + AddArm64ExceptionStubs(model, context, helpers)) is > 0 and var exceptions)
                 found.Add($"{exceptions} exception throwers");
+            if (!NoAccessors && AddArm64ArrayAccessors(model, context, helpers) is > 0 and var arrayStores)
+                found.Add($"{arrayStores} checked object-array stores");
+            if (AddArm64MultiArrayAccessors(model, context, helpers) is > 0 and var rectangular)
+                found.Add($"{rectangular} rank-two array getters");
             return found.Count == 0 ? null : "shapes:   found by their code: " + string.Join("; ", found);
         }
         if (!NoWidened && AddWidenedTargets(model, context, code, helpers) is > 0 and var widened)
@@ -185,6 +189,36 @@ public static class HelperShapes
                 added++;
             }
             if (before == added) break;
+        }
+        return added;
+    }
+
+    private static int AddArm64MultiArrayAccessors(Il2CppModel model, ModelCodeContext context, RuntimeHelpers helpers)
+    {
+        int added = 0;
+        foreach (ulong start in context.FunctionStarts)
+        {
+            if (context.IsManaged(start) || helpers.At(start) != null) continue;
+            HelperInfo? accessor = Arm64MultiArrayAccessShape.Match(Arm64Function(model, context, start), start,
+                target => helpers.At(target) is { Kind: HelperKind.ThrowIndexOutOfRange, NoReturn: true, ReturnsValue: false });
+            if (accessor == null) continue;
+            helpers.Add(start, accessor); added++;
+        }
+        return added;
+    }
+
+
+    private static int AddArm64ArrayAccessors(Il2CppModel model, ModelCodeContext context, RuntimeHelpers helpers)
+    {
+        int added = 0;
+        bool Throws(ulong at) => helpers.At(at) is
+            { Kind: HelperKind.ThrowIndexOutOfRange, NoReturn: true, ReturnsValue: false };
+        foreach (ulong start in context.FunctionStarts)
+        {
+            if (context.IsManaged(start) || helpers.At(start) != null) continue;
+            if (Arm64ArrayAccessShape.Match(Arm64Function(model, context, start), start, Throws) is not { } info) continue;
+            helpers.Add(start, info);
+            added++;
         }
         return added;
     }

@@ -714,7 +714,10 @@ public sealed partial class A64Lifter : IMachineLifter
             return p;
         }
         bool any = returns == CallReturn.Unknown;
-        int ints = shape?.IntResults ?? 1, floats = shape?.FloatResults ?? 1;
+        // A target not known until managed dispatch recovery may return an HFA in v0-v3.
+        // Keep those possible result lanes until the actual return ABI binds them; assuming
+        // one FP result here irreversibly turns the other members into Undef.
+        int ints = shape?.IntResults ?? 1, floats = any ? 4 : shape?.FloatResults ?? 1;
         SetVar(0, any || returns == CallReturn.Integer ? Proj(CallResult.IntReturn, VT.I64) : _b.Undef(VT.I64));
         SetVar(1, ints >= 2 && returns == CallReturn.Integer ? Proj(CallResult.IntReturn2, VT.I64) : _b.Undef(VT.I64));
         for (int r = 2; r <= 18; r++) SetVar(r, _b.Undef(VT.I64));
