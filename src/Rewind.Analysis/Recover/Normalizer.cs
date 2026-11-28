@@ -1504,6 +1504,15 @@ public sealed partial class Normalizer(ProgramAnalysis program)
                 if (ReferenceEquals(target, other) || Function.IsTryEntry(term.In[0])) continue;
                 ThrowKind kind = ClassifyThrowBlock(target, out Node? a, out Node? b);
                 if (kind == ThrowKind.None) continue;
+                // A type mismatch throwing NullReferenceException is still a program branch.
+                // Removing it as an ordinary null guard erases the successful subtype proof.
+                if (kind == ThrowKind.NullReference && IsNativeClassCheck(term.In[0],
+                    slot => program.Model.ResolveUsageSlot(slot) is { Kind: UsageKind.TypeInfo, Type: TypeDefSig { Definition.IsValueType: false } }))
+                {
+                    string note = $"native class check retained at 0x{term.Addr:X}; original NullReferenceException path preserved";
+                    if (!_result.ReceiverNotes.Contains(note)) _result.ReceiverNotes.Add(note);
+                    continue;
+                }
                 // A block that also throws on the other side is not a guard around normal flow.
                 if (ClassifyThrowBlock(other, out _, out _) != ThrowKind.None) continue;
 

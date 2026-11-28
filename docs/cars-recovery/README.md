@@ -66,3 +66,16 @@ The full 6,293-method comparison changed eight formerly rejected bodies; 6,285 b
 dotnet build tests/BoundedTablesAndStructTailsSmoke -c Release -nodeReuse:false -p:UseSharedCompilation=false
 dotnet tests/BoundedTablesAndStructTailsSmoke/bin/Release/net10.0/FsmConstructionSmoke.dll ORIGINAL_SO ORIGINAL_METADATA signatures FRESH_OUTPUT_DIRECTORY
 ```
+
+## Native type guards and paired array offsets
+
+The selected queue is now 23 rejected methods at native20, down from 26. DiagonalSlicedUIButtonImage.ModifyGeneratedMesh, SlingshotScreen.EnsureHeldItemDisplayPool, and UnderwaterFishThreats.Report now recover without gaps.
+
+Native exact-class checks preserve the original NullReferenceException branch. A concrete reference type becomes available only on a successful comparison edge with a single predecessor that dominates its use, and for the same object value. Paired loop counters are rewritten only after an address-scale recovery error and only for matching unit-step index inductions with stable seeds. The replacement preserves the original arithmetic modulo 2^64, including wraparound. Exception regions and unproven recurrences stay rejected.
+
+Targeted tests cover two accepted and seven rejected class guards, four accepted and six rejected loop forms, and 400 recurrence samples. Full comparison changes exactly three originally rejected bodies; 6,290 methods and all 802 previously clean selected declarations are unchanged. Original type, field and method contracts are unchanged. Scene wiring and the documented exception-helper boundary defect remain open.
+
+```sh
+dotnet build tests/ClassGuardsAndAffineLoopsSmoke -c Release -nodeReuse:false -p:UseSharedCompilation=false
+dotnet tests/ClassGuardsAndAffineLoopsSmoke/bin/Release/net10.0/FsmConstructionSmoke.dll ORIGINAL_SO ORIGINAL_METADATA signatures FRESH_OUTPUT_DIRECTORY
+```

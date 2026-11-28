@@ -978,6 +978,16 @@ public sealed class MethodPipeline
     private HMethod BuildCoreOf(LiftedMethod lifted)
     {
         (HirBuilder builder, HMethod result) = BuildRounds(lifted);
+        // Leave already representable methods alone. A paired induction is needed only
+        // after typed recovery has exposed an address or array-index mismatch.
+        int affineOffsets = result.Problems.Any(p => p.Contains("array index scale", StringComparison.Ordinal) ||
+            p.StartsWith("address computation:", StringComparison.Ordinal)) ? AffineLoopOffsets.Run(lifted.Function) : 0;
+        if (affineOffsets != 0)
+        {
+            lifted.Normalization.ReceiverNotes.Add($"paired loop offsets represented by exact modular affine identities: {affineOffsets}");
+            _normalizer.Cleanup(lifted.Function);
+            (builder, result) = BuildRounds(lifted);
+        }
         // Use the already typed call choices to prove array cursor recovery.
         // Rebuild from SSA only after a complete bounded shape was recognized.
         if(Environment.GetEnvironmentVariable("REWIND_NO_ARRAY_CURSOR_RECOVERY")==null&&

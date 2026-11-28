@@ -526,7 +526,7 @@ public sealed partial class HirBuilder
     /// where the native code doesn't. REWIND_NO_CAST_DOMINANCE: anywhere, as before.
     /// </summary>
     private TypeSig? CheckedClassHere(Node obj) =>
-        _castTypes.TryGetValue(obj, out List<TypeSig>? casts) && casts.Count == 1 && (NoCastDominance || CastHoldsHere(obj)) ? casts[0] : null;
+        _castTypes.TryGetValue(obj, out List<TypeSig>? casts) && casts.Count == 1 && (NoCastDominance || CastHoldsHere(obj)) ? casts[0] : ProvenReferenceClass(obj, _block);
 
     /// <summary>
     /// As CheckedClassHere, for the value a merge takes on the edge from block from to block to: the check holds at
