@@ -6,3 +6,4 @@ using System.Runtime.CompilerServices;
 [assembly: InternalsVisibleTo("ListAppendIlFoldingSmoke")]
 [assembly: InternalsVisibleTo("DoubleBitCastSmoke")]
 [assembly: InternalsVisibleTo("ListClearIlSmoke")]
+[assembly: InternalsVisibleTo("VirtualDelegateDupSmoke")]

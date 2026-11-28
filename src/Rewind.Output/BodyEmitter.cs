@@ -69,6 +69,9 @@ public sealed class BodyEmitter
                 _model.FindType("System.ValueType") is { } valueType &&
                 _doubleBitCast.Run(body,_emitter.Import(target.Module,valueType)) is int bitcasts && bitcasts>0)
                 h.Notes.Add($"restored {bitcasts} integer-to-double bit reinterpretation(s) with primitive explicit layout");
+            if (Environment.GetEnvironmentVariable("REWIND_NO_VIRTUAL_DELEGATE_DUP") == null &&
+                VirtualDelegateDup.Run(body) is int delegates && delegates>0)
+                h.Notes.Add($"canonical virtual delegate construction restored at {delegates} identical receiver load(s)");
             body.OptimizeMacros();
             target.Body = body;
             return null;
