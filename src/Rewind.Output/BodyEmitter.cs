@@ -581,9 +581,9 @@ public sealed class BodyEmitter
         private void ValueAs(HExpr e, TypeSig? target)
         {
             // "null" given to a T is T's nothing: null only where T is a class.
-            if (Own(target) != null && e is HConst { Value: null })
+            if (Own(target) is { } openTarget && e is HConst { Value: null })
             {
-                Default(target);
+                Default(openTarget);
                 return;
             }
             Value(e);
@@ -1076,9 +1076,10 @@ public sealed class BodyEmitter
             }
             // A method called on a T: on the T where it is, with its type for the runtime to find the method by
             // (right for a class and for a struct alike).
-            if (!m.IsStatic && m.Name != ".ctor" && Own(call.This?.Type) is { } receiver)
+            if (!m.IsStatic && m.Name != ".ctor" && call.This is { } actualReceiver &&
+                Own(actualReceiver.Type) is { } receiver)
             {
-                Address(call.This);
+                Address(actualReceiver);
                 Arguments(m, call.DeclaringType, call.Arguments);
                 _il.Emit(OpCodes.Constrained, Ref(receiver));
                 _il.Emit(OpCodes.Callvirt, target);
