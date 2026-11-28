@@ -22,6 +22,7 @@ public sealed class BodyEmitter
     private readonly AssemblyEmitter _emitter;
     private readonly Il2CppModel _model;
     private readonly Dictionary<ModuleDefinition, Markers> _markers = [];
+    private readonly DoubleBitCast _doubleBitCast = new();
 
     /// <summary>
     /// How to make an object without running a constructor (and Type.GetTypeFromHandle, which it needs): the
@@ -61,6 +62,10 @@ public sealed class BodyEmitter
             if (Environment.GetEnvironmentVariable("REWIND_NO_LIST_APPEND_IL_FOLDING") == null &&
                 ListAppendIlFolding.Run(body) is int folded && folded > 0)
                 h.Notes.Add($"public List.Add restored from {folded} complete emitted capacity diamond(s)");
+            if (Environment.GetEnvironmentVariable("REWIND_NO_DOUBLE_BITCAST_LAYOUT") == null &&
+                _model.FindType("System.ValueType") is { } valueType &&
+                _doubleBitCast.Run(body,_emitter.Import(target.Module,valueType)) is int bitcasts && bitcasts>0)
+                h.Notes.Add($"restored {bitcasts} integer-to-double bit reinterpretation(s) with primitive explicit layout");
             body.OptimizeMacros();
             target.Body = body;
             return null;

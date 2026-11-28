@@ -4,3 +4,4 @@ using System.Runtime.CompilerServices;
 [assembly: InternalsVisibleTo("ClosedArraySpecializationSmoke")]
 [assembly: InternalsVisibleTo("AggregateNumericOperandsSmoke")]
 [assembly: InternalsVisibleTo("ListAppendIlFoldingSmoke")]
+[assembly: InternalsVisibleTo("DoubleBitCastSmoke")]
