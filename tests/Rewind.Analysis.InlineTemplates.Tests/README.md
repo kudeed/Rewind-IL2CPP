@@ -43,3 +43,18 @@ PAP `CollectToWinChecker::get_CollectToWinController` (`060068BD`, `0x3F11000`),
 CFG recovery substitutes the proved load at the branch site and records its original address. It keeps the original function extent, SSA register state, existing block leaders and exception/call-site addresses. The rule matches only the complete eight-byte unsigned-offset self-register load/branch-back shape. It rejects known function entries, no-return targets, a different continuation, calls, writeback, literals, vector/partial loads, different register effects, extra instructions and invalid mappings. No game name, RVA or metadata token selects this rule.
 
 `BranchVeneers.cs` runs the actual decoder, CFG builder and ARM64 lifter on six real load words at relocated forward/backward islands. An independent instruction fixture executes the original branches; its loaded values, wraparound arithmetic, unrelated register, read address/count and failure behavior are compared with execution of the lifted SSA. The group also checks retained block leaders and strict negative boundaries. Bounded original-game before/after HIR receipts are stored under `/data/home/game/pap_autonomous/20261128-v9-rewind-veneers/`. This validates the recovery boundary, not the game or SDK runtime.
+## Bounded ARM64 exception wrappers
+
+PAP unwind records put the index wrapper at `0x38AA7D4..0x38AA7DC` and an unrelated
+overflow-message factory at `0x38AA7DC..0x38AA7E8`. Scanning both as one function inferred the wrong
+exception. The corrected matcher is bounded by the next known entry, exact unwind extent, executable
+section and mapped bytes. Only a proven no-return callee determines the exception type. The original
+PAP callee `0x38E887C` remains unidentified by the current helper library; rejecting the false overflow
+classification does not claim automatic recovery of that missing index helper.
+
+The ARM64 exception wrapper cases use the observed adjacent index-wrapper/overflow-factory layout,
+bounded by separate native unwind extents. They compare actual wrapper execution with the recognized
+exception type, check that a proven no-return call runs once and cannot reach subsequent instructions,
+and exercise the caller CFG. Unknown or returning callees, argument/effect changes, conditional or
+indirect transfers, and truncated/non-executable/function-boundary cases must remain unclassified.
+Nearby exception messages are deliberately insufficient to identify a helper.

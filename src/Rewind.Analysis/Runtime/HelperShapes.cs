@@ -76,46 +76,58 @@ public static class HelperShapes
     private static readonly bool NoArm64Exceptions = Environment.GetEnvironmentVariable("REWIND_NO_ARM64_EXCEPTIONS") != null;
 
     /// <summary>
-    /// An out-of-line throw: the runtime keeps a function per exception and message ("Arithmetic operation
-    /// resulted in an overflow."), which builds the exception and jumps to the raiser. The message says which.
+    /// A no-return wrapper may have only an LR/frame save before handing control to a known thrower.
+    /// Its callee proves the exception kind. A nearby message is not proof: it can belong to the next
+    /// function, or follow a call that never returns.
     /// </summary>
     private static int AddArm64ExceptionStubs(Il2CppModel model, ModelCodeContext context, RuntimeHelpers helpers)
     {
+        // Unwind extents can end before the next known entry. Build this once, not by scanning the full
+        // unwind table for every support function in a large image.
+        var ends = new Dictionary<ulong, ulong>();
+        foreach (FunctionRange range in model.Image.FunctionTable)
+            if (!range.Chained && range.End > range.Start)
+                ends[range.Start] = ends.TryGetValue(range.Start, out ulong previous)
+                    ? Math.Min(previous, range.End) : range.End;
+
         int added = 0;
         foreach (ulong start in context.FunctionStarts)
         {
             if (context.IsManaged(start) || helpers.At(start) != null) continue;
-            if (Arm64ExceptionStub(model, start) is not { } info) continue;
+            ulong end = context.NextFunctionStart(start);
+            if (ends.TryGetValue(start, out ulong unwindEnd)) end = end == 0 ? unwindEnd : Math.Min(end, unwindEnd);
+            if (Arm64ExceptionStub(model.Image, helpers, start, end) is not { } info) continue;
             helpers.Add(start, info);
             added++;
         }
         return added;
     }
 
-    private static HelperInfo? Arm64ExceptionStub(Il2CppModel model, ulong start)
+    private static HelperInfo? Arm64ExceptionStub(NativeImage image, RuntimeHelpers helpers, ulong start, ulong end)
     {
-        ReadOnlySpan<byte> bytes = model.Image.SpanToSectionEnd(start);
-        if (bytes.Length < 20) return null;
-        ulong page = 0, text = 0;
-        bool call = false, tail = false;
-        for (int i = 0; i < 8 && (i + 1) * 4 <= bytes.Length; i++)
+        if ((start & 3) != 0 || end <= start || image.SectionAt(start) is not { IsExecutable: true } section) return null;
+        ulong limit = Math.Min(end, Math.Min(section.End, image.MemoryEnd));
+        if (limit <= start || !image.TrySpan(start, (int)Math.Min(12UL, limit - start), out ReadOnlySpan<byte> bytes) ||
+            bytes.Length < 4) return null;
+
+        int offset = 0;
+        uint first = BitConverter.ToUInt32(bytes);
+        if (first == 0xF81F0FFE) offset = 4; // str x30, [sp, #-16]!
+        else if (first == 0xA9BF7BFD)        // stp x29, x30, [sp, #-16]!
         {
-            A64Instruction ins = A64Decoder.Decode(BitConverter.ToUInt32(bytes[(i * 4)..]), start + (ulong)(i * 4));
-            if (ins.Op == A64Op.Adrp) page = ins.Target;
-            else if (ins.Op == A64Op.AddImm && ins.Rn == ins.Rd && page != 0) text = page + (ulong)ins.Imm;
-            else if (ins.Op == A64Op.Bl) call = true;
-            else if (ins.Op == A64Op.B && i != 0) { tail = true; break; }
+            offset = 4;
+            if (bytes.Length >= 8 && BitConverter.ToUInt32(bytes[4..]) == 0x910003FD) offset = 8; // mov x29, sp
         }
-        if (!call || !tail || text == 0 || model.Image.TryCString(text, 200) is not { Length: > 10 } message) return null;
-        HelperKind kind;
-        if (message.Contains("overflow", StringComparison.OrdinalIgnoreCase)) kind = HelperKind.GetOverflowException;
-        else if (message.Contains("Object reference not set", StringComparison.Ordinal)) kind = HelperKind.ThrowNullReference;
-        else if (message.Contains("outside the bounds", StringComparison.Ordinal)) kind = HelperKind.ThrowIndexOutOfRange;
-        else if (message.Contains("divide by zero", StringComparison.OrdinalIgnoreCase)) kind = HelperKind.ThrowDivideByZero;
-        else if (message.Contains("cast is not valid", StringComparison.OrdinalIgnoreCase)) kind = HelperKind.ThrowInvalidCast;
-        else return null;
-        // (The overflow helper is otherwise the one that makes the exception; this one raises it.)
-        return new HelperInfo(kind, 0, true, false, "exception thrower (by its code)");
+        if (bytes.Length < offset + 4) return null;
+        A64Instruction transfer = A64Decoder.Decode(BitConverter.ToUInt32(bytes[offset..]), start + (ulong)offset);
+        if (transfer.Op is not (A64Op.B or A64Op.Bl) || transfer.Target >= start && transfer.Target < limit ||
+            helpers.At(transfer.Target) is not { NoReturn: true, ReturnsValue: false, IntArgs: 0, FloatArgs: 0 } info ||
+            info.Kind is not (HelperKind.ThrowNullReference or HelperKind.ThrowIndexOutOfRange or
+                HelperKind.ThrowDivideByZero or HelperKind.ThrowInvalidCast or HelperKind.GetOverflowException))
+            return null;
+        // Nothing after this transfer is reachable. In particular, do not inspect a following literal,
+        // call, return or neighboring function to guess what exception the callee throws.
+        return info with { Name = info.Name + " (no-return wrapper)" };
     }
 
     private enum Arm64StubKind { Branch, FlagBranch, CallBarrierReturn }
