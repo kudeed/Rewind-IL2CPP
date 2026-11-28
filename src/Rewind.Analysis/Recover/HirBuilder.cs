@@ -1855,6 +1855,11 @@ public sealed partial class HirBuilder
             }
         }
         else s = Compute(n);
+        Materialize(n, s, looked);
+    }
+
+    private void Materialize(Node n, Sem s, bool looked)
+    {
         switch (s)
         {
             case SVal v when v.Expr is not (HConst or HLocal or HArg):
@@ -1875,6 +1880,21 @@ public sealed partial class HirBuilder
                 Emit(new HAssign(new HLocal(lo) { Type = lo.Type }, p.Low), n.Addr);
                 Emit(new HAssign(new HLocal(hi) { Type = hi.Type }, p.High), n.Addr);
                 _sem[n] = new SPair(new HLocal(lo) { Type = lo.Type }, new HLocal(hi) { Type = hi.Type });
+                break;
+            }
+            case SParts parts when n.Op == Op.Load:
+            {
+                // A wide read can cover several fields and padding (for example an async token in the
+                // last word of an awaiter). These are values already read, not locations to read when a
+                // later store consumes the word. Keep every leaf before any intervening clear or call.
+                var held = new List<Part>(parts.Parts.Count);
+                foreach (Part part in parts.Parts)
+                {
+                    HVar t = Temp(part.Value.Type, n.Type);
+                    Emit(new HAssign(new HLocal(t) { Type = t.Type }, part.Value), n.Addr);
+                    held.Add(new Part(part.Offset, part.Size, new HLocal(t) { Type = t.Type }));
+                }
+                _sem[n] = new SParts(held, parts.Size);
                 break;
             }
             default:

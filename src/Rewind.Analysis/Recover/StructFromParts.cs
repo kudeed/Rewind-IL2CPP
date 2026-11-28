@@ -262,15 +262,16 @@ internal static class StructFromParts
             isObject = true;
         }
         TypeDef definition = type!.Definition!;
-        if (type is GenericInstSig || definition.GenericParameters.Length != 0) return false;
         if (!OnlyConstructors(first.Field) || !ReferenceEquals(first.Field.DeclaringType, definition)) return false;
 
         var values = new Dictionary<FieldDef, HExpr>();
+        var readAt = new Dictionary<FieldDef, int>();
         int end = i;
         while (end < block.Statements.Count && block.Statements[end] is HAssign { Target: HField { Object: { } owner } target, Value: var value } &&
                Equal(owner, place) && ReferenceEquals(target.Field.DeclaringType, definition) && !target.Field.IsStatic)
         {
             if (!values.TryAdd(target.Field, value)) return false;
+            readAt[target.Field] = end;
             end++;
         }
         var fields = definition.Fields.Where(f => !f.IsStatic).ToList();
@@ -280,11 +281,15 @@ internal static class StructFromParts
             if (!isObject && Mentions(v, place)) return false;
 
         // A copy of one struct, read field by field.
-        if (!isObject && CopyOf(values, fields, defs, type) is { } source)
+        if (!isObject && HirBuilder.IsPure(place) && CopyOf(values, readAt, fields, defs, type, block, i) is { } source)
         {
             Replace(block, i, end, new HAssign(place, source) { Address = block.Statements[end - 1].Address });
             return true;
         }
+
+        // An exact whole-value copy also works for a constructed generic type. Constructor recovery needs
+        // instantiated signatures and bodies; leave that separate limitation in place.
+        if (type is GenericInstSig || definition.GenericParameters.Length != 0) return false;
 
         foreach (MethodDef constructor in definition.Methods)
         {
@@ -329,24 +334,51 @@ internal static class StructFromParts
         return found;
     }
 
-    /// <summary>The struct every field is read from, when each is set to the same field (or property) of it.</summary>
-    private static HExpr? CopyOf(Dictionary<FieldDef, HExpr> values, List<FieldDef> fields, Definitions defs, TypeSig type)
+    /// <summary>
+    /// The struct every field was read from, only when reading it at the replacement still gives those values.
+    /// Meaning deliberately ignores where values were computed; a copy cannot: a saved field may predate a
+    /// clear of the source, a call through an alias, or a write to the saved local itself.
+    /// </summary>
+    private static HExpr? CopyOf(Dictionary<FieldDef, HExpr> values, Dictionary<FieldDef, int> readAt,
+        List<FieldDef> fields, Definitions defs, TypeSig type, HBlock block, int copyAt)
     {
         HExpr? source = null;
         foreach (FieldDef f in fields)
         {
-            object meaning = Meaning(values[f], defs);
-            HExpr? from = meaning switch
-            {
-                HField read when ReferenceEquals(read.Field, f) => read.Object,
-                HCall { This: { } on, Arguments.Length: 0, Method.Name: var name } when AccessorIndex.AutoPropertyName(f) is { } property && name == "get_" + property => on,
-                _ => null,
-            };
+            HExpr? meaning = CopyMeaning(values[f], defs, block, readAt[f], copyAt);
+            HExpr? from = meaning is HField read && ReferenceEquals(read.Field, f) ? read.Object : null;
             if (from == null || from.Type?.Key != type.Key) return null;
             if (source == null) source = from;
             else if (!Equal(source, from)) return null;
         }
-        return source != null && Stable(source) ? source : null;
+        return source != null && HirBuilder.IsPure(source) ? source : null;
+    }
+
+    private static HExpr? CopyMeaning(HExpr value, Definitions defs, HBlock block, int useAt, int copyAt, int depth = 0)
+    {
+        if (depth > 8) return null;
+        // A conversion that changes the value cannot disappear in a whole-struct assignment.
+        while (value is HConv conversion)
+        {
+            if (conversion.Type == null || conversion.Type.Key != conversion.Operand.Type?.Key || !HirBuilder.IsPure(conversion)) return null;
+            value = conversion.Operand;
+        }
+        if (value is HLocal { Variable: var local })
+        {
+            if (local.AddressTaken || !defs.Assigned.TryGetValue(local, out var assigned) || assigned.Count != 1) return null;
+            var definition = assigned[0];
+            // Same-block dominance only. A definition in a predecessor can belong to a different iteration
+            // or exception path; proving that case needs more than a global count of assignments.
+            if (!ReferenceEquals(definition.Block, block) || definition.Index >= useAt || definition.Index >= copyAt) return null;
+            if (!StructFolding.Movable(value, block.Statements, definition.Index, useAt - 1, null) ||
+                !StructFolding.Movable(definition.Value, block.Statements, definition.Index, copyAt - 1, null)) return null;
+            return CopyMeaning(definition.Value, defs, block, definition.Index, copyAt, depth + 1);
+        }
+        // Reads in later stores move to the first store; saved reads move forward from their definition.
+        // In either direction all intervening writes and calls must preserve the value. Calls/getters
+        // themselves are not accepted merely because their names look like properties.
+        return value is HField && StructFolding.Movable(value, block.Statements,
+            Math.Min(useAt, copyAt) - 1, Math.Max(useAt, copyAt) - 1, null) ? value : null;
     }
 
     private sealed record SetFields(Dictionary<FieldDef, object> Fields, bool BaseCall);
