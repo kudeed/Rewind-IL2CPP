@@ -44,6 +44,15 @@ internal static class BaseConstructorCalls
             candidates.Add((m, body, DoesNothing(m, pipeline, program, 0)));
         }
         List<HStmt> entry = method.Blocks[0].Statements;
+        // Keep the final ancestor call in the match: skipping it because its
+        // recovered body is empty can otherwise leave a second .ctor call behind.
+        foreach (var (candidate, body, _) in candidates)
+        {
+            if (!ScheduledBaseConstructorStores.TryGather(ctor, candidate, entry, body, pipeline.CoreBody,
+                    out List<int> gathered)) continue;
+            Replace(method, entry, gathered, Call(candidate, baseSig, owner, [], program, method));
+            return;
+        }
         // The statements of one that does something, pasted in: the longest that matches.
         foreach (var (candidate, body, nothing) in candidates.Where(c => !c.Nothing).OrderByDescending(c => c.Body.Count))
         {
@@ -61,7 +70,7 @@ internal static class BaseConstructorCalls
         }
         if (Trace) Console.Error.WriteLine($"[base-ctor] {ctor.FullName}: {baseType.FullName} not recovered");
         string problem = $"{Missing} ({baseType.Name})";
-        if (method.Problems.Count < 64) method.Problems.Add(problem);
+        method.Problems.Add(problem);
         method.SiteProblems.Add(problem);
         // (The constructor does what the original did, only IL does not accept it: the mark does not stop it.)
         entry.Insert(AfterInitializers(entry, owner), new HEval(new HOpaque("base_constructor") { Problem = problem, Remark = true }));

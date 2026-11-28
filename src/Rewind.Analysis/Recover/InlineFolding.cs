@@ -1965,12 +1965,12 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                             if (!trial.Expression(new HCompare(other, question.Left, question.Right) { Type = question.Type }, candidate)) continue;
                             turned = true;
                         }
-                        // Arguments that do work are worked out in the order of the parameters, after the object
-                        // the method is called on: that must be the order they stand in here.
+                        // Observable arguments keep their declaration order, after the receiver. Independent
+                        // scalar calculations may have been scheduled around them by the native compiler.
                         if (trial.Working)
                         {
                             bool ordered = Stable(trial.This) || ThisFirst(template);
-                            for (int k = 1; k < trial.Order.Count && ordered; k++) ordered = trial.Order[k - 1] < trial.Order[k];
+                            ordered &= InlineArgumentOrder.Preserves(trial.Order, trial.Arguments, method, site, start, u);
                             if (!ordered) continue;
                         }
                         // In the next statement, only through the temporary: the read must be the one it holds.
@@ -1990,13 +1990,13 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             }
             else if (n == 0) continue;
 
-            // Arguments that do work, found among the method's statements: they are worked out in the order of
-            // the parameters, after the object the method is called on, and where the call is written - which
-            // must be the first thing done there.
+            // Arguments that do work, found among the method's statements: preserve the order of observable
+            // computations, after the receiver, and put them where the call is written - which must be the
+            // first thing done there. Independent scalar calculations may cross those computations.
             if (n != 0 && unifier.Working)
             {
                 bool ordered = Stable(unifier.This) || ThisFirst(template);
-                for (int k = 1; k < unifier.Order.Count && ordered; k++) ordered = unifier.Order[k - 1] < unifier.Order[k];
+                ordered &= InlineArgumentOrder.Preserves(unifier.Order, unifier.Arguments, method, site, start, replaced != null ? user : start + n - 1);
                 if (ordered && replaced != null) ordered = WorkedOutFirst(site[user], replaced);
                 if (!ordered)
                 {
@@ -3112,6 +3112,12 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
     private bool TryFoldFlow(HMethod method, HBlock block, int at, Template template, Counts counts)
     {
         HMethod flow = template.Flow!;
+        if (_decided && template.ClassArguments.Length == 0 &&
+            InlineBooleanDispatch.TryFold(method, flow, block.Statements[at], out HCall? dispatch))
+        {
+            ((HEval)block.Statements[at]).Expression = dispatch!;
+            return true;
+        }
         // Where the method's first statement would be: in this block, or in one that leads here.
         Dictionary<HBlock, List<HBlock>> before = counts.Predecessors(method);
         var starts = new List<HBlock> { block };

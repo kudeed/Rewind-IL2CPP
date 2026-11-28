@@ -618,6 +618,9 @@ public sealed class MethodPipeline
         ConstructorFolding.MarkRawConstructors(result);
         InitializerOrder.Run(result);
         UnsetLocals.Run(result);
+        // UnsetLocals supplies the default initializer required by the complete-spill proof.
+        Arm64NullableParameterCopy.Run(result, _program);
+        FreshStructNullInitialization.Run(result, _program, this);
         FlagMarkers(result);
         return result;
     }
@@ -1018,11 +1021,11 @@ public sealed class MethodPipeline
         }
         // A bool's stack slot that still holds another number in the last build: read through the bool, that number
         // would come out as 0 or 1.
-        if (builder.BoolSlotConflicts.Count != 0 && result.Problems.Count < 64)
+        if (builder.BoolSlotConflicts.Count != 0)
             result.Problems.Add("a number kept in the stack slot of a bool");
         // A call taken to reach no more than one object that turns out to take more - or that is still not
         // known, so that nothing says what it takes: the lifetimes were told apart on a footing that does not hold.
-        if (assumed.Count != 0 && !AssumedReachHolds(assumed, fn, builder) && result.Problems.Count < 64)
+        if (assumed.Count != 0 && !AssumedReachHolds(assumed, fn, builder))
             result.Problems.Add("a stack object handed to a call may be larger than it was taken to be");
         FusionWeaving.Run(result);
         FinallyFolding.Run(result, _program);
@@ -1095,7 +1098,7 @@ public sealed class MethodPipeline
         }
         // Each build may learn types the next one starts from. Still learning after the last one means this
         // result was translated with types that have since changed: it cannot be trusted as it is.
-        if (builder.FrameTypesRefined && result.Problems.Count < 64) result.Problems.Add("types of stack objects did not settle");
+        if (builder.FrameTypesRefined) result.Problems.Add("types of stack objects did not settle");
         return (builder, result);
     }
 

@@ -7,17 +7,21 @@ using Rewind.Runtime;
 namespace Rewind.Analysis.Recover;
 
 // Put a public getter back when the compiler has inlined an otherwise
-// inaccessible reference-field dereference and a scalar property getter.
+// inaccessible reference-field dereference and a scalar or reference property getter.
 internal static class Arm64ChainedGetter
 {
     internal static bool Matches(uint[] code,int first,int second,ulong address,Func<ulong,bool> nullThrow)
+        => Matches(code,first,second,address,nullThrow,4);
+
+    internal static bool Matches(uint[] code,int first,int second,ulong address,Func<ulong,bool> nullThrow,int width)
     {
-        if(code.Length!=6||first<0||first%8!=0||first/8>4095||second<0||second%4!=0||second/4>4095)return false;
+        if(width is not (4 or 8)||code.Length!=6||first<0||first%8!=0||first/8>4095||second<0||second%width!=0||second/width>4095)return false;
+        uint load=width==8?0xf9400000u:0xb9400000u;
         uint reg=code[0]&31;
         if(reg==0||reg==31)return false;
         if(code[0]!=(0xf9400000u|((uint)(first/8)<<10)|reg)||
            code[1]!=(0xb4000000u|(3u<<5)|reg)||
-           code[2]!=(0xb9400000u|((uint)(second/4)<<10)|(reg<<5))||
+           code[2]!=(load|((uint)(second/width)<<10)|(reg<<5))||
            code[3]!=0xd65f03c0u||code[4]!=0xf81f0ffeu||(code[5]&0xfc000000u)!=0x94000000u)return false;
         long delta=((long)(int)(code[5]<<6)>>6)*4;
         return nullThrow(unchecked((ulong)((long)address+20+delta)));
@@ -39,8 +43,15 @@ internal static class Arm64ChainedGetter
            program.RangeOf(call.Method.Address) is not {} shortRange||shortRange.End-shortRange.Start!=8)
             return null;
         uint w=program.Model.Image.U32(shortRange.Start);
-        if((w&0xffc003ffu)!=0xb9400000u||program.Model.Image.U32(shortRange.Start+4)!=0xd65f03c0u)return null;
-        return Fold(field,(int)((w>>10)&4095)*4,call.Method.ReturnType,call.Type,current,program);
+        int width=ReadWidth(call.Method.ReturnType);
+        if(width==0||(w&0xffc003ffu)!=(width==8?0xf9400000u:0xb9400000u)||program.Model.Image.U32(shortRange.Start+4)!=0xd65f03c0u)return null;
+        return Fold(field,(int)((w>>10)&4095)*width,call.Method.ReturnType,call.Type,current,program);
+    }
+
+    private static int ReadWidth(TypeSig ret)
+    {
+        if((ret.Definition?.EnumUnderlyingType??ret) is PrimitiveSig {Element:Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4})return 4;
+        return ret is TypeDefSig {Definition:{IsValueType:false,IsGenericDefinition:false}}?8:0;
     }
 
     private static HCall? Fold(HField field,int offset,TypeSig ret,TypeSig? result,MethodDef current,ProgramAnalysis program)
@@ -52,7 +63,8 @@ internal static class Arm64ChainedGetter
            (receiver.Type??(receiver as HLocal)?.Variable.Type) is not TypeDefSig outer||
            !ReferenceEquals(outer.Definition,field.Field.DeclaringType)||outer.Definition.IsValueType||outer.Definition.IsGenericDefinition)
            return null;
-        if((ret.Definition?.EnumUnderlyingType??ret) is not PrimitiveSig {Element:Il2CppTypeEnum.I4 or Il2CppTypeEnum.U4})return null;
+        int width=ReadWidth(ret);
+        if(width==0)return null;
         if(inner.Definition.Fields.Count(f=>!f.IsStatic&&f.Offset==offset&&f.Type.Key==ret.Key)!=1)return null;
         var image=program.Model.Image;
         var matches=outer.Definition.Properties.Select(p=>p.Getter).OfType<MethodDef>().Where(m=>
@@ -60,7 +72,7 @@ internal static class Arm64ChainedGetter
             (m.Flags&MethodDef.AccessMask)==6&&m.ReturnType.Key==ret.Key&&
             program.RangeOf(m.Address) is {} r&&r.End-r.Start==24&&
             Matches(Enumerable.Range(0,6).Select(i=>image.U32(r.Start+(ulong)i*4)).ToArray(),
-                field.Field.Offset,offset,r.Start,a=>program.Helpers.KindAt(a)==HelperKind.ThrowNullReference)).Distinct().ToArray();
+                field.Field.Offset,offset,r.Start,a=>program.Helpers.KindAt(a)==HelperKind.ThrowNullReference,width)).Distinct().ToArray();
         if(matches.Length!=1)return null;
         return new HCall{Method=matches[0],This=receiver,Arguments=[],Type=result??ret};
     }

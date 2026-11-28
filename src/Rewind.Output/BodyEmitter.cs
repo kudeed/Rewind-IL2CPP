@@ -72,6 +72,8 @@ public sealed class BodyEmitter
             if (Environment.GetEnvironmentVariable("REWIND_NO_VIRTUAL_DELEGATE_DUP") == null &&
                 VirtualDelegateDup.Run(body) is int delegates && delegates>0)
                 h.Notes.Add($"canonical virtual delegate construction restored at {delegates} identical receiver load(s)");
+            if (ReadOnlyFieldReadIlFolding.Run(body) is int readonlyReads && readonlyReads > 0)
+                h.Notes.Add($"restored {readonlyReads} readonly struct field value read(s)");
             body.OptimizeMacros();
             target.Body = body;
             return null;
@@ -498,7 +500,13 @@ public sealed class BodyEmitter
                     Value(el.Array);
                     Index(el.Index);
                     ValueAs(value, el.Type);
-                    _il.Emit(OpCodes.Stelem_Any, Ref(el.Type));
+                    // Boolean arrays use the CLI byte storage opcodes. The
+                    // evaluation stack still carries int32 values for bool.
+                    if (el.Type is PrimitiveSig { Element: Il2CppTypeEnum.Boolean } &&
+                        el.Array.Type is SzArraySig { ElementType: PrimitiveSig { Element: Il2CppTypeEnum.Boolean } })
+                        _il.Emit(OpCodes.Stelem_I1);
+                    else
+                        _il.Emit(OpCodes.Stelem_Any, Ref(el.Type));
                     return;
                 case HDeref d:
                     Value(d.Pointer);
@@ -827,7 +835,13 @@ public sealed class BodyEmitter
                 case HElement el:
                     Value(el.Array);
                     Index(el.Index);
-                    _il.Emit(OpCodes.Ldelem_Any, Ref(el.Type));
+                    // Boolean arrays use the CLI byte storage opcodes. The
+                    // evaluation stack still carries int32 values for bool.
+                    if (el.Type is PrimitiveSig { Element: Il2CppTypeEnum.Boolean } &&
+                        el.Array.Type is SzArraySig { ElementType: PrimitiveSig { Element: Il2CppTypeEnum.Boolean } })
+                        _il.Emit(OpCodes.Ldelem_U1);
+                    else
+                        _il.Emit(OpCodes.Ldelem_Any, Ref(el.Type));
                     return;
                 case HArrayLength len:
                     Value(len.Array);
@@ -1026,13 +1040,27 @@ public sealed class BodyEmitter
             // ("x as long" is an object or null, not a number of 64 bits: nothing to widen the other side to.)
             bool tested = c.Left is HTypeExpr { Op: HTypeOp.IsInst } || c.Right is HTypeExpr { Op: HTypeOp.IsInst };
             bool wide = !isFloat && !tested && (StackBits(c.Left) == 64 || StackBits(c.Right) == 64);
-            Value(c.Left);
-            if (wide && StackBits(c.Left) == 32 && c.Left.Type is PrimitiveSig) _il.Emit(IsUnsigned(c.Left.Type) ? OpCodes.Conv_U8 : OpCodes.Conv_I8);
-            // A T is compared (with null, with another reference) as the object it is when boxed.
-            if (Own(c.Left.Type) is { } openLeft) _il.Emit(OpCodes.Box, Ref(openLeft));
-            Value(c.Right);
-            if (wide && StackBits(c.Right) == 32 && c.Right.Type is PrimitiveSig) _il.Emit(IsUnsigned(c.Right.Type) ? OpCodes.Conv_U8 : OpCodes.Conv_I8);
-            if (Own(c.Right.Type) is { } openRight) _il.Emit(OpCodes.Box, Ref(openRight));
+            void Operand(HExpr value, HExpr other)
+            {
+                // A type test compared with null asks whether isinst returned an object. Do not unbox
+                // that object as T first: when T is a value type, a failed test must be false rather
+                // than throw while unboxing null. The reference also needs no box afterwards.
+                if (c.Op is HCompareOp.Eq or HCompareOp.Ne && other is HConst { Value: null } &&
+                    value is HTypeExpr { Op: HTypeOp.IsInst } test)
+                {
+                    TypeOperation(test, preserveIsInstObject: true);
+                    return;
+                }
+                Value(value);
+                if (wide && StackBits(value) == 32 && value.Type is PrimitiveSig)
+                    _il.Emit(IsUnsigned(value.Type) ? OpCodes.Conv_U8 : OpCodes.Conv_I8);
+                // A T is compared as its boxed object. A literal null already pushes an object
+                // reference, even when recovery annotated it as T; boxing that null is invalid IL.
+                if (value is not HConst { Value: null } && Own(value.Type) is { } open)
+                    _il.Emit(OpCodes.Box, Ref(open));
+            }
+            Operand(c.Left, c.Right);
+            Operand(c.Right, c.Left);
 
             void Not()
             {
@@ -1119,7 +1147,7 @@ public sealed class BodyEmitter
             _il.Emit(direct ? OpCodes.Call : OpCodes.Callvirt, target);
         }
 
-        private void TypeOperation(HTypeExpr t)
+        private void TypeOperation(HTypeExpr t, bool preserveIsInstObject = false)
         {
             TypeReference type = Ref(t.Target);
             switch (t.Op)
@@ -1137,7 +1165,7 @@ public sealed class BodyEmitter
                     if (Own(t.Operand!.Type) is { } tested) _il.Emit(OpCodes.Box, Ref(tested));
                     _il.Emit(OpCodes.Isinst, type);
                     // "x as T": the object, or null, as a T.
-                    if (Own(t.Target) != null) _il.Emit(OpCodes.Unbox_Any, type);
+                    if (!preserveIsInstObject && Own(t.Target) != null) _il.Emit(OpCodes.Unbox_Any, type);
                     return;
                 case HTypeOp.CastClass:
                     Value(t.Operand!);

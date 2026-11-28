@@ -867,7 +867,7 @@ public sealed partial class HirBuilder
             held.Add(text);
             return;
         }
-        if (_h.Problems.Count < 64) _h.Problems.Add(text);
+        _h.Problems.Add(text); // Complete evidence: presentation may shorten; collection must not.
         // Debugging aid: where a problem of this kind is raised from.
         if (ProblemTrace != null && text.Contains(ProblemTrace, StringComparison.Ordinal))
         {
@@ -901,6 +901,11 @@ public sealed partial class HirBuilder
             for (int i = 0; i < b.Nodes.Count; i++) _position[b.Nodes[i]] = i;
         }
 
+        // Cast facts can read a type from this method's runtime generic context. Bind the ABI parameters
+        // before evaluating them: otherwise those reads memoize an undefined MethodInfo and stay undefined
+        // after its parameter is bound, even when later reads of the same context are known.
+        BindParameters();
+
         // A check in a block the CFG no longer reaches (or no longer has) was on a path that is gone: no fact at all,
         // neither a cast type nor a place.
         var reach = new Cfg(_fn);
@@ -912,7 +917,6 @@ public sealed partial class HirBuilder
             AddCastPlace(cast.Object, cast.At, cast.From, cast.Over);
         }
 
-        BindParameters();
         FindFakeBoxes();
         InferFrameTypes();
         PlanRawCells();

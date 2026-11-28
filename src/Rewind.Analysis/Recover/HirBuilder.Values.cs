@@ -637,6 +637,26 @@ public sealed partial class HirBuilder
             _ => HCompareOp.LeUn,
         };
         if (TypeTestCompare(n) is { } typeTest) return typeTest;
+        // Native OR followed by an exact zero test is a joint reference-null test.
+        // Keep bitwise eager evaluation, and do not translate the OR itself as numeric
+        // reference arithmetic. Pointer, truncated, masked and nonzero tests are excluded.
+        if (n.Op is Op.CmpEq or Op.CmpNe && n.In.Length == 2)
+        {
+            Node joint = n.In[0], zero = n.In[1];
+            if (joint.IsConstValue(0)) (joint, zero) = (zero, joint);
+            if (zero.IsConstValue(0) && zero.Type == VT.I64 &&
+                joint.Op == Op.Or && joint.Type == VT.I64 && joint.In.Length == 2 &&
+                joint.In[0].Type == VT.I64 && joint.In[1].Type == VT.I64 &&
+                Value(joint.In[0]) is { } first && Value(joint.In[1]) is { } second &&
+                IsReference(first.Type) && IsReference(second.Type) &&
+                (first.Type is not GenericParamSig ga || (ga.Parameter.Flags & 4) != 0) &&
+                (second.Type is not GenericParamSig gb || (gb.Parameter.Flags & 4) != 0))
+            {
+                var a = new HCompare(op, first, new HConst(null, _object)) { Type = _bool };
+                var b = new HCompare(op, second, new HConst(null, _object)) { Type = _bool };
+                return new SVal(new HBinary(n.Op == Op.CmpEq ? HBinaryOp.And : HBinaryOp.Or, a, b) { Type = _bool });
+            }
+        }
         // "x as T" of a struct T against zero, before the operands become numbers: taken as a number, a T that is
         // one number became that number - its field read out of the box, which is null where x is no T.
         if (n.Op is Op.CmpEq or Op.CmpNe && !NoBoxedTests)

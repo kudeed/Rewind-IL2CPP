@@ -229,7 +229,8 @@ public static class AccessorFolding
         // The storage of an automatic property has no name in source. Outside the accessors, every use of it was
         // a use of the property - in the class itself too. Only a constructor of the class writes it directly:
         // an initializer, or the assignment of a property without a setter.
-        bool Nameable(FieldDef field) => !AccessorIndex.IsBackingField(field) && IsAccessible(field, current);
+        bool Nameable(HField field) => !AccessorIndex.IsBackingField(field.Field) && IsAccessible(field.Field, current) &&
+            ProtectedFieldReceiver.Allows(field.Field, current, field.Object);
         bool OwnConstructor(FieldDef field) => current.IsConstructor && ReferenceEquals(current.DeclaringType, field.DeclaringType);
 
         // The storage of a base class's property, used on "this" in a class that has its own version of the
@@ -316,7 +317,7 @@ public static class AccessorFolding
                         return chain;
                     }
                     if (f.Object != null) f.Object = Read(f.Object);
-                    if (Nameable(f.Field)) return f;
+                    if (Nameable(f)) return f;
                     if (Getter(f) is { } get) return get;
                     if (!IsAccessible(f.Field, current)) unfolded.Add(f.Field);
                     return f;
@@ -379,7 +380,7 @@ public static class AccessorFolding
         bool PropertyParts(HBlock block, int i)
         {
             if (AccessorIndex.NoPropertyParts || block.Statements[i] is not HAssign { Target: HField { Object: HField { Object: { } owner } inner } } ||
-                Nameable(inner.Field) || inner.Type is not { IsValueType: true } partsType || owner is not (HLocal or HArg or HField) ||
+                Nameable(inner) || inner.Type is not { IsValueType: true } partsType || owner is not (HLocal or HArg or HField) ||
                 index.GetterOf(inner.Field) is not { } getter || index.SetterOf(inner.Field) is not { } setter ||
                 ReferenceEquals(getter, current) || ReferenceEquals(setter, current)) return false;
             int end = i;
@@ -428,7 +429,7 @@ public static class AccessorFolding
                         if (a.Target is HField f)
                         {
                             if (f.Object != null) f.Object = Owner(f.Object);
-                            if (Nameable(f.Field) || (AccessorIndex.IsBackingField(f.Field) && OwnConstructor(f.Field))) break;
+                            if (Nameable(f) || (AccessorIndex.IsBackingField(f.Field) && OwnConstructor(f.Field))) break;
                             if (index.SetterOf(f.Field) is { } setter && !ReferenceEquals(setter, current))
                             {
                                 var call = new HCall { Method = setter, DeclaringType = f.DeclaringType is GenericInstSig ? f.DeclaringType : null, This = f.Object, Arguments = [a.Value], Virtual = setter.IsVirtual && !ViaBase(setter, f.Object), Type = setter.ReturnType };

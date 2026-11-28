@@ -150,7 +150,7 @@ internal static partial class ConstructorFolding
                     !RunsConstructorOn(method, created))
                     continue;
                 string invalid = $"the constructor of {allocation.Target.ShortName} was not put back: a constructor runs on the object allocated raw";
-                if (method.Problems.Count < 64) method.Problems.Add(invalid);
+                method.Problems.Add(invalid);
                 method.SiteProblems.Add(invalid);
                 block.Statements.Insert(i, new HEval(new HOpaque("raw_constructor") { Problem = invalid, Remark = true }) { Address = block.Statements[i].Address });
             }
@@ -275,7 +275,7 @@ internal static partial class ConstructorFolding
     private static bool TryFoldScheduledReads(HMethod method, HBlock block, int at, HLocal target, TypeSig type, ProgramAnalysis program, MethodPipeline pipeline)
     {
         if (Environment.GetEnvironmentVariable("REWIND_NO_SCHEDULED_CTOR_READS") != null ||
-            method.Method.Name != ".ctor" || method.Method.IsStatic || method.Method.DeclaringType.IsValueType ||
+            method.Method.IsStatic || method.Method.DeclaringType.IsValueType ||
             type is not TypeDefSig { Definition: { IsValueType: false } definition } ||
             definition.GenericParameters.Length != 0) return false;
         var site = block.Statements;
@@ -286,7 +286,10 @@ internal static partial class ConstructorFolding
                 continue;
             var template = body.Blocks[0].Statements;
             if (!ScheduledConstructorReads.TryGather(method.Method, site, at, created, template.Count - 1,
-                    out List<int> picked)) continue;
+                    out List<int> picked) &&
+                !(program.Model.FindType("System.Object") is { } objectType &&
+                  ScheduledConstructorReads.TryGatherGetters(method.Method, site, at, created, template.Count - 1,
+                      objectType, pipeline.CoreBody, out picked))) continue;
             var gathered = picked.Select(i => site[i]).ToList();
             var unifier = new Unifier(created, ctor.Parameters.Length) { Constructor = ctor, Quiet = c => QuietConstructor(c, pipeline) };
             bool match = true;
@@ -306,7 +309,7 @@ internal static partial class ConstructorFolding
             for (int k = picked.Count - 1; k >= 0; k--) site.RemoveAt(picked[k]);
             site.Insert(first, creation);
             site.RemoveAt(at);
-            method.Notes.Add($"constructor scheduled reads: {ctor.FullName}, {delayed.Length} independent caller field read(s)");
+            method.Notes.Add($"constructor scheduled reads: {ctor.FullName}, {delayed.Length} independent caller read(s)");
             return true;
         }
         return false;

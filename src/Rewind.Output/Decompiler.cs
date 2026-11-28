@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection.Metadata;
 using System.Text;
+using System.Text.Json;
 using ICSharpCode.Decompiler;
 using ICSharpCode.Decompiler.CSharp;
 using ICSharpCode.Decompiler.CSharp.OutputVisitor;
@@ -56,6 +57,8 @@ public sealed class DecompileResult
     public int Types, TypesWithErrors;
     public Dictionary<string, int> EmitFailures = [];
     public List<string> AssembliesWritten = [];
+    /// <summary>All assembly emission warnings, in emission order; never truncated.</summary>
+    public List<string> AssemblyWarnings = [];
 }
 
 /// <summary>Runs the whole pipeline: recover method bodies, rebuild the assemblies with them, write C# source.</summary>
@@ -188,10 +191,18 @@ public static partial class Decompiler
         sw.Restart();
         string assemblyDirectory = Path.Combine(options.OutputDirectory, "assemblies");
         result.AssembliesWritten = emitter.Write(assemblyDirectory);
-        foreach (string warning in emitter.Warnings.Take(20)) options.Log("warning: " + warning);
+        result.AssemblyWarnings.AddRange(emitter.Warnings);
+        foreach (string warning in result.AssemblyWarnings) options.Log("warning: " + warning);
         options.Log($"wrote {result.AssembliesWritten.Count} assemblies to {assemblyDirectory} ({sw.ElapsedMilliseconds} ms)");
 
         Directory.CreateDirectory(options.OutputDirectory);
+        File.WriteAllText(Path.Combine(options.OutputDirectory, "recovery-warnings.json"), JsonSerializer.Serialize(new
+        {
+            schema_version = 1,
+            source = "AssemblyEmitter",
+            warning_count = result.AssemblyWarnings.Count,
+            warnings = result.AssemblyWarnings,
+        }, new JsonSerializerOptions { WriteIndented = true }) + "\n");
         File.WriteAllText(Path.Combine(options.OutputDirectory, "recovery-report.tsv"), report.ToString());
         evidence.Write(options.OutputDirectory);
 
