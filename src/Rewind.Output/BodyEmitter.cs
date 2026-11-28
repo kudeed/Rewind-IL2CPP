@@ -876,6 +876,14 @@ public sealed class BodyEmitter
                     });
                     return;
                 case HCall call:
+                    if (Environment.GetEnvironmentVariable("REWIND_NO_PACKED_FLOAT_LANE") == null &&
+                        PackedFloatLane.Resolve(call, _model.Image.Arch == Rewind.Binary.CpuArch.Arm64 &&
+                            _model.Image.Format == Rewind.Binary.ImageFormat.Elf, 2*_model.Image.PointerSize) is { } lane)
+                    {
+                        Value(lane);
+                        _h.Notes.Add("restored explicit packed float lane using exact sequential field layout");
+                        return;
+                    }
                     Call(call);
                     return;
                 case HNewObject n:
