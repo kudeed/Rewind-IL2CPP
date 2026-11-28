@@ -257,6 +257,7 @@ public sealed partial class HirBuilder
     private void FinishRegisterStruct(Node call, HExpr expr, ReturnKind kind, TypeSig returnType)
     {
         Dictionary<int, Node> projs = Projections(call);
+        if (kind == ReturnKind.StructInRegisterPair) RegisterResultStorage(projs, returnType);
         int[] wanted = kind == ReturnKind.StructInRegisterPair ? [CallResult.IntReturn, CallResult.IntReturn2] : [.. FloatResultLane0, .. FloatResultLane1];
         if (!wanted.Any(w => projs.TryGetValue(w, out Node? p) && IsUsed(p)))
         {
@@ -291,5 +292,77 @@ public sealed partial class HirBuilder
             }
             else if (projs.TryGetValue(FloatResultLane0[k], out Node? lane)) _sem[lane] = new SVal(member.Value);
         }
+    }
+
+    /// <summary>
+    /// A pair returned in x0/x1 and stored by one STP is a complete value of the call's exact return type.
+    /// If those bytes were previously a different stack struct, ask the existing reaching-definition pass
+    /// to separate their lifetimes. Scalar-compatible prefixes do not prove the two structs are the same.
+    /// </summary>
+    private static readonly string? ReturnStorageTrace = Environment.GetEnvironmentVariable("REWIND_RETURN_STORAGE_TRACE");
+
+    private void RegisterResultStorage(Dictionary<int, Node> projs, TypeSig type)
+    {
+        bool tracing = ReturnStorageTrace != null && _method.FullName.Contains(ReturnStorageTrace, StringComparison.Ordinal);
+        if (tracing)
+            foreach (var (which, node) in projs)
+                if (which is CallResult.IntReturn or CallResult.IntReturn2)
+                    Console.Error.WriteLine($"[return-storage] {type.ShortName} %{node.Id}: {string.Join("; ", _uses.GetValueOrDefault(node, []).Select(n => Function.Describe(n)))}");
+        if (!IsStructType(type) || type.ContainsGenericParameter || !Nameable(type) || type.Definition!.IsByRefLike ||
+            !projs.TryGetValue(CallResult.IntReturn, out Node? low) || !projs.TryGetValue(CallResult.IntReturn2, out Node? high) ||
+            !_uses.TryGetValue(low, out List<Node>? lowUsers) || !_uses.TryGetValue(high, out List<Node>? highUsers)) return;
+        TypeLayout layout = _p.Layouts.Of(type);
+        if (!layout.Known || layout.Size is <= 8 or > 16 || layout.Fields.Length == 0 ||
+            layout.Fields.Length != type.Definition.Fields.Count(f => !f.IsStatic)) return;
+        int end = 0;
+        TypeSig[] arguments = type is GenericInstSig generic ? generic.Arguments : [];
+        foreach (FieldSlot field in layout.Fields.OrderBy(f => f.Offset))
+        {
+            if (field.Offset < end || field.Size <= 0 || field.Offset + field.Size > layout.Size ||
+                field.Field.IsStatic || !ReferenceEquals(field.Field.DeclaringType, type.Definition) ||
+                field.Type is OpaqueSig or ByRefSig || field.Type.ContainsGenericParameter ||
+                _m.Sigs.Substitute(field.Field.Type, arguments, []).Key != field.Type.Key ||
+                _p.Layouts.SizeOf(field.Type) is not { Known: true } size || size.Size != field.Size) return;
+            end = field.Offset + field.Size;
+        }
+        // Only a complete, unchanged two-register STP copy proves a new struct lifetime here.
+        // Partial stores or normalized bit reconstructions need a separate proof and stay unchanged.
+        foreach (Node first in lowUsers)
+        {
+            if (first.Dead || first.Op != Op.Store || !ReferenceEquals(first.In[1], low) || first.Block == null ||
+                first.Addr == 0 || !IsFrameAddress(first.In[0], out int start)) continue;
+            bool pair = highUsers.Any(second => !second.Dead && second.Op == Op.Store &&
+                ReferenceEquals(second.In[1], high) && ReferenceEquals(second.Block, first.Block) &&
+                second.Addr == first.Addr && IsFrameAddress(second.In[0], out int at) && at == start + 8);
+            if (!pair) continue;
+            if (tracing) Console.Error.WriteLine($"[return-storage] {type.ShortName} complete at {start} from 0x{first.Addr:X}");
+            bool covered = false;
+            foreach (var (at, held) in _frameTypes)
+            {
+                var size = _p.Layouts.SizeOf(held);
+                if (!size.Known || at >= start + layout.Size || start >= at + size.Size) continue;
+                covered = true;
+                // Taking the address of a struct's field is an ordinary view, including a field at offset 0.
+                if (!ExactFrameView(held, start - at, type))
+                {
+                    FrameConflicts.Add(at);
+                    // As with a struct handed where another struct is expected, stack values captured
+                    // for arguments the real ABI never takes cannot join these lifetimes. The existing
+                    // splitter still requires every ignored load use to be such an untaken argument.
+                    ScalarSlotConflicts.Add(at);
+                }
+            }
+            if (!covered) VoteCopyType(start, type);
+        }
+    }
+
+    private bool ExactFrameView(TypeSig held, int offset, TypeSig wanted, int depth = 0)
+    {
+        if (offset == 0 && held.Key == wanted.Key) return true;
+        if (depth >= 8 || offset < 0 || !IsStructType(held) || Open(held)) return false;
+        TypeLayout layout = _p.Layouts.Of(held);
+        if (!layout.Known) return false;
+        FieldSlot[] containing = layout.Fields.Where(f => f.Offset <= offset && offset < f.Offset + f.Size).ToArray();
+        return containing.Length == 1 && ExactFrameView(containing[0].Type, offset - containing[0].Offset, wanted, depth + 1);
     }
 }

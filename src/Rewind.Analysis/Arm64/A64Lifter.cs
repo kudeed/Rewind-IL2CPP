@@ -716,7 +716,10 @@ public sealed partial class A64Lifter : IMachineLifter
         bool any = returns == CallReturn.Unknown;
         int ints = shape?.IntResults ?? 1, floats = shape?.FloatResults ?? 1;
         SetVar(0, any || returns == CallReturn.Integer ? Proj(CallResult.IntReturn, VT.I64) : _b.Undef(VT.I64));
-        SetVar(1, ints >= 2 && returns == CallReturn.Integer ? Proj(CallResult.IntReturn2, VT.I64) : _b.Undef(VT.I64));
+        // An indirect call's signature is resolved later. Its result may be a 9-16 byte struct in x0/x1:
+        // keep both possible result projections until that signature says which ones have meaning.
+        // This is a new value from the call, never the caller's old (now clobbered) x1.
+        SetVar(1, any || ints >= 2 && returns == CallReturn.Integer ? Proj(CallResult.IntReturn2, VT.I64) : _b.Undef(VT.I64));
         for (int r = 2; r <= 18; r++) SetVar(r, _b.Undef(VT.I64));
         SetVar(30, _b.Undef(VT.I64));
         bool floating = any || returns is CallReturn.Float or CallReturn.Double;

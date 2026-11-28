@@ -167,6 +167,8 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         public HExpr? Result;
         /// <summary>A method with branches: all of it.</summary>
         public HMethod? Flow;
+        /// <summary>The caller discards the return value; this model retains every observable evaluation.</summary>
+        public bool DiscardResult;
         /// <summary>The fields it touches and the methods it calls.</summary>
         public readonly HashSet<object> Members = [];
         public int Size;
@@ -333,6 +335,13 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             template.SiteArguments = g.Arguments;
             template.Declaring = g;
             list.Add(template);
+            if (!NoFlows && MakeDiscardedFlow(m, body) is { } discarded)
+            {
+                discarded.ClassArguments = inst.ClassArguments;
+                discarded.SiteArguments = g.Arguments;
+                discarded.Declaring = g;
+                list.Add(discarded);
+            }
         }
         list = list.OrderByDescending(t => t.Size).ThenBy(t => Rank(t.Method)).ToList();
         RecoveryStats.End(RecoveryStats.Kind.Templates, started);
@@ -369,6 +378,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                 int had = list.Count;
                 if (code.Instructions <= 96 && Make(m, body) is { } template) list.Add(template);
                 else if (!NoFlows && MakeFlow(m, body) is { } flow) list.Add(flow);
+                if (!NoFlows && MakeDiscardedFlow(m, body) is { } discarded) list.Add(discarded);
                 if (Tracing(m))
                 {
                     Console.Error.WriteLine($"[inline] {m.FullName}: {code.Instructions} instructions, {(body == null ? "not recovered" : body.Blocks.Count + " blocks")}, {(list.Count == had ? "no model" : list[^1].Flow != null ? "a model with branches" : "a model")}");
@@ -473,7 +483,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         FinallyFolding.Visit(result, Note);
     }
 
-    private static Template? Make(MethodDef m, HMethod? h)
+    private Template? Make(MethodDef m, HMethod? h)
     {
         if (h == null || h.Blocks.Count != 1) return null;
         List<HStmt> all = h.Blocks[0].Statements;
@@ -482,6 +492,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         if (statements.Any(s => s is not (HAssign or HEval))) return null;
         HExpr? result = ret.Value;
         if (m.ReturnType.IsVoid != (result == null)) return null;
+        DropOverwrittenReturnDefault(statements, result);
         // "r = X; return r" is "return X".
         if (result is HLocal { Variable: var returned } && statements.Count != 0 &&
             statements[^1] is HAssign { Target: HLocal { Variable: var set }, Value: var value } && ReferenceEquals(returned, set))
@@ -502,8 +513,50 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         return template;
     }
 
+    /// <summary>
+    /// A return buffer may be cleared before every field is overwritten. The inlined caller need not have
+    /// that clear. Remove it from the comparison template only when the exact closed layout is filled by a
+    /// pure straight run which cannot observe its old value. The recovered body itself remains unchanged.
+    /// </summary>
+    private void DropOverwrittenReturnDefault(List<HStmt> statements, HExpr? result)
+    {
+        if (result is not HLocal { Variable: var returned, Type: { } type } ||
+            type is PrimitiveSig or ByRefSig or PointerSig or OpaqueSig || !type.IsValueType || type.ContainsGenericParameter ||
+            type.Definition is not { IsEnum: false, IsByRefLike: false } definition || statements.Count < 2 ||
+            statements[0] is not HAssign { Target: HLocal { Variable: var cleared, Type: { } clearedType },
+                Value: HTypeExpr { Op: HTypeOp.Default, Target: var zeroType } } ||
+            !ReferenceEquals(cleared, returned) || clearedType.Key != type.Key || zeroType.Key != type.Key)
+            return;
+        TypeSig[] arguments = type is GenericInstSig generic ? generic.Arguments : [];
+        if (arguments.Length != definition.GenericParameters.Length) return;
+        TypeLayout layout = program.Layouts.Of(type);
+        FieldSlot[] fields = layout.Fields.OrderBy(f => f.Offset).ToArray();
+        if (!layout.Known || layout.Size <= 0 || fields.Length == 0 || fields.Length != statements.Count - 1 ||
+            fields.Length != definition.Fields.Count(f => !f.IsStatic)) return;
+        int end = 0;
+        foreach (FieldSlot slot in fields)
+        {
+            TypeSig declared = program.Model.Sigs.Substitute(slot.Field.Type, arguments, []);
+            if (slot.Field.IsStatic || !ReferenceEquals(slot.Field.DeclaringType, definition) || slot.Offset < end ||
+                slot.Size <= 0 || slot.Offset + slot.Size > layout.Size || slot.Type.ContainsGenericParameter ||
+                slot.Type is OpaqueSig or ByRefSig || declared.Key != slot.Type.Key) return;
+            end = slot.Offset + slot.Size;
+        }
+        var seen = new HashSet<FieldDef>();
+        for (int i = 1; i < statements.Count; i++)
+        {
+            if (statements[i] is not HAssign { Target: HField { Object: HLocal { Variable: var owner, Type: { } ownerType } } target,
+                    Value: var value } || !ReferenceEquals(owner, returned) || ownerType.Key != type.Key || target.Field.IsStatic ||
+                !seen.Add(target.Field) || target.DeclaringType != null && target.DeclaringType.Key != type.Key ||
+                !HirBuilder.IsPure(value) || ConstructorFolding.Mentions(value, returned)) return;
+            int at = Array.FindIndex(fields, f => ReferenceEquals(f.Field, target.Field));
+            if (at < 0 || target.Type?.Key != fields[at].Type.Key || value.Type?.Key != fields[at].Type.Key) return;
+        }
+        statements.RemoveAt(0);
+    }
+
     /// <summary>A method with branches, as something to compare with: no loops of its own making are excluded, only what cannot be compared.</summary>
-    private static Template? MakeFlow(MethodDef m, HMethod? h)
+    private static Template? MakeFlow(MethodDef m, HMethod? h, bool discardResult = false)
     {
         if (h == null || h.Blocks.Count < 2 || h.Blocks.Count > 24 || h.TryRegions.Count != 0) return null;
         int count = 0, returns = 0;
@@ -525,7 +578,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                 }
                 if (s is HReturn r)
                 {
-                    if (m.ReturnType.IsVoid != (r.Value == null)) return null;
+                    if ((m.ReturnType.IsVoid || discardResult) != (r.Value == null)) return null;
                     returns++;
                 }
                 FinallyFolding.Visit(s, e => opaque |= e is HOpaque);
@@ -533,10 +586,105 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             }
         }
         if (count > 64 || returns == 0 || opaque) return null;
-        var template = new Template { Method = m, Flow = h };
+        var template = new Template { Method = m, Flow = h, DiscardResult = discardResult };
         Measure(template, h.Blocks.SelectMany(b => b.Statements), null);
         return template;
     }
+
+    /// <summary>
+    /// A caller may run a value-returning method for its effects alone. Compare that form too: values made
+    /// solely for the discarded result are absent, but calls, possible exceptions and externally visible
+    /// writes must remain. This is a separate template; no recovered body or ordinary result model changes.
+    /// </summary>
+    private static Template? MakeDiscardedFlow(MethodDef m, HMethod? h)
+    {
+        if (m.ReturnType.IsVoid || MakeFlow(m, h) == null) return null;
+        var copy = new HMethod { Method = m, Locals = [.. h!.Locals] };
+        var blocks = h.Blocks.ToDictionary(b => b, b => new HBlock { Id = b.Id, Scope = b.Scope });
+        foreach (HBlock old in h.Blocks)
+        {
+            HBlock block = blocks[old];
+            copy.Blocks.Add(block);
+            foreach (HStmt statement in old.Statements)
+            {
+                if (statement is HReturn returned)
+                {
+                    if (returned.Value != null && !DiscardableValue(returned.Value))
+                        block.Statements.Add(new HEval(returned.Value) { Address = statement.Address });
+                    block.Statements.Add(new HReturn(null) { Address = statement.Address });
+                    continue;
+                }
+                HStmt made = statement switch
+                {
+                    HAssign a => new HAssign(a.Target, a.Value),
+                    HEval e => new HEval(e.Expression),
+                    HJump j => new HJump(blocks[j.Target]),
+                    HBranch b => new HBranch(b.Condition, blocks[b.WhenTrue], blocks[b.WhenFalse]),
+                    HSwitch s => new HSwitch(s.Value, s.Targets.Select(t => blocks[t]).ToArray(), blocks[s.Default]),
+                    HThrow t => new HThrow(t.Exception),
+                    _ => throw new InvalidOperationException("invalid inline flow statement"),
+                };
+                made.Address = statement.Address;
+                block.Statements.Add(made);
+            }
+        }
+        // Only unaliased value-local writes are candidates. Taking a local's address is a read here, so it
+        // cannot disappear merely because a later call's access through that address is not spelled out.
+        static HVar? WrittenLocal(HExpr target)
+        {
+            while (target is HField { Field.IsStatic: false, Object: { Type: { IsValueType: true } and not (ByRefSig or PointerSig) } inside })
+                target = inside;
+            return target is HLocal { Type: not (ByRefSig or PointerSig) } local ? local.Variable : null;
+        }
+        bool changed;
+        do
+        {
+            var read = new HashSet<HVar>();
+            void Read(HExpr? expression) => FinallyFolding.Visit(expression, e => { if (e is HLocal l) read.Add(l.Variable); });
+            foreach (HBlock block in copy.Blocks)
+                foreach (HStmt statement in block.Statements)
+                    if (statement is HAssign a)
+                    {
+                        Read(a.Value);
+                        if (WrittenLocal(a.Target) == null) Read(a.Target);
+                    }
+                    else FinallyFolding.Visit(statement, e => { if (e is HLocal l) read.Add(l.Variable); });
+            changed = false;
+            foreach (HBlock block in copy.Blocks)
+                for (int i = block.Statements.Count - 1; i >= 0; i--)
+                {
+                    HStmt statement = block.Statements[i];
+                    HExpr? value = statement switch
+                    {
+                        HAssign a when WrittenLocal(a.Target) is { } local && !read.Contains(local) => a.Value,
+                        HEval e when DiscardableValue(e.Expression) => e.Expression,
+                        _ => null,
+                    };
+                    if (value == null) continue;
+                    if (DiscardableValue(value)) block.Statements.RemoveAt(i);
+                    else block.Statements[i] = new HEval(value) { Address = statement.Address };
+                    changed = true;
+                }
+        } while (changed);
+        return MakeFlow(m, copy, discardResult: true);
+    }
+
+    /// <summary>Evaluation has no effect and cannot throw: notably, no class dereference, getter or checked arithmetic.</summary>
+    private static bool DiscardableValue(HExpr value) => value switch
+    {
+        HConst or HLocal or HArg => true,
+        HField { Field.IsStatic: false, Object: { Type: { IsValueType: true } and not (ByRefSig or PointerSig) } owner }
+            => DiscardableValue(owner),
+        HTypeExpr { Op: HTypeOp.Default or HTypeOp.SizeOf, Operand: null } => true,
+        HUnary unary => DiscardableValue(unary.Operand),
+        HBinary { Op: HBinaryOp.Add or HBinaryOp.Sub or HBinaryOp.Mul or HBinaryOp.And or HBinaryOp.Or or HBinaryOp.Xor or HBinaryOp.Shl or HBinaryOp.Shr or HBinaryOp.ShrUn } binary
+            => DiscardableValue(binary.Left) && DiscardableValue(binary.Right),
+        HCompare compare => DiscardableValue(compare.Left) && DiscardableValue(compare.Right),
+        HConv { Kind: HConvKind.I1 or HConvKind.U1 or HConvKind.I2 or HConvKind.U2 or HConvKind.I4 or HConvKind.U4 or HConvKind.I8 or HConvKind.U8 or HConvKind.R4 or HConvKind.R8 or HConvKind.RUn or HConvKind.I or HConvKind.U } conv
+            => DiscardableValue(conv.Operand),
+        HSelect select => DiscardableValue(select.Condition) && DiscardableValue(select.WhenTrue) && DiscardableValue(select.WhenFalse),
+        _ => false,
+    };
 
     private static bool Within(TypeDef inner, TypeDef outer)
     {
@@ -1240,6 +1388,15 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
                     // The methods of the member's class - and those of the classes this one derives from: what a
                     // base class offers ("do I have authority?") is often made of members of other classes.
                     IEnumerable<Template> candidates = templates(owner, declaring);
+                    // A containing struct can return its nested wrapper (Task<T>.GetAwaiter returns
+                    // Task<T>.Awaiter). The copied private field belongs to the wrapper, while the public
+                    // method whose code it came from belongs to the containing type. Nested generic
+                    // metadata carries the containing type's arguments as its leading arguments.
+                    for (TypeDef? outer = owner.DeclaringType; outer != null; outer = outer.DeclaringType)
+                    {
+                        TypeSig? enclosing = EnclosingType(outer, declaring);
+                        if (enclosing != null) candidates = candidates.Concat(templates(outer, enclosing));
+                    }
                     if (inherited)
                     {
                         var others = new List<TypeDef>();
@@ -1303,6 +1460,14 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             }
         }
         return false;
+    }
+
+    private TypeSig? EnclosingType(TypeDef outer, TypeSig? nested)
+    {
+        int count = outer.GenericParameters.Length;
+        if (count == 0) return outer.Sig;
+        return nested is GenericInstSig { ContainsGenericParameter: false } instance && instance.Arguments.Length >= count
+            ? program.Model.Sigs.GenericInst(outer, instance.Arguments.Take(count).ToArray()) : null;
     }
 
     /// <summary>Set while a method with branches is compared: its first statements were found at a place, the rest was not.</summary>
@@ -1391,6 +1556,8 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         {
             TypeSig parameter = classArguments.Length != 0 ? program.Model.Sigs.Substitute(m.Parameters[p].Type, classArguments, []) : m.Parameters[p].Type;
             if (unifier.Arguments[p] is { } found) arguments[p] = found;
+            // A discarded-result comparison must still identify every argument from the actual caller.
+            else if (template.DiscardResult) return null;
             // A place the method never uses: nothing to name.
             else if (parameter is ByRefSig or PointerSig || parameter.ContainsGenericParameter) return null;
             // A parameter the method never looks at: any value does.
@@ -1594,6 +1761,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             bool value = template.Method.DeclaringType.IsValueType;
             fine &= self != null && around switch
             {
+                null => value, // the complete struct value, read once before anything else
                 HField { Field.IsStatic: false } => true,
                 HDeref => value,
                 HCall c when !value => ReferenceEquals(c.This, self),
@@ -1614,6 +1782,16 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
     /// </summary>
     private static bool WorkedOutFirst(HStmt statement, HExpr wanted)
     {
+        // A field write through value-type locals works out an address, not the value previously kept
+        // there. The local's storage does not move when its address is taken (return buffers have that
+        // flag too). Do not extend this to class fields, references, pointers or array elements: finding
+        // their destination reads a value which the right-hand side could change, or can itself throw.
+        static bool FixedLocalStorage(HExpr place) => place switch
+        {
+            HLocal { Type: { IsValueType: true } and not (ByRefSig or PointerSig) } => true,
+            HField { Field.IsStatic: false, Object: { Type: { IsValueType: true } and not (ByRefSig or PointerSig) } owner } => FixedLocalStorage(owner),
+            _ => false,
+        };
         bool? In(HExpr? e)
         {
             if (e == null) return null;
@@ -1631,7 +1809,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             case HAssign a:
             {
                 bool clean = true;
-                if (a.Target is not HLocal)
+                if (a.Target is not HLocal && !FixedLocalStorage(a.Target))
                     foreach (HExpr? operand in Operands(a.Target))
                     {
                         if (In(operand) is { } inside) return inside && clean;
@@ -3138,7 +3316,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
             return true;
         }
 
-        if (m.ReturnType.IsVoid)
+        if (m.ReturnType.IsVoid || template.DiscardResult)
         {
             if (!OneWayOn()) return Why("its returns do not go on at one place");
         }
