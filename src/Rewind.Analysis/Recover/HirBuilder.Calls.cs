@@ -2731,6 +2731,14 @@ public sealed partial class HirBuilder
 
         switch (helper.Kind)
         {
+            case HelperKind.WriteBarrier when helper.ManagedStoreBarrierOnly:
+            {
+                bool managedVoid = _abi.Return == ReturnKind.Void &&
+                    _method.ReturnType is PrimitiveSig { Element: Il2CppTypeEnum.Void };
+                if (!ManagedStoreBarrierProof.CanElide(_managedStoreBarrier, call, a0, _cur, managedVoid, IsUsed)) break;
+                if (tail) Emit(new HReturn(null), call.Addr);
+                return;
+            }
             case HelperKind.MathFunction:
             {
                 var operands = new HExpr[helper.FloatArgs];
@@ -3107,6 +3115,7 @@ public sealed partial class HirBuilder
             Emit(new HThrow(new HOpaque("noreturn")), call.Addr);
             return;
         }
-        FinishCall(call, opaque, helper.ReturnsValue ? ReturnKind.Integer : ReturnKind.Void, _long, tail);
+        FinishCall(call, opaque, helper.ReturnsValue || helper.ManagedStoreBarrierOnly ? ReturnKind.Integer : ReturnKind.Void, _long, tail);
+        if (helper.ManagedStoreBarrierOnly && !tail) PreserveManagedBarrierReturns(call, projs);
     }
 }

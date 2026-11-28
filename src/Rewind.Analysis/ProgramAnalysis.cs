@@ -764,7 +764,8 @@ public sealed class ProgramAnalysis
             shape = new CallShape
             {
                 Count = n, IsFloat = new bool[Math.Max(4, n)], IsDouble = new bool[Math.Max(4, n)],
-                Returns = helper.ReturnsValue ? CallReturn.Integer : CallReturn.Void,
+                // Preserve all possible return lanes until the typed-store barrier gate accepts or rejects the call.
+                Returns = helper.ManagedStoreBarrierOnly ? CallReturn.Unknown : helper.ReturnsValue ? CallReturn.Integer : CallReturn.Void,
             };
         }
         else

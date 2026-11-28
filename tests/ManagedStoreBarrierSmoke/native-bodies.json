@@ -1,0 +1,44 @@
+{
+  "native_sha256": "c14148fa2bca4e8d09d0f5422db1b288fdcdaab8bf98f12a59988bf1e8da00f6",
+  "exports": {
+    "il2cpp_gc_wbarrier_set_field": 32517236
+  },
+  "functions": [
+    {
+      "address": 32254568,
+      "length": 72,
+      "sha256": "a8be6dd816c8b7270181e8c3878563e42a2565e63d883a3faf9dfede00a81f27",
+      "fde": "0x1bb1040",
+      "bytes": "8897019008c949b9e8010034ea8601d0088052d34a0113910b9c8c5209fc4cd38b00a0722c008052480d088b08010b8b8921c99a0a7d5fc84a0109aa0a7d0bc8abffff35c0035fd6"
+    },
+    {
+      "address": 32716376,
+      "length": 4,
+      "sha256": "15a52dbc42785e47f737d3895925c8ddee299e7aeef90bcb461a9a3ef751951a",
+      "fde": "0x1bbee68",
+      "bytes": "043dfe17"
+    },
+    {
+      "address": 32691960,
+      "length": 4,
+      "sha256": "05ed926a9f60616ef409aed8942609417c67343fc66e4d74960a5d2d40926aef",
+      "fde": "0x1bbd580",
+      "bytes": "d8170014"
+    },
+    {
+      "address": 32517236,
+      "length": 12,
+      "sha256": "49903d6478db992dc90e8be166f0e9a539e4d01786b70f088f7ff83b5db9589a",
+      "fde": "0x1bb8160",
+      "bytes": "e00301aae10302aa31c80014"
+    },
+    {
+      "address": 32722240,
+      "length": 8,
+      "sha256": "f55a5d0232077d8b6ab2258f91e47dfd7c9132ffe3aee86a56f6390b08f0fa53",
+      "fde": "0x1bbf290",
+      "bytes": "010000f94937fe17"
+    }
+  ],
+  "test_status": "PREPARED_NOT_EXECUTED"
+}

@@ -3,6 +3,13 @@ using Rewind.Model;
 using Rewind.Output;
 using Rewind.Runtime;
 
+// Run the new affected branch without repeating unchanged numeric/lane smoke cases.
+if (args.Length == 1 && args[0] == "--isinst-null-only")
+{
+    IsInstNullCompareSmoke.Run();
+    return;
+}
+
 static TypeSig Struct(string ns, string name, bool isEnum = false)
 {
     var d = new TypeDef { Namespace=ns, Name=name, IsValueType=true, IsEnum=isEnum };
@@ -101,3 +108,5 @@ bitCall.Name="ToSingle";Lane(Packed(snapshot),null);bitCall.Name="Int32BitsToSin
 Lane(Packed(snapshot),low);
 Check(true,"I4",snapshot); // original guard must still reject naked aggregate casts.
 Console.WriteLine("PACKED_FLOAT_LANE_SMOKE_PASS positive=3 negative=15 original_guard_retained=1");
+
+IsInstNullCompareSmoke.Run();

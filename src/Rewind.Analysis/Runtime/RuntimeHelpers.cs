@@ -120,6 +120,8 @@ public sealed record HelperInfo(HelperKind Kind, int IntArgs, bool NoReturn, boo
     public bool BufferFirst { get; init; }
     /// <summary>A proved ARM64 store shape; recovery requires an exact fresh object[] and 32-bit index.</summary>
     public bool ArrayAccessFreshObjectStore { get; init; }
+    /// <summary>One-argument native mark-only helper; keep opaque until a typed managed store witnesses it.</summary>
+    public bool ManagedStoreBarrierOnly { get; init; }
 }
 
 /// <summary>Maps function addresses to the runtime helpers they implement.</summary>

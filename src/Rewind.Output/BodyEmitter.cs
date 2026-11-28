@@ -1034,8 +1034,17 @@ public sealed class BodyEmitter
 
         private void Compare(HCompare c)
         {
-            CheckAggregateNumeric(c.Op.ToString(), c.Left);
-            CheckAggregateNumeric(c.Op.ToString(), c.Right);
+            // IsInst yields an object reference even when its HIR type (or the literal null's
+            // type) is the tested struct. Classify this exact pair before the numeric guard;
+            // Operand below already preserves that reference instead of unboxing it.
+            bool referenceTypeTest = (c.Op is HCompareOp.Eq or HCompareOp.Ne) &&
+                ((c.Left is HTypeExpr { Op: HTypeOp.IsInst } && c.Right is HConst { Value: null }) ||
+                 (c.Right is HTypeExpr { Op: HTypeOp.IsInst } && c.Left is HConst { Value: null }));
+            if (!referenceTypeTest)
+            {
+                CheckAggregateNumeric(c.Op.ToString(), c.Left);
+                CheckAggregateNumeric(c.Op.ToString(), c.Right);
+            }
             bool isFloat = IsFloat(c.Left.Type) || IsFloat(c.Right.Type);
             // ("x as long" is an object or null, not a number of 64 bits: nothing to widen the other side to.)
             bool tested = c.Left is HTypeExpr { Op: HTypeOp.IsInst } || c.Right is HTypeExpr { Op: HTypeOp.IsInst };

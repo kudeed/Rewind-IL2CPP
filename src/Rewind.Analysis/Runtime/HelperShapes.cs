@@ -24,6 +24,8 @@ public static class HelperShapes
         {
             if (!NoArm64Thunks && AddArm64Thunks(model, context, helpers) is > 0 and var thunks)
                 found.Add($"{thunks} thunks of support functions");
+            if (Arm64ExportHelperShapes.Add(model.Image, context.IsManaged, helpers) is > 0 and var exported)
+                found.Add($"{exported} support functions anchored by complete public API wrappers");
             if (Environment.GetEnvironmentVariable("REWIND_NO_ARM64_COMPARE_EXCHANGE") == null)
             {
                 int atomics = 0;
@@ -37,6 +39,8 @@ public static class HelperShapes
             }
             if (!NoArm64Exceptions && (AddArm64TypedExceptionStubs(model, context, helpers) + AddArm64ExceptionStubs(model, context, helpers)) is > 0 and var exceptions)
                 found.Add($"{exceptions} exception throwers");
+            if (Arm64RuntimeDispatchShapes.AddClassInitializers(model, context, helpers) is > 0 and var classInitializers)
+                found.Add($"{classInitializers} one-argument class metadata initializers");
             if (!NoAccessors && AddArm64ArrayAccessors(model, context, helpers) is > 0 and var arrayStores)
                 found.Add($"{arrayStores} checked object-array stores");
             if (AddArm64MultiArrayAccessors(model, context, helpers) is > 0 and var rectangular)
@@ -68,6 +72,9 @@ public static class HelperShapes
             {
                 if (context.IsManaged(start) || helpers.At(start) != null) continue;
                 if (Arm64Stub(model, context, start) is not { } stub || helpers.At(stub.Target) is not { } info) continue;
+                // A newly proven mark-only helper carries a caller proof obligation; do not copy it
+                // through a branch prefix whose complete function may contain other behavior.
+                if (info.ManagedStoreBarrierOnly && !Arm64MarkOnlyWriteBarrierShape.HasCompleteAliasExtent(model.Image.FunctionTable, start)) continue;
                 HelperInfo? alias = stub.Kind switch
                 {
                     // A branch is the helper itself.

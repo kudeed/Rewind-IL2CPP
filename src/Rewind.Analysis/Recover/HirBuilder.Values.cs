@@ -2469,7 +2469,9 @@ public sealed partial class HirBuilder
                 if (!NoStoredCasts && IsReference(loc.Type) && CheckedClassHere(valueNode) is { } storedAs &&
                     stored.Type != null && !IsAssignable(stored.Type, loc.Type) && IsAssignable(storedAs, loc.Type))
                     stored = new HTypeExpr(HTypeOp.CastClass, storedAs, stored) { Type = storedAs };
-                Emit(new HAssign(loc.Location, stored), n.Addr);
+                var referenceStore = new HAssign(loc.Location, stored);
+                Emit(referenceStore, n.Addr);
+                RecordManagedStoreBarrier(n, referenceStore);
                 return;
             case PPair pair:
             {

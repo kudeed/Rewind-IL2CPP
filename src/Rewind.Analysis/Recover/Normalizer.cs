@@ -444,6 +444,7 @@ public sealed partial class Normalizer(ProgramAnalysis program)
         {
             Node? tail = b.Terminator;
             if (tail?.Op != Op.TailCall || tail.Aux is not CallInfo { Indirect: false, Intrinsic: null } info) continue;
+            if (program.Helpers.At(info.Target) is { ManagedStoreBarrierOnly: true }) continue;
             if (program.Helpers.KindAt(info.Target) is not (HelperKind.WriteBarrier or HelperKind.WriteBarrierForClass
                 or HelperKind.WriteBarrierForType or HelperKind.NullCheck or HelperKind.MetadataInit or HelperKind.ClassInit
                 or HelperKind.ArrayElementTypeCheck or HelperKind.MemoryBarrier)) continue;
@@ -464,6 +465,7 @@ public sealed partial class Normalizer(ProgramAnalysis program)
                 Node call = b.Nodes[i];
                 HelperKind kind = HelperOf(call);
                 if (kind == HelperKind.None) continue;
+                if (call.Aux is CallInfo barrier && program.Helpers.At(barrier.Target) is { ManagedStoreBarrierOnly: true }) continue;
 
                 Node? result = null;
                 bool remove = true;

@@ -15,6 +15,9 @@ public sealed class KlassLayout
         TypeHierarchy, CctorStarted, CctorFinished, InstanceSize, StackSlotSize, ElementSize, Flags, VTableCount, InterfaceOffsetsCount,
         TypeHierarchyDepth, Rank, Bitflags, VTable, ByvalArg, ThisArg;
 
+    /// <summary>The stored exception handle, whose width changes independently of pointer size.</summary>
+    public int InitializationExceptionGCHandle, InitializationExceptionGCHandleSize;
+
     /// <summary>Size of one vtable entry: { method pointer, MethodInfo* }.</summary>
     public int VTableEntrySize;
 
@@ -99,7 +102,8 @@ public sealed class KlassLayout
         k.RgctxData = Ptr();
         k.TypeHierarchy = Ptr();
         Ptr();                          // unity_user_data
-        if (shape.HandleIsPointer) Ptr(); else U32(); // initializationExceptionGCHandle
+        k.InitializationExceptionGCHandleSize = shape.HandleIsPointer ? p : 4;
+        k.InitializationExceptionGCHandle = shape.HandleIsPointer ? Ptr() : U32();
         k.CctorStarted = U32();
         k.CctorFinished = U32();
         Field(8, 8);                    // cctor_thread (ALIGN_TYPE(8) size_t)
