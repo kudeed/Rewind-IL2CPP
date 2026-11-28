@@ -246,3 +246,29 @@ internal sealed class SRuntimeSize(TypeSig type, Node? array = null) : Sem
     public TypeSig Type = type;
     public Node? Array = array;
 }
+
+/// <summary>A dynamically sized stack allocation for exactly one managed T.</summary>
+internal sealed class SRuntimeBuffer(TypeSig type, HVar variable, int upperBound) : Sem
+{
+    public TypeSig Type = type;
+    public HVar Variable = variable;
+    public int UpperBound = upperBound;
+}
+
+/// <summary>The standard MethodInfo.invoker_method entry, tied to that exact method record.</summary>
+internal sealed class SMethodInvoker(SMethod method) : Sem
+{
+    public SMethod Method = method;
+}
+
+/// <summary>One T passed to an invoker: its address for values, its object pointer for references.</summary>
+internal sealed class SRuntimeMarshal(SRuntimeBuffer buffer) : Sem
+{
+    public SRuntimeBuffer Buffer = buffer;
+}
+
+/// <summary>T's stack slot rounded up for allocation, not T's copy length.</summary>
+internal sealed class SRuntimeAllocationExtent(TypeSig type) : Sem
+{
+    public TypeSig Type = type;
+}

@@ -931,6 +931,8 @@ public sealed partial class HirBuilder
         FindPieceCopies();
         FindPieceFills();
         foreach (Block b in cfg.ReversePostOrder) DeclarePhis(b);
+        PlanRuntimeInvokers();
+        PlanRuntimeStackGuards();
         _building = true;
         foreach (Block b in cfg.ReversePostOrder) ProcessBlock(b);
         _building = false;
@@ -1257,7 +1259,7 @@ public sealed partial class HirBuilder
     private static bool IsPointerLike(Sem s) => s switch
     {
         SRef or SKlass or SObjKlass or SStatics or SFrame or SUnboxed or SNewObject or SHierarchy or SInterfaceEntry or SNativeCode => true,
-        SMethod or SRgctx => true,
+        SMethod or SRgctx or SRuntimeBuffer => true,
         SVal v => IsReference(v.Type) || v.Type is PointerSig or ByRefSig || v.Type is PrimitiveSig { Element: Il2CppTypeEnum.I or Il2CppTypeEnum.U },
         _ => false,
     };
@@ -1327,6 +1329,8 @@ public sealed partial class HirBuilder
                 return v.Expr;
             case SRef r:
                 return new HAddressOf(r.Location) { Type = _m.Sigs.ByRef(r.Type) };
+            case SRuntimeBuffer buffer:
+                return new HAddressOf(new HLocal(buffer.Variable) { Type = buffer.Type }) { Type = _m.Sigs.ByRef(buffer.Type) };
             case SNewObject o:
                 return new HLocal(o.Variable) { Type = o.Type };
             case SType t:
@@ -1418,6 +1422,16 @@ public sealed partial class HirBuilder
             if (!NoMergedStatics && MergedStatics(phi) is { } statics)
             {
                 _sem[phi] = statics;
+                continue;
+            }
+            // Runtime-sized T locals still have one managed type, even though their stack offsets vary.
+            if (RuntimeBufferPhiType(phi) is { } runtimeType)
+            {
+                TypeSig reference = _m.Sigs.ByRef(runtimeType);
+                HVar merged = _h.NewLocal(reference, "m");
+                _phiVar[phi] = merged;
+                _phiOfVar[merged] = phi;
+                _sem[phi] = new SVal(new HLocal(merged) { Type = reference });
                 continue;
             }
             // The address of one stack object or another, by the way in: a reference variable.
@@ -1796,6 +1810,7 @@ public sealed partial class HirBuilder
 
     private void ProcessBlock(Block b)
     {
+        if (_runtimeReachable != null && !_runtimeReachable.Contains(b)) return;
         _block = b;
         _cur = _hblock[b];
         foreach (Node n in b.Nodes)
@@ -1990,6 +2005,18 @@ public sealed partial class HirBuilder
             }
             case Op.Branch:
             {
+                // Both native views of the same T become one argument only after proving the exact
+                // value-type/reference marshalling diamond and the invoker consuming its result.
+                if (_runtimeStackGuards.Contains(b))
+                {
+                    Emit(new HJump(Edge(1)), term.Addr);
+                    break;
+                }
+                if (_runtimeMarshalGuards.Contains(b))
+                {
+                    Emit(new HJump(Edge(0)), term.Addr);
+                    break;
+                }
                 if (b.Succs.Count == 2 && InstanceTestOf(term.In[0]) is var (tested, testedType, whenTrue))
                 {
                     Block instanceSide = b.Succs[whenTrue ? 0 : 1];

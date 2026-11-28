@@ -375,12 +375,14 @@ public sealed partial class Normalizer(ProgramAnalysis program)
             foreach (Node n in b.Nodes)
             {
                 if (n.Op != Op.Load || n.Type != VT.I64) continue;
-                if (!n.In[0].IsConst)
+                Node address = Resolve(n.In[0]);
+                ulong va;
+                if (address.IsConst) va = address.UImm;
+                else if (!MetadataSlotAddress.TryConstantAdd(address, IsMetadataSlot, out va))
                 {
-                    if (!n.Dead && IsSlotChoice(Resolve(n.In[0]), 0, [])) chosen.Add(n);
+                    if (!n.Dead && IsSlotChoice(address, 0, [])) chosen.Add(n);
                     continue;
                 }
-                ulong va = (ulong)n.In[0].Imm;
                 if (!IsMetadataSlot(va)) continue;
                 _replace[n] = SlotValue(va);
                 n.Dead = true;

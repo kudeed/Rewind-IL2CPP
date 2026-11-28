@@ -50,6 +50,8 @@ public sealed class MethodAbi
     public bool Known = true;
     /// <summary>The selected native body uses IL2CPP's explicit fully shared return buffer.</summary>
     public bool UsesFullySharedReturnBuffer;
+    /// <summary>The registered fully shared body has a supported managed argument convention.</summary>
+    public bool UsesFullySharedRuntime;
 
     /// <summary>FloatAggregate returns: how many members, and whether they are doubles.</summary>
     public int ReturnCount = 1;

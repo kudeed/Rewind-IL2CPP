@@ -299,6 +299,8 @@ public sealed partial class HirBuilder
 
     private Sem BinarySem(Node n)
     {
+        if (RuntimeBufferAllocation(n) is { } buffer) return buffer;
+        if (RuntimeAllocationExtent(n) is { } extent) return extent;
         HBinaryOp op = n.Op switch
         {
             Op.Add => HBinaryOp.Add,
@@ -831,6 +833,11 @@ public sealed partial class HirBuilder
                     (shift != 0 || _p.Layouts.FieldAt(whole.Type!, 0) is not { Offset: 0 } first || first.Size * 8 != to) &&
                     _p.Layouts.FieldExactly(whole.Type!, shift, to / 8) is { } part && !IsStructType(part.Type))
                     return new SVal(new HField { Object = whole, Field = part.Field, DeclaringType = whole.Type, Type = part.Type });
+                // Arm64 native input is little-endian: a narrow register slice can cross adjacent public
+                // byte fields even when no single managed field covers the requested bits (e.g. Color32.r/g).
+                if (_m.Image.Arch == Rewind.Binary.CpuArch.Arm64 && IsStructType(whole.Type) &&
+                    ScalarByteSlice.Read(whole, _p.Layouts.Of(whole.Type!), shift, to / 8, _m.Sigs) is { } packedBytes)
+                    return new SVal(packedBytes);
             }
         }
 
@@ -983,6 +990,7 @@ public sealed partial class HirBuilder
     private sealed record PKlassOf(TypeSig Type) : Place;
     /// <summary>The code pointer kept in a method's runtime record.</summary>
     private sealed record PMethodCode(SMethod Method) : Place;
+    private sealed record PMethodInvoker(SMethod Method) : Place;
     /// <summary>The pointer to a runtime generic context (of a class or a method), and one entry of such a context.</summary>
     private sealed record PRgctx(SRgctx Context) : Place;
     private sealed record PRgctxItem(SRgctx Context, int Index) : Place;
@@ -1785,6 +1793,8 @@ public sealed partial class HirBuilder
                 int klassAt = (twoPointers ? 4 : 3) * _ptr;
                 TypeSig[] classArguments = method.Inst?.ClassArguments ?? [];
                 if (size == _ptr && (a.Offset == 0 || (twoPointers && a.Offset == _ptr))) return new PMethodCode(method);
+                if (_abi.UsesFullySharedRuntime && size == _ptr && a.Offset == (twoPointers ? 2 : 1) * _ptr)
+                    return new PMethodInvoker(method);
                 if (a.Offset == klassAt)
                     return new PKlassOf(classArguments.Length != 0 ? _m.Sigs.GenericInst(method.Method.DeclaringType, classArguments) : method.Method.DeclaringType.Sig);
                 if (a.Offset == klassAt + 3 * _ptr && method.Inst is { MethodArguments.Length: > 0 } inst)
@@ -1997,9 +2007,9 @@ public sealed partial class HirBuilder
         {
             case SInterfaceEntry e when a.Index == null && a.Offset is 0 or 8 && (a.Offset == 0 || a.Offset == _ptr):
                 return new SVTable(e.Object, e.Slot, a.Offset != 0) { Interface = e.Interface };
-            case SKlass k when _abi.UsesFullySharedReturnBuffer && n.Type == VT.I32 && a.Index == null && _p.Klass.StackSlotSize > 0 && a.Offset == _p.Klass.StackSlotSize:
+            case SKlass k when _abi.UsesFullySharedRuntime && n.Type == VT.I32 && a.Index == null && _p.Klass.StackSlotSize > 0 && a.Offset == _p.Klass.StackSlotSize:
                 return new SRuntimeSize(k.Type);
-            case SObjKlass o when _abi.UsesFullySharedReturnBuffer && n.Type == VT.I32 && a.Index == null && a.Offset == _p.Klass.ElementSize &&
+            case SObjKlass o when _abi.UsesFullySharedRuntime && n.Type == VT.I32 && a.Index == null && a.Offset == _p.Klass.ElementSize &&
                                   Eval(o.Object) is SVal { Type: SzArraySig array }:
                 return new SRuntimeSize(array.ElementType, o.Object);
             case SKlass k when a.Index == null && a.Offset == _p.Klass.TypeHierarchyDepth:
@@ -2269,6 +2279,8 @@ public sealed partial class HirBuilder
                 return new SKlass(of.Type);
             case PMethodCode code:
                 return new SMethodCode(code.Method.Method, code.Method.Inst);
+            case PMethodInvoker invoker:
+                return new SMethodInvoker(invoker.Method);
             case PRgctx table:
                 return table.Context;
             case PRgctxItem entry:
@@ -2397,6 +2409,7 @@ public sealed partial class HirBuilder
             // Dropped, that local read as never set.
             FrameConflicts.Add(first ? boxOffset : boxOffset - _ptr);
         }
+        if (_runtimeInvokerStores.Contains(n)) return; // proven local invocation address table
         if (_spillStores.Contains(n)) return; // a parked stack address (see PlanAddressSpills)
         if (_caughtStores.Contains(n)) return; // the catch object (see PlanCaughtSlots)
         Node valueNode = n.In[1];

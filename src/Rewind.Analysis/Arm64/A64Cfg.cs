@@ -112,6 +112,22 @@ public sealed class A64Cfg
                         ulong target = ins.Target;
                         if (!InFunction(target))
                         {
+                            // Some images move one instruction out of line, then jump back to the exact
+                            // continuation. A direct B does not set LR: this is still the caller's control
+                            // flow, not a tail call. Keep both original instructions and their addresses.
+                            if (extraRoots == null && extraLeaders == null && splitAfter == null &&
+                                TryReturningLoadIsland(context, ins, start, limit, out var load, out var back) &&
+                                !instructions.ContainsKey(load.Address) && !instructions.ContainsKey(back.Address))
+                            {
+                                instructions.Add(load.Address, load);
+                                instructions.Add(back.Address, back);
+                                ends[ip] = (BlockEnd.Jump, [load.Address]);
+                                ends[back.Address] = (BlockEnd.Jump, [next]);
+                                leaders.Add(load.Address);
+                                leaders.Add(next);
+                                work.Push(next);
+                                goto nextBlock;
+                            }
                             ends[ip] = (BlockEnd.TailCall, []);
                             goto nextBlock;
                         }
@@ -204,6 +220,35 @@ public sealed class A64Cfg
             cfg.Blocks.Insert(0, entry);
         }
         return cfg;
+    }
+
+    /// <summary>
+    /// A two-instruction, non-PC-relative load island that resumes immediately after the original B.
+    /// Do not generalize this to veneers, calls, arbitrary returning fragments, or exception regions:
+    /// their register and protected-range contracts need separate proofs.
+    /// </summary>
+    private static bool TryReturningLoadIsland(ICodeContext context, in A64Instruction branch,
+        ulong start, ulong limit, out A64Instruction load, out A64Instruction back)
+    {
+        load = back = default;
+        if (branch.Op != A64Op.B || branch.NextAddress >= limit ||
+            context.IsFunctionStart(branch.NextAddress) || context.IsNoReturn(branch.Target))
+            return false;
+        ulong target = branch.Target;
+        NativeImage image = context.Image;
+        if ((target & 3) != 0 || target >= start && target < limit ||
+            !image.IsMapped(target, 8) || image.SectionAt(target) is not { IsExecutable: true } section ||
+            section.End - target < 8)
+            return false;
+        load = A64Decoder.Decode(image.U32(target), target);
+        back = A64Decoder.Decode(image.U32(target + 4), target + 4);
+        if (load.Op != A64Op.Ldr || load.Mode != A64Mode.Offset ||
+            load.Rn >= A64Instruction.Zr || load.Size is not (1 or 2 or 4 or 8 or 16) ||
+            back.Op != A64Op.B || back.Target != branch.NextAddress)
+            return false;
+        // A detached block's physical address is not part of the original LSDA range. Until that
+        // mapping is supported, leave functions with protected call sites on the existing path.
+        return image is not ElfImage elf || elf.ExceptionTableOf(start)?.CallSites.Any() != true;
     }
 
     /// <summary>

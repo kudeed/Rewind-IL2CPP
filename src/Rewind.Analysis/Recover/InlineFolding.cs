@@ -1070,6 +1070,7 @@ internal sealed class InlineFolding(MethodPipeline pipeline, ProgramAnalysis pro
         _barred = pipeline.BarredFor(current);
         try
         {
+            MergedInlineArguments.Run(method);
             Fold(method, current);
         }
         finally

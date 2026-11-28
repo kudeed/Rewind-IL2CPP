@@ -473,6 +473,8 @@ public sealed partial class HirBuilder
         {
             case SRef r:
                 return AtStart(r.Location, r.Type, expected);
+            case SRuntimeBuffer buffer when expected?.Key == buffer.Type.Key:
+                return new HLocal(buffer.Variable) { Type = buffer.Type };
             case SFrame f when BufferAddress(f.Offset) is { } buffer:
             {
                 // In a stackalloc'd buffer: what the pointer points at.
@@ -2257,6 +2259,7 @@ public sealed partial class HirBuilder
 
     private void EmitIndirectCall(Node call, bool tail)
     {
+        if (!tail && TryEmitRuntimeInvoker(call)) return;
         Node targetNode = call.In[0];
         // The code of one virtual method or another, by the way in, then called: the compiler merged the calls
         // of "if (dying) HandleDie(); else HandleRevive();" into one.
